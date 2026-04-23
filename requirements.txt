@@ -1,7 +1,24 @@
-flask
-flask-cors
-groq
-huggingface-hub
-numpy
-pdfplumber
-python-dotenv
+# EduCAT backend — Python dependencies
+# Generated after LangChain migration
+
+# ── LangChain core ───────────────────────────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0          # ChatGroq — replaces raw Groq client
+langchain-community>=0.3.0     # FAISS wrapper, SQLChatMessageHistory
+langchain-huggingface>=0.1.0   # HuggingFaceEndpointEmbeddings
+
+# ── Vector store ─────────────────────────────────────────
+faiss-cpu>=1.7.4               # or faiss-gpu if on GPU hardware
+
+# ── Web framework ─────────────────────────────────────────
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# ── Utilities ─────────────────────────────────────────────
+python-dotenv>=1.0.0
+numpy>=1.26.0                  # still used by FAISS internally
+
+# ── Previously used directly, now via LangChain ───────────
+# groq>=0.9.0                  # kept if you want direct client fallback
+# huggingface-hub>=0.23.0      # pulled in by langchain-huggingface

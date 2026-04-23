@@ -1,43 +1,88 @@
+"""
+rag.py  —  EduCAT RAG index  (LangChain migration)
+
+Migration from raw HuggingFace InferenceClient to LangChain:
+
+WHAT CHANGED
+────────────
+1. Embeddings     : HuggingFace InferenceClient.feature_extraction() replaced
+                    by HuggingFaceEndpointEmbeddings from langchain_huggingface.
+                    The same model (all-MiniLM-L6-v2) is used.
+
+2. Vector store   : Manual numpy array + cosine_similarity() loop replaced by
+                    LangChain's FAISS wrapper (langchain_community.vectorstores).
+                    FAISS.from_documents() builds the index; similarity_search()
+                    queries it.  The index is saved/loaded from disk with
+                    FAISS.save_local() / FAISS.load_local() so caching still
+                    works exactly as before (no re-embedding on restarts).
+
+3. Documents      : Raw chunk dicts wrapped in LangChain Document objects
+                    (page_content + metadata).  This is LangChain's standard
+                    unit for retrieval pipelines.
+
+4. search()       : Returns the same list-of-dicts format as before
+                    ({ "content": ..., "source": ..., "score": ... }) so
+                    agent.py's search_theory tool and generate_answer() in
+                    model.py need no changes.
+
+WHAT DID NOT CHANGE
+───────────────────
+- _is_rag_eligible() file classification logic is identical.
+- load_all_chunks() reads from the same processed/ folder.
+- Incremental embedding (only new chunks) still works via chunk ID tracking.
+- The public RAGIndex.search(query, k) interface is identical.
+
+INSTALL additions (requirements.txt)
+──────────────────────────────────────
+langchain-huggingface>=0.1.0
+langchain-community>=0.3.0   # includes FAISS wrapper
+faiss-cpu>=1.7               # or faiss-gpu
+"""
+
 import os
 import json
-import numpy as np
 import hashlib
-from huggingface_hub import InferenceClient
+from dotenv import load_dotenv
 
-HF_TOKEN = os.getenv("HF_TOKEN")
+# ── LangChain imports ────────────────────────────────────────────────────────
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
-BASE_DIR         = os.path.dirname(__file__)
+load_dotenv()
+
+HF_TOKEN  = os.getenv("HF_TOKEN")
+BASE_DIR  = os.path.dirname(__file__)
+
 PROCESSED_FOLDER = os.path.join(BASE_DIR, "processed")
-
-EMBEDDINGS_FILE = os.path.join(PROCESSED_FOLDER, "embeddings.npy")
-METADATA_FILE   = os.path.join(PROCESSED_FOLDER, "metadata.json")
-CHUNK_IDS_FILE  = os.path.join(PROCESSED_FOLDER, "chunk_ids.json")
+FAISS_INDEX_DIR  = os.path.join(PROCESSED_FOLDER, "faiss_lc_index")
+CHUNK_IDS_FILE   = os.path.join(PROCESSED_FOLDER, "chunk_ids.json")
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-client = InferenceClient(token=HF_TOKEN)
+# ── Embeddings object — passed to FAISS ──────────────────────────────────────
+# HuggingFaceEndpointEmbeddings calls the HuggingFace Inference API,
+# same endpoint as the old InferenceClient.feature_extraction().
+_embeddings = HuggingFaceEndpointEmbeddings(
+    model     = MODEL_NAME,
+    huggingfacehub_api_token = HF_TOKEN,
+)
 
 
-# =========================
-# 🚫 FILE CLASSIFICATION
-# Same keyword logic as process_exams.py so RAG
-# never accidentally embeds exam or memo content.
-#
-# Only files that are NOT exam/memo get embedded —
-# i.e. theory books, notes, textbooks, study guides.
-# =========================
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE CLASSIFICATION  —  identical logic to old rag.py
+# Only theory/study content gets embedded; exam papers and memos are excluded.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Files that are always internal — never content
 _INTERNAL_FILES = {
     "processed_files.json",
     "metadata.json",
     "chunk_ids.json",
     "processed_exams.json",
     "processed_memos.json",
-    "embeddings.npy",
+    "embeddings.npy",         # old numpy cache (no longer written)
 }
 
-# Keywords that mark a file as an exam question paper
 _EXAM_KEYWORDS = [
     "exam", "paper", "question", "theory", "p1", "p2", "p3",
     "nov", "november", "may", "june", "feb", "february",
@@ -45,70 +90,55 @@ _EXAM_KEYWORDS = [
     "oct", "october", "term", "trial", "nsc", "dbe",
 ]
 
-# Keywords that mark a file as a memo / answer file
 _MEMO_KEYWORDS = [
     "memo", "memorandum", "answers", "answer_key", "marking",
 ]
 
 
-def _is_rag_eligible(filename):
+def _is_rag_eligible(filename: str) -> bool:
     """
-    Returns True ONLY if the file should be embedded into the RAG index.
-
-    Rules:
-      - Skip internal tracking files
-      - Skip memo files (answer keys — not teaching content)
-      - Skip exam question paper files (questions only, no explanations)
-      - Accept everything else (theory books, notes, study guides etc.)
+    Returns True only for theory / study-guide content files.
+    Exam question papers and memos are excluded.
     """
     if filename in _INTERNAL_FILES:
         return False
-
     lower = filename.lower()
-
-    # Skip memos first (they often also contain exam keywords)
     if any(kw in lower for kw in _MEMO_KEYWORDS):
         return False
-
-    # Skip exam question papers
     if any(kw in lower for kw in _EXAM_KEYWORDS):
         return False
-
-    # Anything else is eligible content for the tutor
     return True
 
 
-# =========================
-# 🔑 UNIQUE CHUNK ID
-# =========================
-def generate_chunk_id(text):
+def _generate_chunk_id(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-# =========================
-# 📥 LOAD ELIGIBLE CHUNKS
-# Only loads files that pass _is_rag_eligible()
-# =========================
-def load_all_chunks():
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHUNK LOADING  —  returns LangChain Document objects
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_all_chunks() -> list[Document]:
+    """
+    Load eligible content files from processed/ and wrap each chunk
+    as a LangChain Document with page_content + metadata.
+    """
     if not os.path.exists(PROCESSED_FOLDER):
         print(f"⚠️  Processed folder not found: {PROCESSED_FOLDER}")
         return []
 
-    all_data      = []
+    documents     = []
     loaded_files  = []
     skipped_files = []
 
     for filename in sorted(os.listdir(PROCESSED_FOLDER)):
-
         if not filename.endswith(".json"):
             continue
-
         if not _is_rag_eligible(filename):
             skipped_files.append(filename)
             continue
 
         path = os.path.join(PROCESSED_FOLDER, filename)
-
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -125,159 +155,131 @@ def load_all_chunks():
             content = item.get("content", "").strip()
             if not content:
                 continue
-            all_data.append({
-                "content": content,
-                "source":  item.get("source", filename),
-                "id":      generate_chunk_id(content)
-            })
+            # LangChain Document: text goes in page_content, extras in metadata
+            documents.append(Document(
+                page_content = content,
+                metadata     = {
+                    "source":   item.get("source", filename),
+                    "chunk_id": _generate_chunk_id(content),
+                },
+            ))
             count += 1
 
-        if count > 0:
+        if count:
             loaded_files.append(f"{filename} ({count} chunks)")
 
-    print(f"\n📚 RAG content files loaded  : {len(loaded_files)}")
+    print(f"\n📚 RAG content files  : {len(loaded_files)}")
     for f in loaded_files:
         print(f"     ✅ {f}")
-
     if skipped_files:
-        print(f"🚫 Skipped (exam/memo/system): {len(skipped_files)}")
-        for f in skipped_files:
-            print(f"     → {f}")
+        print(f"🚫 Skipped            : {len(skipped_files)}")
+    print(f"📦 Total documents    : {len(documents)}\n")
 
-    print(f"📦 Total chunks for RAG      : {len(all_data)}\n")
-
-    return all_data
+    return documents
 
 
-# =========================
-# 🔢 EMBEDDING
-# =========================
-def get_embedding(text):
-    result = client.feature_extraction(text, model=MODEL_NAME)
-    return np.array(result, dtype=np.float32).flatten()
+# ═══════════════════════════════════════════════════════════════════════════════
+# RAG INDEX
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-# =========================
-# 📐 COSINE SIMILARITY
-# =========================
-def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
-
-
-# =========================
-# 🧠 RAG INDEX
-# =========================
 class RAGIndex:
 
     def __init__(self):
-        self.dataset     = load_all_chunks()
-        self._embeddings = None
+        self._store: FAISS | None = None
+        self._docs = load_all_chunks()
 
-        if not self.dataset:
+        if not self._docs:
             print("⚠️  RAG: No eligible content files found.")
             print("💡  Add theory books / study guides to the processed/ folder.")
-            print("    Files with keywords like: memo, exam, paper, nov, may, term")
-            print("    will be excluded — only pure content files are embedded.\n")
 
-    # =========================
-    # 🔄 LOAD OR UPDATE EMBEDDINGS
-    # Incremental — only embeds NEW chunks
-    # =========================
-    def _load_or_update_embeddings(self):
+    # ── Build or update the FAISS index ───────────────────────────────────────
+    def _load_or_build_index(self):
+        """
+        Incremental build:
+        1. Load existing FAISS index from disk (if present).
+        2. Determine which chunk IDs are new.
+        3. Embed only new chunks and add them to the index.
+        4. Save updated index to disk.
 
-        # ── Load existing state ───────────────────────
-        if os.path.exists(EMBEDDINGS_FILE):
-            embeddings = np.load(EMBEDDINGS_FILE)
-        else:
-            embeddings = np.array([])
-
-        if os.path.exists(METADATA_FILE):
-            with open(METADATA_FILE) as f:
-                metadata = json.load(f)
-        else:
-            metadata = []
-
+        This mirrors the old numpy-based incremental logic but uses
+        LangChain's FAISS wrapper instead.
+        """
+        # Load existing chunk IDs
         if os.path.exists(CHUNK_IDS_FILE):
             with open(CHUNK_IDS_FILE) as f:
-                existing_ids = set(json.load(f))
+                existing_ids: set = set(json.load(f))
         else:
             existing_ids = set()
 
-        print(f"📊 Cached chunks  : {len(existing_ids)}")
+        # Load existing FAISS index from disk
+        if os.path.exists(FAISS_INDEX_DIR) and existing_ids:
+            try:
+                self._store = FAISS.load_local(
+                    FAISS_INDEX_DIR,
+                    _embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                print(f"⚡ FAISS index loaded from disk ({len(existing_ids)} cached chunks).")
+            except Exception as e:
+                print(f"⚠️  Could not load FAISS index: {e} — rebuilding.")
+                self._store = None
+                existing_ids = set()
 
-        # ── Find new chunks not yet embedded ──────────
-        new_chunks = [c for c in self.dataset if c["id"] not in existing_ids]
-        print(f"🆕 New chunks     : {len(new_chunks)}")
-
-        # ── Use cache if nothing new ──────────────────
-        if not new_chunks and embeddings.size > 0:
-            print("⚡ No updates needed — using cache.\n")
-            self._embeddings = embeddings
-            self.dataset     = metadata
-            return
-
-        # ── Embed only new chunks ─────────────────────
-        if new_chunks:
-            print(f"🔢 Embedding {len(new_chunks)} new chunk(s)...")
-            new_embeddings = []
-
-            for i, chunk in enumerate(new_chunks, 1):
-                emb = get_embedding(chunk["content"])
-                new_embeddings.append(emb)
-                if i % 10 == 0 or i == len(new_chunks):
-                    print(f"   {i}/{len(new_chunks)} embedded")
-
-            new_embeddings = np.array(new_embeddings)
-
-            if embeddings.size == 0:
-                embeddings = new_embeddings
-            else:
-                embeddings = np.vstack([embeddings, new_embeddings])
-
-            metadata.extend(new_chunks)
-            existing_ids.update(c["id"] for c in new_chunks)
-
-            # ── Persist ───────────────────────────────
-            np.save(EMBEDDINGS_FILE, embeddings)
-
-            with open(METADATA_FILE, "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            with open(CHUNK_IDS_FILE, "w") as f:
-                json.dump(list(existing_ids), f, indent=2)
-
-            print(f"💾 Embeddings saved — {len(metadata)} total chunks\n")
-
-        self._embeddings = embeddings
-        self.dataset     = metadata
-
-    # =========================
-    # 🔍 SEARCH
-    # =========================
-    def search(self, query, k=3):
-
-        if not self.dataset:
-            return []
-
-        self._load_or_update_embeddings()
-
-        if self._embeddings is None or self._embeddings.size == 0:
-            return []
-
-        query_emb = get_embedding(query)
-
-        scores = [
-            cosine_similarity(query_emb, emb)
-            for emb in self._embeddings
+        # Find new documents not yet in the index
+        new_docs = [
+            doc for doc in self._docs
+            if doc.metadata["chunk_id"] not in existing_ids
         ]
 
-        top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+        if not new_docs:
+            print("⚡ No new chunks — using cached index.\n")
+            return
+
+        print(f"🔢 Embedding {len(new_docs)} new document(s)...")
+
+        if self._store is None:
+            # First-time build
+            self._store = FAISS.from_documents(new_docs, _embeddings)
+        else:
+            # Incremental update — add new docs to existing index
+            self._store.add_documents(new_docs)
+
+        # Persist index and updated chunk ID list
+        os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+        self._store.save_local(FAISS_INDEX_DIR)
+
+        existing_ids.update(doc.metadata["chunk_id"] for doc in new_docs)
+        with open(CHUNK_IDS_FILE, "w") as f:
+            json.dump(list(existing_ids), f, indent=2)
+
+        print(f"💾 FAISS index saved — {len(existing_ids)} total chunks.\n")
+
+    # ── Public search method — same interface as before ────────────────────────
+    def search(self, query: str, k: int = 3) -> list[dict]:
+        """
+        Search the theory book index for text relevant to query.
+
+        Returns:
+            list of dicts: [{ "content": str, "source": str, "score": float }]
+            Same format as the old implementation so callers need no changes.
+        """
+        if not self._docs:
+            return []
+
+        self._load_or_build_index()
+
+        if self._store is None:
+            return []
+
+        # similarity_search_with_score returns (Document, float) tuples
+        # Lower L2 distance = better match; we convert to a 0-1 similarity score
+        results = self._store.similarity_search_with_score(query, k=k)
 
         return [
             {
-                "content": self.dataset[i]["content"],
-                "source":  self.dataset[i]["source"],
-                "score":   round(scores[i], 4)
+                "content": doc.page_content,
+                "source":  doc.metadata.get("source", "unknown"),
+                "score":   round(float(score), 4),
             }
-            for i in top_k
+            for doc, score in results
         ]

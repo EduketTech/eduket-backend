@@ -1,44 +1,105 @@
 """
-app.py  —  EduCAT Flask API  (LangChain migration)
+app.py  —  EduCAT Flask API  (Firestore-native exam pipeline)
 
-WHAT CHANGED
-────────────
-1. agent.py import: run_agent() signature is unchanged.
-   One new call: agent.set_rag(rag) at startup so the @tool functions
-   inside agent.py can access the RAGIndex without it being passed on
-   every request.
+WHAT CHANGED FROM PREVIOUS VERSION
+────────────────────────────────────
+1. Exams now live in Firestore (/exams collection) instead of local JSON files.
+   Teachers upload PDFs via the React frontend → Google Drive → Firestore record.
+   The scheduled extraction task (scheduled_task.py) processes PDFs and sets
+   status="ready". Only ready exams are served to students.
 
-2. /agent-chat route: identical — calls run_agent(student_id, message, rag=rag).
-   Passing rag= on each call is kept for backwards compatibility; agent.py
-   also stores it globally after the first call.
+2. /exams  — reads Firestore, returns {id, name, subject, grade, year, curriculum}
+             instead of a flat list of filenames.
 
-3. Everything else (session management, /submit marking, /dashboard, home UI)
-   is completely unchanged.  model.py and memory.py are drop-in replacements
-   so no route logic needed to change.
+3. /start-exam — accepts exam_id (Firestore doc ID) instead of a filename.
+                 Loads questions from /exam_questions subcollection.
+                 Falls back to local JSON files (EXAMS_FOLDER) for backward
+                 compatibility during the migration period.
 
-WHAT DID NOT CHANGE
-───────────────────
-- All route signatures and response shapes are identical.
-- in-memory sessions{} dict is unchanged.
-- flatten_exam(), load_exam() helpers are unchanged.
-- The embedded home-UI HTML/JS is unchanged.
+4. A Drive helper (download_from_drive_bytes) is added so the extraction
+   scheduled task can fetch PDFs using the service account without needing
+   a user OAuth token.
+
+5. Everything else (session management, /submit marking, /dashboard,
+   /agent-chat, model.py, memory.py, agent.py, home UI) is unchanged.
+
+ENVIRONMENT VARIABLES REQUIRED
+───────────────────────────────
+  GOOGLE_APPLICATION_CREDENTIALS  path to your service account JSON file
+    OR
+  FIREBASE_SERVICE_ACCOUNT_JSON   JSON string of the service account (for
+                                  PythonAnywhere env-var based config)
+
+  GROQ_API_KEY                    already set
+  SERVICE_ACCOUNT_EMAIL           e.g. educat@your-project.iam.gserviceaccount.com
+                                  (used to share uploaded Drive files with backend)
 """
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import io
 import json
 import uuid
 import re
 import traceback
+import requests as http_requests   # renamed to avoid clash with Flask's request
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# ── Firebase Admin ────────────────────────────────────────────────────────────
+import firebase_admin
+from firebase_admin import credentials, firestore as fs_admin
+
+
+def _init_firebase():
+    """
+    Initialises Firebase Admin SDK.
+    Accepts either a path (GOOGLE_APPLICATION_CREDENTIALS env var) or an
+    inline JSON string (FIREBASE_SERVICE_ACCOUNT_JSON).
+    """
+    if firebase_admin._apps:
+        return
+
+    inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if inline_json:
+        try:
+            sa_dict = json.loads(inline_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+
+        # Debug print — safe because sa_dict is guaranteed to exist here
+        print("[Firebase] Using inline JSON credentials")
+        print("[Firebase] Keys found:", list(sa_dict.keys()))
+        print("[Firebase] Type field:", sa_dict.get('type'))
+
+        if sa_dict.get("type") != "service_account":
+            raise ValueError(
+                'FIREBASE_SERVICE_ACCOUNT_JSON must contain "type": "service_account". '
+                f'Got type={sa_dict.get("type")!r}. '
+                'Did you accidentally paste a file path instead of the JSON content?'
+            )
+        cred = credentials.Certificate(sa_dict)
+    else:
+        # Falls back to GOOGLE_APPLICATION_CREDENTIALS path automatically
+        print("[Firebase] Using Application Default Credentials")
+        cred = credentials.ApplicationDefault()
+
+    firebase_admin.initialize_app(cred)
+
+
+# Call it at module level — UNINDENTED
+_init_firebase()
+db_admin = fs_admin.client()
+
+
+# ── Local modules ─────────────────────────────────────────────────────────────
 from model import generate_answer, mark_answer, generate_exam_feedback
 from rag import RAGIndex
 import memory as mem
-import agent                        # import module so we can call set_rag()
+import agent
 from agent import run_agent
 
 app = Flask(__name__)
@@ -50,20 +111,26 @@ CORS(app, resources={r"/*": {"origins": [
 ]}})
 
 # ── Initialise RAG and inject into agent tools ────────────────────────────────
-# set_rag() makes the RAGIndex available to the @tool search_theory function
-# inside agent.py without needing to pass rag= on every HTTP request.
 rag = RAGIndex()
 agent.set_rag(rag)
 
+# ── Fallback for exams still stored as local JSON (migration period) ──────────
 EXAMS_FOLDER = "exams"
-sessions     = {}   # in-memory exam sessions (separate from agent memory)
+sessions     = {}   # in-memory exam sessions
+
+# ── Service-account email (backend shares Drive files to this address) ────────
+SERVICE_ACCOUNT_EMAIL = os.getenv(
+    "SERVICE_ACCOUNT_EMAIL",
+    ""   # set this in your PythonAnywhere env vars
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_exam(exam_name: str) -> dict | None:
+# ── Legacy: local JSON loader (kept for migration compatibility) ───────────────
+def load_exam_local(exam_name: str) -> dict | None:
     path = os.path.join(EXAMS_FOLDER, exam_name)
     if not os.path.exists(path):
         return None
@@ -71,8 +138,100 @@ def load_exam(exam_name: str) -> dict | None:
         return json.load(f)
 
 
+# ── Firestore: load exam metadata + questions ─────────────────────────────────
+def load_exam_from_firestore(exam_id: str) -> tuple[dict | None, list]:
+    """
+    Returns (exam_metadata_dict, flat_questions_list).
+    Questions come from the /exam_questions collection filtered by examId.
+    If no questions are found in Firestore, returns (meta, []) — caller can
+    then attempt the local JSON fallback.
+    """
+    try:
+        doc = db_admin.collection("exams").document(exam_id).get()
+        if not doc.exists:
+            return None, []
+
+        meta = doc.to_dict()
+        meta["id"] = doc.id
+
+        q_docs = (
+            db_admin.collection("exam_questions")
+            .where("examId", "==", exam_id)
+            .order_by("questionNumber")
+            .stream()
+        )
+
+        questions = []
+        for q in q_docs:
+            d = q.to_dict()
+            questions.append({
+                "id":               d.get("questionNumber", q.id),
+                "question_number":  str(d.get("questionNumber", "")),
+                "parent_question":  d.get("parentQuestion", ""),
+                "parent_context":   d.get("parentContext"),
+                "section":          d.get("section", "A"),
+                "section_title":    d.get("sectionTitle", ""),
+                "section_instructions": d.get("sectionInstructions", ""),
+                "section_total_marks":  d.get("sectionTotalMarks"),
+                "question":         d.get("questionText", "⚠️ Question text missing"),
+                "type":             d.get("type", "open").lower(),
+                "options":          d.get("options"),       # list of {key, value}
+                "column_a":         d.get("columnA"),
+                "column_b":         d.get("columnB"),
+                "marks":            d.get("marks", 1),
+                "memo":             d.get("memo", ""),
+                "saved_answer":     "",
+            })
+
+        return meta, questions
+
+    except Exception as e:
+        traceback.print_exc()
+        return None, []
+
+
+# ── Download a Drive file as bytes using the service account ──────────────────
+def download_from_drive_bytes(file_id: str) -> bytes | None:
+    """
+    Downloads a Drive file by ID using the service account's OAuth token.
+    Used by the extraction pipeline (scheduled_task.py).
+    Not called during normal exam serving — questions come from Firestore.
+    """
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request as GoogleRequest
+
+        inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if inline_json:
+            sa_info = json.loads(inline_json)
+            creds = service_account.Credentials.from_service_account_info(
+                sa_info,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            )
+        else:
+            sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+            creds = service_account.Credentials.from_service_account_file(
+                sa_path,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            )
+
+        creds.refresh(GoogleRequest())
+        token = creds.token
+
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        res = http_requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        if res.status_code == 200:
+            return res.content
+        print(f"[Drive] download failed: {res.status_code} {res.text[:200]}")
+        return None
+
+    except Exception as e:
+        traceback.print_exc()
+        return None
+
+
 def flatten_exam(exam: dict) -> list:
-    """Convert sections → flat list of question dicts with memo embedded."""
+    """Convert sections → flat list of question dicts (local JSON path only)."""
     flat     = []
     sections = exam.get("sections", [])
     if not sections and "questions" in exam:
@@ -133,7 +292,7 @@ def home():
     return r"""<!DOCTYPE html>
 <html>
 <head>
-<title>EduCAT — AI Agent</title>
+<title>Eduket — AI Agent</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Arial,sans-serif;background:#f4f6f9;color:#2c3e50}
@@ -243,7 +402,15 @@ textarea{width:100%;height:110px;margin-top:12px;padding:10px;border:1px solid #
 const studentId=localStorage.getItem('educat_sid')||'stu_'+Math.random().toString(36).slice(2,10);
 localStorage.setItem('educat_sid',studentId);
 document.getElementById('sidDisplay').textContent='ID: '+studentId;
+
+/*
+ * examIdMap: maps the <option> value shown in the UI to the Firestore examId.
+ * For Firestore exams the value IS the examId.
+ * For legacy local-file exams value is the filename (ends in _exam.json).
+ */
+let examIdMap = {};
 let sessionId=null,currentIdx=0,totalQ=0,currentType=null;
+
 function showPanel(name,e){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
@@ -270,20 +437,40 @@ async function clearHistory(){
   document.getElementById('chatMessages').innerHTML='';
   addMsg('agent','🗑 Chat history cleared. How can I help you?');
 }
+
+/* Load exam list — now returns objects with id, name, subject, grade */
 window.addEventListener('load',async()=>{
-  const res=await fetch('/exams');const data=await res.json();
-  const sel=document.getElementById('examSelect');sel.innerHTML='<option value="">— select exam —</option>';
-  (data.exams||[]).forEach(e=>{const o=document.createElement('option');o.value=e;o.text=e.replace('_exam.json','').replace(/_/g,' ');sel.appendChild(o);});
+  const res=await fetch('/exams');
+  const data=await res.json();
+  const sel=document.getElementById('examSelect');
+  sel.innerHTML='<option value="">— select exam —</option>';
+
+  (data.exams||[]).forEach(e=>{
+    const o=document.createElement('option');
+    const isLegacy = typeof e === 'string';          // old local-file format
+    if(isLegacy){
+      o.value = e;
+      o.text  = e.replace('_exam.json','').replace(/_/g,' ');
+    } else {
+      o.value = e.id;                                // Firestore doc ID
+      o.text  = `${e.name}${e.grade?' — Gr '+e.grade:''}${e.year?' ('+e.year+')':''}`;
+    }
+    sel.appendChild(o);
+  });
 });
+
 async function startExam(){
-  const exam=document.getElementById('examSelect').value;if(!exam){alert('Select an exam first.');return;}
+  const examVal=document.getElementById('examSelect').value;
+  if(!examVal){alert('Select an exam first.');return;}
   const res=await fetch('/start-exam',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({exam,student_id:studentId})});
+    body:JSON.stringify({exam:examVal,student_id:studentId})});
   const data=await res.json();if(data.error){alert(data.error);return;}
   sessionId=data.session_id;totalQ=data.total_questions;currentIdx=0;
   document.getElementById('memoStatus').innerHTML=data.memo_merged?'✅ Memo loaded':'⚠️ No memo — AI feedback only';
   document.getElementById('examArea').innerHTML='';showPanel('exam');loadQuestion();
 }
+
+/* --- rest of UI JS unchanged --- */
 async function loadQuestion(){
   const res=await fetch('/question',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({session_id:sessionId,index:currentIdx})});
@@ -360,28 +547,74 @@ async function loadDashboard(){
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ROUTES  —  all unchanged from before the migration
+# ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/exams", methods=["GET"])
 def list_exams():
+    """
+    Returns all available exams from TWO sources, merged:
+
+    1. Firestore /exams where status == "ready"
+       → returned as rich objects: {id, name, subject, grade, year, curriculum}
+
+    2. Local JSON files in EXAMS_FOLDER (legacy / migration fallback)
+       → returned as plain strings (filename) so the existing UI still works
+
+    The React AIExamMocker and the embedded home UI both handle both shapes.
+    Once all exams are migrated to Firestore you can remove the local fallback.
+    """
+    exams = []
+
+    # ── Source 1: Firestore ready exams ──────────────────────────────────────
     try:
-        exams = sorted([f for f in os.listdir(EXAMS_FOLDER) if f.endswith("_exam.json")])
-        return jsonify({"exams": exams})
+        docs = (
+            db_admin.collection("exams")
+            .where("status", "==", "ready")
+            .stream()
+        )
+        for doc in docs:
+            d = doc.to_dict()
+            exams.append({
+                "id":         doc.id,
+                "name":       d.get("title", doc.id),
+                "subject":    d.get("subject", ""),
+                "grade":      d.get("grade", ""),
+                "year":       d.get("year", ""),
+                "curriculum": d.get("curriculum", "CAPS"),
+                "source":     "firestore",
+            })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        print(f"[list_exams] Firestore error: {e}")
+
+    # ── Source 2: Local JSON files (legacy fallback) ──────────────────────────
+    try:
+        if os.path.isdir(EXAMS_FOLDER):
+            for fname in sorted(os.listdir(EXAMS_FOLDER)):
+                if fname.endswith("_exam.json"):
+                    # Skip if a Firestore exam with same title already listed
+                    display = fname.replace("_exam.json", "").replace("_", " ")
+                    already = any(
+                        e.get("name", "").lower() == display.lower()
+                        for e in exams
+                        if isinstance(e, dict)
+                    )
+                    if not already:
+                        exams.append(fname)   # plain string — legacy shape
+    except Exception as e:
+        print(f"[list_exams] Local folder error: {e}")
+
+    return jsonify({"exams": exams})
 
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():
-    """Agent chat endpoint — LangChain agent handles tool selection."""
     try:
         data       = request.get_json()
         student_id = data.get("student_id", "anonymous")
         message    = data.get("message", "").strip()
         if not message:
             return jsonify({"response": "⚠️ Please enter a message."})
-        # rag= is passed for backwards compatibility; agent.py stores it globally
         response = run_agent(student_id, message, rag=rag)
         return jsonify({"response": response})
     except Exception as e:
@@ -391,7 +624,6 @@ def agent_chat():
 
 @app.route("/clear-history", methods=["POST"])
 def clear_history():
-    """Clears both conversation_history and lc_message_store for this student."""
     data = request.get_json()
     mem.clear_history(data.get("student_id", ""))
     return jsonify({"status": "cleared"})
@@ -399,20 +631,73 @@ def clear_history():
 
 @app.route("/start-exam", methods=["POST"])
 def start_exam():
+    """
+    Accepts either:
+      • A Firestore examId  (new path) — loads questions from /exam_questions
+      • A legacy filename   (old path) — loads from local JSON file
+
+    Detection: if the value ends with "_exam.json" it is a legacy filename.
+    Otherwise it is treated as a Firestore doc ID.
+    """
     try:
         data       = request.get_json()
-        exam_name  = data.get("exam")
+        exam_value = data.get("exam", "").strip()
         student_id = data.get("student_id", "anonymous")
-        exam       = load_exam(exam_name)
-        if not exam:
-            return jsonify({"error": "❌ Exam not found"})
-        flat = flatten_exam(exam)
-        if not flat:
-            return jsonify({"error": "❌ No questions found"})
+
+        if not exam_value:
+            return jsonify({"error": "❌ No exam specified"})
+
+        flat       = []
+        memo_merged = False
+        exam_label  = exam_value   # used for session recording
+
+        # ── Path A: Firestore exam ────────────────────────────────────────────
+        if not exam_value.endswith("_exam.json"):
+            meta, flat = load_exam_from_firestore(exam_value)
+
+            if meta is None:
+                return jsonify({"error": f"❌ Exam '{exam_value}' not found in Firestore"})
+
+            memo_merged = bool(meta.get("memoDriveFileId"))
+            exam_label  = meta.get("title", exam_value)
+
+            # If extraction pipeline hasn't stored questions yet, surface a
+            # clear error rather than serving an empty exam.
+            if not flat:
+                status = meta.get("status", "unknown")
+                return jsonify({
+                    "error": (
+                        f"❌ Exam is not ready yet (status: {status}). "
+                        "The extraction pipeline may still be processing. "
+                        "Please try again in a few minutes."
+                    )
+                })
+
+        # ── Path B: Legacy local JSON ─────────────────────────────────────────
+        else:
+            exam = load_exam_local(exam_value)
+            if not exam:
+                return jsonify({"error": f"❌ Exam file '{exam_value}' not found"})
+            flat        = flatten_exam(exam)
+            memo_merged = exam.get("memo_merged", False)
+            if not flat:
+                return jsonify({"error": "❌ No questions found in exam file"})
+
         mem.ensure_student(student_id)
         sid = str(uuid.uuid4())
-        sessions[sid] = {"exam": exam_name, "student_id": student_id, "questions": flat, "answers": {}}
-        return jsonify({"session_id": sid, "total_questions": len(flat), "memo_merged": exam.get("memo_merged", False)})
+        sessions[sid] = {
+            "exam":       exam_label,
+            "student_id": student_id,
+            "questions":  flat,
+            "answers":    {},
+        }
+
+        return jsonify({
+            "session_id":      sid,
+            "total_questions": len(flat),
+            "memo_merged":     memo_merged,
+        })
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)})
@@ -486,14 +771,12 @@ def submit_exam():
                 student_answer=student, memo=memo, marks=marks, options=options,
             )
 
-            # Update weak topic memory
             if result.get("status") in ("incorrect", "missing"):
                 topic = q.get("parent_question", "").split(":")[1].strip() if ":" in q.get("parent_question", "") else ""
                 mem.record_wrong(student_id, q_num, q_text, q_type, topic)
             elif result.get("status") == "correct":
                 mem.record_correct(student_id, q_num)
 
-            # Build correct_answer display string
             if isinstance(memo, dict) and memo:
                 correct_display = " | ".join(f"{k.split()[0]} → {v}" for k, v in memo.items())
             elif memo:
@@ -525,7 +808,6 @@ def submit_exam():
         mem.save_session(student_id, exam_name, total_score, total_marks, percentage)
         feedback = generate_exam_feedback(results, total_score, total_marks, percentage)
 
-        # Agent auto-updates study plan based on new weak areas
         weak = mem.get_weak_topics(student_id)
         if weak:
             try:
@@ -536,7 +818,7 @@ def submit_exam():
                     rag=rag,
                 )
             except Exception:
-                pass  # non-critical
+                pass
 
         return jsonify({
             "score": total_score, "total": total_marks,

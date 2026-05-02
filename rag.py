@@ -1,42 +1,51 @@
 """
-rag.py  —  EduCAT RAG Index with Google Drive Integration
+rag.py  —  EduCAT RAG  (Groq-native, zero disk storage)
+
+HOW IT WORKS
+────────────
+Previous version used FAISS which wrote large binary index files to disk —
+a problem on PythonAnywhere's limited storage quota.
+
+This version replaces FAISS entirely with a two-stage Groq approach:
+
+  Stage 1 — Lightweight keyword index (stored in Firestore, ~1–2 KB per chunk)
+    When a new theory PDF is detected in Google Drive, the text is extracted,
+    split into chunks, and each chunk is stored as a Firestore document in
+    /rag_chunks/{chunkId}.  No local files written at all.
+
+  Stage 2 — Groq LLM reranking at query time (in-memory, no disk)
+    When search() is called:
+      a. Pull candidate chunks from Firestore using simple keyword matching
+         (Firestore array-contains on a keywords field we store per chunk).
+      b. Send the top N candidates + the query to Groq's llama3 model with a
+         reranking prompt — ask it to select and summarise the most relevant.
+      c. Return the reranked results.
+
+WHY THIS IS FINE FOR EDUCAT
+────────────────────────────
+• Theory books for CAPS/IEB subjects are not huge — a few hundred chunks total.
+• Firestore reads are fast (<100ms) and the free tier handles thousands/day.
+• Groq's llama3-8b-8192 is extremely fast (tokens/sec) and the free tier
+  covers well more traffic than a school-sized deployment needs.
+• Zero disk usage on PythonAnywhere — the only I/O is temp PDF download
+  during extraction, which is deleted immediately after chunking.
 
 ROLE IN THE SYSTEM
 ──────────────────
-This module handles THEORY BOOKS only — textbooks, study guides, past-paper
-explanations — uploaded into a Google Drive folder you designate.
-
-It does NOT handle exam papers. Exam papers are:
-  • Uploaded by teachers via the React frontend
-  • Stored as Drive file references in Firestore /exams
-  • Extracted by scheduled_task.py into /exam_questions
-  • Served to students via /start-exam in app.py
-
-RAG's job is to give the AI agent searchable background knowledge so it can
-answer "explain capacitors", "what is a LAN?", "define GDP" etc.
-
-WHAT THIS VERSION FIXES
-───────────────────────
-1. No longer a generator script — this IS rag.py, deploy it directly.
-2. FAISS cache stored at ~/educat_faiss/ (persistent on PythonAnywhere,
-   not /tmp which is wiped on restart).
-3. Subject detection uses word-boundary regex — "cat" no longer matches
-   inside "concatenate.pdf".
-4. Clear startup message when env vars are missing instead of silent failure.
-5. firebase_admin initialisation deferred so it reuses app.py's instance.
+This module handles THEORY BOOKS only — textbooks, study guides.
+Exam papers are handled by the separate extraction pipeline (scheduled_task.py)
+and stored in /exams + /exam_questions in Firestore.
 
 ENVIRONMENT VARIABLES
 ─────────────────────
-  GOOGLE_APPLICATION_CREDENTIALS  path to service account JSON
-      OR
-  FIREBASE_SERVICE_ACCOUNT_JSON   inline JSON string (PythonAnywhere env var)
+  GROQ_API_KEY                    Groq API key (already set for marking)
+  FIREBASE_SERVICE_ACCOUNT_JSON   Inline service account JSON (or)
+  GOOGLE_APPLICATION_CREDENTIALS  Path to service account file
 
-  HF_TOKEN                        HuggingFace token (sentence-transformers)
-  EDUCAT_DRIVE_FOLDER_ID          Drive folder ID containing theory PDFs
-  EDUCAT_OUTPUT_FOLDER_ID         Drive folder ID for extracted chunks output
-                                  (optional — skipped if blank)
-  EDUCAT_FAISS_DIR                Local directory for FAISS cache
-                                  (default: ~/educat_faiss)
+  EDUCAT_DRIVE_FOLDER_ID          Drive folder containing theory PDFs
+  EDUCAT_OUTPUT_FOLDER_ID         Optional: Drive folder for chunk JSON backups
+  EDUCAT_RAG_CANDIDATES           How many keyword candidates to pull before
+                                  Groq reranking (default: 20)
 """
 
 import os
@@ -50,15 +59,13 @@ from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
-# ── LangChain ────────────────────────────────────────────────────────────────
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
+# ── Groq ─────────────────────────────────────────────────────────────────────
+from groq import Groq
 
 # ── Google Drive ─────────────────────────────────────────────────────────────
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 load_dotenv()
 
@@ -66,31 +73,22 @@ load_dotenv()
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("HF_TOKEN is not set. Get one at https://huggingface.co/settings/tokens")
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+GROQ_RAG_MODEL    = "llama3-8b-8192"   # fast + generous free tier
+GROQ_MAX_TOKENS   = 1024
 
-MODEL_NAME    = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE    = 1000
-CHUNK_OVERLAP = 200
+SOURCE_FOLDER_ID  = os.getenv("EDUCAT_DRIVE_FOLDER_ID", "")
+OUTPUT_FOLDER_ID  = os.getenv("EDUCAT_OUTPUT_FOLDER_ID", "")
+RAG_CANDIDATES    = int(os.getenv("EDUCAT_RAG_CANDIDATES", "20"))
 
-SOURCE_FOLDER_ID = os.getenv("EDUCAT_DRIVE_FOLDER_ID", "")
-OUTPUT_FOLDER_ID = os.getenv("EDUCAT_OUTPUT_FOLDER_ID", "")
+CHUNK_SIZE        = 900    # chars — kept small so Groq context fits many chunks
+CHUNK_OVERLAP     = 150
 
-# FIX: persistent path — not /tmp which is wiped on PythonAnywhere restart
-FAISS_CACHE_DIR = os.getenv(
-    "EDUCAT_FAISS_DIR",
-    os.path.join(os.path.expanduser("~"), "educat_faiss")
-)
-os.makedirs(FAISS_CACHE_DIR, exist_ok=True)
-
-# ── Subject patterns ─────────────────────────────────────────────────────────
-# FIX: All patterns use \b word-boundaries so "cat" won't match "concatenate"
+# ── Subject detection (word-boundary safe) ───────────────────────────────────
 SUBJECT_PATTERNS = {
     r"\bmathematics\b":             "Mathematics",
     r"\bmaths\b":                   "Mathematics",
-    r"\bmath\s+lit\b":              "Mathematical Literacy",
-    r"\bmath_lit\b":                "Mathematical Literacy",
+    r"\bmath[\s_]lit\b":            "Mathematical Literacy",
     r"\btechnical[\s_]math\b":      "Technical Mathematics",
     r"\bphysical[\s_]sciences?\b":  "Physical Sciences",
     r"\blife[\s_]sciences?\b":      "Life Sciences",
@@ -99,7 +97,7 @@ SUBJECT_PATTERNS = {
     r"\baccounting\b":              "Accounting",
     r"\beconomics\b":               "Economics",
     r"\bbusiness[\s_]studies\b":    "Business Studies",
-    r"\bcat\b":                     "Computer Applications Technology",   # word boundary
+    r"\bcat\b":                     "Computer Applications Technology",
     r"\b(?:it|info[\s_]tech)\b":    "Information Technology",
     r"\beng[\s_]graphics\b":        "Engineering Graphics & Design",
     r"\benglish\b":                 "English",
@@ -114,24 +112,138 @@ _EXAM_KEYWORDS = [
 ]
 _MEMO_KEYWORDS = ["memo", "memorandum", "answers", "answer_key", "marking"]
 
-# ── Embeddings (module-level singleton) ──────────────────────────────────────
-_embeddings = HuggingFaceEndpointEmbeddings(
-    model=MODEL_NAME,
-    huggingfacehub_api_token=HF_TOKEN,
-)
+# ── Groq client (module-level) ────────────────────────────────────────────────
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is not set.")
+_groq = Groq(api_key=GROQ_API_KEY)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GOOGLE DRIVE SERVICE
+# FIRESTORE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _get_drive_service():
-    """Build authenticated Drive service from service account credentials."""
+def _get_db():
+    """Return Firestore client — reuses firebase_admin if already initialised."""
+    import firebase_admin
+    from firebase_admin import firestore as fsa, credentials
+
+    if not firebase_admin._apps:
+        inline = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+        cred = (credentials.Certificate(json.loads(inline))
+                if inline else credentials.ApplicationDefault())
+        firebase_admin.initialize_app(cred)
+
+    return fsa.client()
+
+
+# ─── Processed-file tracking ──────────────────────────────────────────────────
+
+def _get_processed_ids() -> set:
+    try:
+        return {d.id for d in _get_db().collection("rag_processed_pdfs").stream()}
+    except Exception as e:
+        print(f"[RAG] Could not load processed IDs: {e}")
+        return set()
+
+
+def _mark_processed(file_id: str, filename: str, subject: str,
+                    status: str = "completed", chunks: int = 0):
+    try:
+        _get_db().collection("rag_processed_pdfs").document(file_id).set({
+            "filename":     filename,
+            "subject":      subject,
+            "status":       status,
+            "chunks":       chunks,
+            "processed_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[RAG] Could not mark processed: {e}")
+
+
+def _mark_failed(file_id: str, filename: str, error: str):
+    try:
+        _get_db().collection("rag_processed_pdfs").document(file_id).set({
+            "filename":     filename,
+            "status":       "failed",
+            "error":        error[:500],
+            "processed_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[RAG] Could not mark failed: {e}")
+
+
+# ─── Chunk storage ────────────────────────────────────────────────────────────
+
+def _save_chunks_to_firestore(chunks: list[dict]):
+    """
+    Store extracted text chunks in Firestore /rag_chunks.
+    Each document:
+      content   : str   — the raw chunk text
+      source    : str   — filename it came from
+      subject   : str   — detected subject
+      page_num  : int
+      keywords  : list  — cleaned lowercase words for keyword matching
+      chunk_id  : str   — md5 hash (document ID)
+    """
+    db    = _get_db()
+    batch = db.batch()
+    count = 0
+
+    for chunk in chunks:
+        ref = db.collection("rag_chunks").document(chunk["chunk_id"])
+        batch.set(ref, chunk, merge=True)
+        count += 1
+
+        # Firestore batches are limited to 500 operations
+        if count % 400 == 0:
+            batch.commit()
+            batch = db.batch()
+
+    if count % 400 != 0:
+        batch.commit()
+
+
+def _keyword_search_firestore(keywords: list[str], subject_filter: str = "",
+                               limit: int = RAG_CANDIDATES) -> list[dict]:
+    """
+    Pull candidate chunks from Firestore using keyword matching.
+
+    Strategy: run one query per keyword (Firestore array-contains is single-key),
+    collect results, deduplicate by chunk_id, return top `limit` by keyword hits.
+    """
+    db       = _get_db()
+    seen     = {}      # chunk_id → (chunk_dict, hit_count)
+
+    for kw in keywords[:8]:   # cap at 8 keywords to limit read ops
+        try:
+            q = db.collection("rag_chunks").where("keywords", "array_contains", kw)
+            if subject_filter:
+                q = q.where("subject", "==", subject_filter)
+            q = q.limit(limit)
+            for doc in q.stream():
+                d = doc.to_dict()
+                cid = d.get("chunk_id", doc.id)
+                if cid in seen:
+                    seen[cid] = (seen[cid][0], seen[cid][1] + 1)
+                else:
+                    seen[cid] = (d, 1)
+        except Exception as e:
+            print(f"[RAG] Keyword query error for '{kw}': {e}")
+
+    # Sort by hit count descending, return top candidates
+    ranked = sorted(seen.values(), key=lambda x: x[1], reverse=True)
+    return [item[0] for item in ranked[:limit]]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOOGLE DRIVE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_drive():
     inline = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
     if inline:
-        sa_info = json.loads(inline)
         creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
+            json.loads(inline), scopes=["https://www.googleapis.com/auth/drive"]
         )
     else:
         sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
@@ -141,81 +253,17 @@ def _get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FIRESTORE TRACKING
-# Reuses the firebase_admin instance already initialised by app.py.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _get_firestore_client():
-    """Get Firestore client — reuses existing firebase_admin instance if present."""
-    import firebase_admin
-    from firebase_admin import firestore as fs_admin, credentials
-
-    if not firebase_admin._apps:
-        inline = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-        if inline:
-            cred = credentials.Certificate(json.loads(inline))
-        else:
-            cred = credentials.ApplicationDefault()
-        firebase_admin.initialize_app(cred)
-
-    return fs_admin.client()
-
-
-def _get_processed_files() -> set:
-    """Return set of Drive file IDs already indexed (from Firestore)."""
-    try:
-        db   = _get_firestore_client()
-        docs = db.collection("rag_processed_pdfs").stream()
-        return {doc.id for doc in docs}
-    except Exception as e:
-        print(f"[RAG] Could not load processed files: {e}")
-        return set()
-
-
-def _mark_file_processed(file_id: str, filename: str, subject: str,
-                          status: str = "completed", chunks: int = 0):
-    try:
-        db = _get_firestore_client()
-        db.collection("rag_processed_pdfs").document(file_id).set({
-            "filename":     filename,
-            "subject":      subject,
-            "status":       status,
-            "chunks":       chunks,
-            "processed_at": datetime.utcnow().isoformat(),
-        })
-    except Exception as e:
-        print(f"[RAG] Could not mark file processed: {e}")
-
-
-def _mark_file_failed(file_id: str, filename: str, error: str):
-    try:
-        db = _get_firestore_client()
-        db.collection("rag_processed_pdfs").document(file_id).set({
-            "filename":     filename,
-            "status":       "failed",
-            "error":        error[:500],
-            "processed_at": datetime.utcnow().isoformat(),
-        })
-    except Exception as e:
-        print(f"[RAG] Could not mark file failed: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DRIVE FILE OPERATIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _list_pdfs_in_folder(folder_id: str) -> list[dict]:
+def _list_pdfs(folder_id: str) -> list[dict]:
     if not folder_id:
         return []
-    service   = _get_drive_service()
-    query     = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
-    results   = []
+    svc        = _get_drive()
+    q          = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+    results    = []
     page_token = None
     while True:
-        resp = service.files().list(
-            q=query, spaces="drive", pageToken=page_token, pageSize=100,
-            fields="nextPageToken, files(id, name, modifiedTime, size)"
+        resp = svc.files().list(
+            q=q, spaces="drive", pageToken=page_token, pageSize=100,
+            fields="nextPageToken, files(id, name, size)"
         ).execute()
         results.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
@@ -225,50 +273,25 @@ def _list_pdfs_in_folder(folder_id: str) -> list[dict]:
 
 
 def _download_pdf(file_id: str, filename: str) -> str:
-    """Download Drive PDF to a temp file. Caller must delete the file."""
-    service = _get_drive_service()
-    req     = service.files().get_media(fileId=file_id)
-    suffix  = os.path.splitext(filename)[1] or ".pdf"
-    fd, local_path = tempfile.mkstemp(suffix=suffix)
+    """Download PDF to temp file. Caller must delete after use."""
+    svc        = _get_drive()
+    req        = svc.files().get_media(fileId=file_id)
+    suffix     = os.path.splitext(filename)[1] or ".pdf"
+    fd, path   = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
-    with io.FileIO(local_path, "wb") as fh:
+    with io.FileIO(path, "wb") as fh:
         dl = MediaIoBaseDownload(fh, req)
         done = False
         while not done:
             _, done = dl.next_chunk()
-    return local_path
-
-
-def _upload_to_drive(local_path: str, filename: str, parent_id: str,
-                     mime_type: str = "application/json") -> Optional[str]:
-    if not parent_id:
-        return None
-    service = _get_drive_service()
-    meta    = {"name": filename, "parents": [parent_id]}
-    media   = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-    f       = service.files().create(body=meta, media_body=media, fields="id").execute()
-    return f.get("id")
-
-
-def _ensure_drive_folder(parent_id: str, folder_name: str) -> str:
-    service = _get_drive_service()
-    q = (f"'{parent_id}' in parents "
-         f"and mimeType='application/vnd.google-apps.folder' "
-         f"and name='{folder_name}' and trashed=false")
-    items = service.files().list(q=q, spaces="drive", fields="files(id)").execute().get("files", [])
-    if items:
-        return items[0]["id"]
-    meta   = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    folder = service.files().create(body=meta, fields="id").execute()
-    return folder.get("id")
+    return path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PDF TEXT EXTRACTION
+# PDF EXTRACTION + CHUNKING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _detect_subject(filename: str) -> str:
-    """Detect subject from filename using word-boundary patterns."""
     lower = filename.lower()
     for pattern, subject in SUBJECT_PATTERNS.items():
         if re.search(pattern, lower):
@@ -277,11 +300,7 @@ def _detect_subject(filename: str) -> str:
 
 
 def _is_rag_eligible(filename: str) -> bool:
-    """
-    Returns True for theory/study content suitable for RAG indexing.
-    Returns False for exam papers and memos — those are handled separately
-    by the exam extraction pipeline (scheduled_task.py).
-    """
+    """Theory books only — exclude exam papers and memos."""
     lower = filename.lower()
     if any(kw in lower for kw in _MEMO_KEYWORDS):
         return False
@@ -290,270 +309,363 @@ def _is_rag_eligible(filename: str) -> bool:
     return True
 
 
-def _extract_text_pdfplumber(pdf_path: str) -> list[dict]:
+def _extract_pages(pdf_path: str) -> list[dict]:
+    """Extract page text — tries pdfplumber, falls back to pypdf."""
+    # Try pdfplumber
     try:
         import pdfplumber
         pages = []
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                if text and text.strip():
-                    pages.append({
-                        "page_num": i + 1,
-                        "text":     text.strip(),
-                        "tables":   page.extract_tables() or [],
-                    })
-        return pages
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages.append({"page_num": i + 1, "text": text.strip()})
+        if pages:
+            return pages
     except Exception as e:
         print(f"    [pdfplumber] {e}")
-        return []
 
-
-def _extract_text_pypdf(pdf_path: str) -> list[dict]:
+    # Fallback to pypdf
     try:
         from pypdf import PdfReader
         pages = []
         for i, page in enumerate(PdfReader(pdf_path).pages):
-            text = page.extract_text()
-            if text and text.strip():
-                pages.append({"page_num": i + 1, "text": text.strip(), "tables": []})
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append({"page_num": i + 1, "text": text.strip()})
         return pages
     except Exception as e:
         print(f"    [pypdf] {e}")
         return []
 
 
-def _extract_pdf(pdf_path: str) -> list[dict]:
-    pages = _extract_text_pdfplumber(pdf_path)
-    return pages if pages else _extract_text_pypdf(pdf_path)
+def _extract_keywords(text: str) -> list[str]:
+    """
+    Extract meaningful keywords from chunk text for Firestore keyword search.
+    Returns lowercase words, 4+ chars, deduplicated, max 40.
+    """
+    words = re.findall(r"[a-zA-Z]{4,}", text.lower())
+    # Remove common stop words
+    stops = {
+        "that", "this", "with", "from", "have", "will", "been",
+        "they", "were", "when", "what", "which", "their", "there",
+        "about", "would", "could", "should", "also", "into", "some",
+        "more", "than", "then", "each", "such", "only", "most",
+    }
+    filtered = [w for w in words if w not in stops]
+    # Deduplicate preserving order, take top 40
+    seen  = set()
+    uniq  = []
+    for w in filtered:
+        if w not in seen:
+            seen.add(w)
+            uniq.append(w)
+        if len(uniq) >= 40:
+            break
+    return uniq
 
 
-def _chunk_text(text: str, source: str, page_num: int, subject: str) -> list[Document]:
+def _chunk_page(text: str, source: str, page_num: int,
+                subject: str) -> list[dict]:
+    """Split page text into overlapping chunks stored as plain dicts."""
     if not text or len(text.strip()) < 50:
         return []
+
     chunks = []
     start  = 0
     tlen   = len(text)
+
     while start < tlen:
         end = min(start + CHUNK_SIZE, tlen)
+        # Try to break at sentence boundary
         if end < tlen:
-            for pos in range(end, max(start + CHUNK_SIZE // 2, end - 200), -1):
-                if pos < tlen and text[pos] in ".!?\n":
+            for pos in range(end, max(start + CHUNK_SIZE // 2, end - 150), -1):
+                if text[pos] in ".!?\n":
                     end = pos + 1
                     break
-        chunk = text[start:end].strip()
-        if chunk:
-            cid = hashlib.md5(f"{source}:{page_num}:{start}:{chunk[:100]}".encode()).hexdigest()
-            chunks.append(Document(
-                page_content=chunk,
-                metadata={"source": source, "page_num": page_num,
-                           "chunk_id": cid, "subject": subject},
-            ))
+        content = text[start:end].strip()
+        if content:
+            cid = hashlib.md5(
+                f"{source}:{page_num}:{start}:{content[:80]}".encode()
+            ).hexdigest()
+            chunks.append({
+                "chunk_id":  cid,
+                "content":   content,
+                "source":    source,
+                "subject":   subject,
+                "page_num":  page_num,
+                "keywords":  _extract_keywords(content),
+            })
         start = end - CHUNK_OVERLAP if end < tlen else end
+
     return chunks
 
 
-def _process_pdf(file_id: str, filename: str) -> tuple[list[Document], str]:
-    subject = _detect_subject(filename)
-    print(f"    Subject detected: {subject}")
-    print(f"    Downloading...")
+def _process_pdf(file_id: str, filename: str) -> tuple[list[dict], str]:
+    """
+    Download, extract and chunk a single PDF.
+    Temp file is deleted immediately after extraction.
+    Returns (chunks, subject).
+    """
+    subject    = _detect_subject(filename)
     local_path = _download_pdf(file_id, filename)
     try:
-        pages = _extract_pdf(local_path)
+        pages = _extract_pages(local_path)
         if not pages:
-            print(f"    No text extracted")
+            print(f"    No text extracted from {filename}")
             return [], subject
-        print(f"    {len(pages)} pages extracted")
-        docs = []
+
+        print(f"    {len(pages)} pages | subject: {subject}")
+        all_chunks = []
         for page in pages:
-            docs.extend(_chunk_text(page["text"], filename, page["page_num"], subject))
-        print(f"    {len(docs)} chunks created")
-        return docs, subject
+            all_chunks.extend(
+                _chunk_page(page["text"], filename, page["page_num"], subject)
+            )
+        print(f"    {len(all_chunks)} chunks created")
+        return all_chunks, subject
     finally:
         try:
-            os.unlink(local_path)
+            os.unlink(local_path)    # delete temp file immediately
         except Exception:
             pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FAISS INDEX
+# GROQ RERANKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DriveRAGIndex:
+def _groq_rerank(query: str, candidates: list[dict], k: int = 4) -> list[dict]:
     """
-    RAG index backed by Google Drive.
+    Send candidate chunks to Groq and ask it to select + paraphrase the
+    most relevant ones for the query.
 
-    Theory PDFs → Drive (EDUCAT_DRIVE_FOLDER_ID)
-                → downloaded + extracted on first encounter
-                → chunks stored in FAISS
-                → FAISS persisted to ~/educat_faiss/ (survives PythonAnywhere restarts)
-                → processed file IDs tracked in Firestore /rag_processed_pdfs
+    Returns a list of result dicts with keys:
+      content, source, subject, page_num, score (1-10 from model)
+    """
+    if not candidates:
+        return []
+
+    # Build numbered context block — trim to avoid hitting token limits
+    context_lines = []
+    for i, c in enumerate(candidates, 1):
+        preview = c.get("content", "")[:400].replace("\n", " ")
+        context_lines.append(
+            f"[{i}] Source: {c.get('source','?')} | "
+            f"Subject: {c.get('subject','?')} | "
+            f"Page: {c.get('page_num','?')}\n{preview}"
+        )
+    context_block = "\n\n".join(context_lines)
+
+    prompt = f"""You are a study assistant for South African high school students.
+
+A student asked: "{query}"
+
+Below are {len(candidates)} text excerpts from theory books.
+Select the {k} most relevant excerpts and for each one:
+1. Give it a relevance score from 1-10.
+2. Write a concise 1-3 sentence explanation using that excerpt's content.
+
+Respond in JSON only — no extra text — as a list:
+[
+  {{
+    "index": <1-based index from the list above>,
+    "score": <1-10>,
+    "explanation": "<concise explanation using the excerpt>"
+  }},
+  ...
+]
+
+EXCERPTS:
+{context_block}
+"""
+
+    try:
+        resp = _groq.chat.completions.create(
+            model=GROQ_RAG_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=GROQ_MAX_TOKENS,
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        ranked = json.loads(raw)
+        results = []
+        for item in ranked:
+            idx = item.get("index", 1) - 1
+            if 0 <= idx < len(candidates):
+                c = candidates[idx]
+                results.append({
+                    "content":  item.get("explanation", c.get("content", ""))[:600],
+                    "source":   c.get("source", ""),
+                    "subject":  c.get("subject", ""),
+                    "page_num": c.get("page_num", 0),
+                    "score":    item.get("score", 5),
+                })
+        # Sort by Groq's score descending
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:k]
+
+    except json.JSONDecodeError:
+        # Groq didn't return clean JSON — fall back to top-k by keyword hits
+        print("[RAG] Groq rerank JSON parse failed — using raw candidates")
+        return [
+            {
+                "content":  c.get("content", "")[:400],
+                "source":   c.get("source", ""),
+                "subject":  c.get("subject", ""),
+                "page_num": c.get("page_num", 0),
+                "score":    5,
+            }
+            for c in candidates[:k]
+        ]
+
+    except Exception as e:
+        print(f"[RAG] Groq rerank error: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RAGIndex:
+    """
+    Zero-disk RAG index.
+
+    Extraction (one-time per PDF):
+      Drive PDF → extract text → chunk → store in Firestore /rag_chunks
+      Processed file IDs tracked in /rag_processed_pdfs
+
+    Search (each query):
+      Query → keyword extraction → Firestore keyword fetch →
+      Groq reranking → return top-k results
+
+    No FAISS, no local index files, no HuggingFace token needed.
+    The only I/O on disk is a short-lived temp file during PDF download,
+    deleted immediately after chunking.
     """
 
     def __init__(self):
-        self._store: Optional[FAISS] = None
-        self._local_index_path = os.path.join(FAISS_CACHE_DIR, "faiss_index")
-        self._load_or_build()
+        self._check_env()
+        self._ingest_new_pdfs()
 
-    def _load_or_build(self):
-        # Try loading existing FAISS index from persistent local cache
-        if os.path.exists(self._local_index_path):
-            try:
-                self._store = FAISS.load_local(
-                    self._local_index_path, _embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                print(f"[RAG] Loaded FAISS index from {self._local_index_path}")
-            except Exception as e:
-                print(f"[RAG] Could not load FAISS cache: {e}")
-                self._store = None
-
+    def _check_env(self):
         if not SOURCE_FOLDER_ID:
             print("[RAG] WARNING: EDUCAT_DRIVE_FOLDER_ID not set.")
-            print("[RAG]   Theory book search will return empty results.")
-            print("[RAG]   Set this env var to a Drive folder containing .pdf textbooks.")
+            print("[RAG]   No PDFs will be indexed. Set this env var to a")
+            print("[RAG]   Google Drive folder containing theory textbooks.")
+        else:
+            print(f"[RAG] Source folder: {SOURCE_FOLDER_ID}")
+
+    def _ingest_new_pdfs(self):
+        """Check Drive folder for new PDFs and index any not yet processed."""
+        if not SOURCE_FOLDER_ID:
             return
 
-        processed_ids = _get_processed_files()
-        all_pdfs      = _list_pdfs_in_folder(SOURCE_FOLDER_ID)
-        eligible      = [p for p in all_pdfs if _is_rag_eligible(p["name"])]
-        new_pdfs      = [p for p in eligible if p["id"] not in processed_ids]
+        processed   = _get_processed_ids()
+        all_pdfs    = _list_pdfs(SOURCE_FOLDER_ID)
+        eligible    = [p for p in all_pdfs if _is_rag_eligible(p["name"])]
+        new_pdfs    = [p for p in eligible if p["id"] not in processed]
 
-        print(f"[RAG] {len(all_pdfs)} PDFs in folder | "
-              f"{len(eligible)} eligible | "
-              f"{len(processed_ids)} already processed | "
-              f"{len(new_pdfs)} new")
+        print(
+            f"[RAG] {len(all_pdfs)} PDFs in Drive | "
+            f"{len(eligible)} eligible | "
+            f"{len(processed)} already indexed | "
+            f"{len(new_pdfs)} new"
+        )
 
-        if not new_pdfs:
-            if not self._store:
-                print("[RAG] No index and no new PDFs — search will return empty results.")
-            return
-
-        all_new_docs: list[Document] = []
         for pdf in new_pdfs:
             fid, fname = pdf["id"], pdf["name"]
-            print(f"\n  [RAG] Processing: {fname}")
+            print(f"\n  [RAG] Indexing: {fname}")
             try:
-                docs, subject = _process_pdf(fid, fname)
-                if docs:
-                    all_new_docs.extend(docs)
-                    _mark_file_processed(fid, fname, subject, "completed", len(docs))
-                    if OUTPUT_FOLDER_ID:
-                        self._save_chunks_to_drive(docs, fname, subject)
+                chunks, subject = _process_pdf(fid, fname)
+                if chunks:
+                    print(f"    Saving {len(chunks)} chunks to Firestore...")
+                    _save_chunks_to_firestore(chunks)
+                    _mark_processed(fid, fname, subject, "completed", len(chunks))
+                    print(f"    Done.")
                 else:
-                    _mark_file_processed(fid, fname, _detect_subject(fname), "empty", 0)
+                    _mark_processed(fid, fname, _detect_subject(fname), "empty", 0)
             except Exception as e:
                 traceback.print_exc()
-                _mark_file_failed(fid, fname, str(e))
+                _mark_failed(fid, fname, str(e))
 
-        if all_new_docs:
-            print(f"\n[RAG] Embedding {len(all_new_docs)} chunks...")
-            if self._store is None:
-                self._store = FAISS.from_documents(all_new_docs, _embeddings)
-            else:
-                self._store.add_documents(all_new_docs)
-            self._store.save_local(self._local_index_path)
-            print(f"[RAG] FAISS index saved to {self._local_index_path}")
-            if OUTPUT_FOLDER_ID:
-                self._backup_index_to_drive()
+        print("[RAG] Ingestion complete.")
 
-        print("[RAG] Index ready.")
-
-    def _save_chunks_to_drive(self, docs: list[Document], filename: str, subject: str):
-        try:
-            folder_id     = _ensure_drive_folder(OUTPUT_FOLDER_ID, subject)
-            chunks_data   = [{
-                "content":   d.page_content,
-                "source":    d.metadata.get("source", filename),
-                "page_num":  d.metadata.get("page_num", 0),
-                "chunk_id":  d.metadata.get("chunk_id", ""),
-                "subject":   d.metadata.get("subject", subject),
-            } for d in docs]
-            base          = os.path.splitext(filename)[0]
-            fd, tmp_path  = tempfile.mkstemp(suffix=".json")
-            os.close(fd)
-            with open(tmp_path, "w") as f:
-                json.dump(chunks_data, f, indent=2)
-            _upload_to_drive(tmp_path, f"{base}_chunks.json", folder_id)
-            os.unlink(tmp_path)
-            print(f"    Chunks saved to Drive → {subject}/{base}_chunks.json")
-        except Exception as e:
-            print(f"    Could not save chunks to Drive: {e}")
-
-    def _backup_index_to_drive(self):
-        try:
-            folder_id = _ensure_drive_folder(OUTPUT_FOLDER_ID, "faiss_index")
-            for fname in os.listdir(self._local_index_path):
-                fpath = os.path.join(self._local_index_path, fname)
-                if os.path.isfile(fpath):
-                    _upload_to_drive(fpath, fname, folder_id)
-            print("[RAG] FAISS index backed up to Drive.")
-        except Exception as e:
-            print(f"[RAG] Could not backup index to Drive: {e}")
-
-    def search(self, query: str, k: int = 3, subject_filter: str = "") -> list[dict]:
+    def search(self, query: str, k: int = 4,
+               subject_filter: str = "") -> list[dict]:
         """
-        Search theory index for content relevant to the query.
+        Search theory content relevant to query.
 
         Args:
-            query:          Natural language query
-            k:              Number of results to return
-            subject_filter: Optional subject name to restrict results
+            query:          Natural language question or topic
+            k:              Number of results to return (default 4)
+            subject_filter: Limit to a subject e.g. "Mathematics" (optional)
 
         Returns:
-            list of {"content", "source", "score", "subject", "page_num"}
+            list of dicts:
+              content   : str   explanation from Groq using the source chunk
+              source    : str   filename the chunk came from
+              subject   : str   detected subject
+              page_num  : int
+              score     : int   Groq relevance score 1-10
         """
-        if not self._store:
+        if not query or not query.strip():
             return []
 
-        raw = self._store.similarity_search_with_score(query, k=k * 2)
-        results = []
-        for doc, score in raw:
-            results.append({
-                "content":  doc.page_content,
-                "source":   doc.metadata.get("source", "unknown"),
-                "score":    round(float(score), 4),
-                "subject":  doc.metadata.get("subject", "General"),
-                "page_num": doc.metadata.get("page_num", 0),
-            })
+        # Stage 1: keyword extraction from query
+        query_keywords = _extract_keywords(query)
+        if not query_keywords:
+            # Fallback: split query into words
+            query_keywords = [w.lower() for w in query.split() if len(w) >= 4]
 
-        if subject_filter:
-            results = [r for r in results if r["subject"].lower() == subject_filter.lower()]
+        # Stage 2: Firestore keyword fetch
+        candidates = _keyword_search_firestore(
+            query_keywords,
+            subject_filter=subject_filter,
+            limit=RAG_CANDIDATES,
+        )
 
-        return results[:k]
+        if not candidates:
+            return []
+
+        # Stage 3: Groq reranking
+        return _groq_rerank(query, candidates, k=k)
 
     def get_stats(self) -> dict:
-        """Return index statistics from Firestore tracking collection."""
+        """Return indexing statistics."""
         try:
-            db      = _get_firestore_client()
-            docs    = db.collection("rag_processed_pdfs").stream()
-            total   = completed = failed = 0
-            by_subj: dict = {}
-            for doc in docs:
-                d = doc.to_dict()
-                total += 1
-                status = d.get("status", "")
-                if status == "completed": completed += 1
-                elif status == "failed":  failed    += 1
-                sub = d.get("subject", "Unknown")
+            db       = _get_db()
+            proc     = list(db.collection("rag_processed_pdfs").stream())
+            chunks   = db.collection("rag_chunks").count().get()
+            total    = len(proc)
+            done     = sum(1 for d in proc if d.to_dict().get("status") == "completed")
+            failed   = sum(1 for d in proc if d.to_dict().get("status") == "failed")
+            by_subj  = {}
+            for d in proc:
+                sub = d.to_dict().get("subject", "Unknown")
                 by_subj[sub] = by_subj.get(sub, 0) + 1
-            return {"total_pdfs": total, "completed": completed,
-                    "failed": failed, "by_subject": by_subj}
+            return {
+                "total_pdfs":    total,
+                "completed":     done,
+                "failed":        failed,
+                "total_chunks":  chunks[0][0].value if chunks else "?",
+                "by_subject":    by_subj,
+            }
         except Exception as e:
             return {"error": str(e)}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API (backward-compatible)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RAGIndex(DriveRAGIndex):
-    """
-    Public class — same name and interface as the original RAGIndex.
-    All existing calls to RAGIndex() and rag.search() work without changes.
-    """
-    pass
+    def reindex(self):
+        """
+        Force re-check of Drive for new PDFs.
+        Call this from a scheduled task or manually if you add new books.
+        """
+        print("[RAG] Reindexing...")
+        self._ingest_new_pdfs()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -562,21 +674,27 @@ class RAGIndex(DriveRAGIndex):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("EduCAT RAG — Manual PDF Processing Run")
+    print("EduCAT RAG — Manual Run")
     print("=" * 60)
     print(f"  Source folder : {SOURCE_FOLDER_ID or 'NOT SET'}")
-    print(f"  Output folder : {OUTPUT_FOLDER_ID or 'NOT SET (chunks not saved)'}")
-    print(f"  FAISS cache   : {FAISS_CACHE_DIR}")
+    print(f"  Output folder : {OUTPUT_FOLDER_ID or 'not set'}")
+    print(f"  Groq model    : {GROQ_RAG_MODEL}")
+    print(f"  Candidates    : {RAG_CANDIDATES} per query")
     print()
-    index = RAGIndex()
-    stats = index.get_stats()
+
+    rag   = RAGIndex()
+    stats = rag.get_stats()
     print(f"\nStats: {json.dumps(stats, indent=2)}")
 
-    # Quick search test
-    test_q = "What is a LAN?"
-    results = index.search(test_q, k=2)
-    print(f"\nTest search: '{test_q}'")
-    for i, r in enumerate(results, 1):
-        print(f"  {i}. [{r['subject']}] p{r['page_num']} score={r['score']}")
-        print(f"     {r['content'][:120]}...")
-    print("\nDone.")
+    # Interactive test
+    while True:
+        q = input("\nSearch query (blank to quit): ").strip()
+        if not q:
+            break
+        results = rag.search(q, k=3)
+        if not results:
+            print("  No results.")
+        for i, r in enumerate(results, 1):
+            print(f"\n  {i}. [{r['subject']}] {r['source']} p{r['page_num']} "
+                  f"score={r['score']}/10")
+            print(f"     {r['content'][:200]}...")

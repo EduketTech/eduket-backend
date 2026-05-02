@@ -1,365 +1,290 @@
 """
-chunk_pdf.py  —  EduCAT PDF chunking pipeline  (LangChain migration)
+chunk_pdf.py  —  EduCAT PDF Chunking Pipeline with Google Drive Integration  (Universal)
 
-WHAT CHANGED
-────────────
-No LangChain migration needed for this file.
-chunk_pdf.py uses only stdlib (os, json, hashlib) and pdfplumber.
-It produces the JSON chunk files that feed into:
+WHAT CHANGED FROM PREVIOUS VERSION
+───────────────────────────────────
+1. GOOGLE DRIVE SOURCE:
+   - Reads PDFs directly from a Google Drive folder
+   - Uses service account authentication
+   - Downloads PDFs to temp, extracts text, then cleans up
 
-  process_exams.py  →  LangChain-migrated exam extraction pipeline
-  rag.py            →  LangChain FAISS RAG index builder
+2. PROCESS-ONCE MEMORY:
+   - Tracks processed PDFs via Drive file IDs in Firestore
+   - Detects modified PDFs via Drive modifiedTime timestamp
+   - Stores extraction state per file: pending, processing, completed, failed
 
-The output format (list of dicts with source / chunk_index /
-total_chunks / content keys) is consumed unchanged by both downstream
-files after the LangChain migration.
+3. DRIVE OUTPUT:
+   - Saves extracted chunks JSON back to Google Drive
+   - Creates folder structure: /EduCAT/processed/{subject}/
 
-Minor housekeeping applied:
-1. hashlib.md5(usedforsecurity=False) — suppresses Python 3.9+
-   security warning when md5 is used for non-cryptographic hashing.
-2. Type hints added to all function signatures for readability.
-3. Module-level docstring added for consistency with the migrated files.
-
-WHAT DID NOT CHANGE
-───────────────────
-- BLOCKLIST logic
-- DATA_FOLDER / PROCESSED_FOLDER / TRACKER_FILE paths
-- Tracker load/save/migration
-- extract_text_from_pdf()
-- chunk_text() — chunk size, overlap, metadata fields
-- merge_chunks()
-- process_files() — all logic, output format, summary printing
-
-PIPELINE POSITION
-─────────────────
-  1. chunk_pdf.py         ← YOU ARE HERE
-     Reads PDFs from data/
-     Writes JSON chunk files to processed/
-
-  2. process_exams.py
-     Reads chunk JSON from processed/
-     Writes structured exam JSON to exams/
-     (uses langchain_groq ChatGroq for LLM extraction)
-
-  3. rag.py
-     Reads theory-book chunk JSON from processed/
-     Builds / updates FAISS vector index
-     (uses langchain_huggingface + langchain_community FAISS)
-
-  4. agent.py / app.py
-     Serves the Flask API using the agent loop and exam JSON
+4. UNIVERSAL SUBJECT SUPPORT:
+   - Detects subject from PDF filename
+   - Skips exam papers and memos (only theory/study content)
 """
 
-import pdfplumber
 import os
+import io
+import re
 import json
 import hashlib
+import tempfile
+import traceback
+from datetime import datetime, timezone
+from typing import Optional
+from dotenv import load_dotenv
 
-print("🔥 SCRIPT STARTED")
-print("📁 Current directory:", os.getcwd())
+# -- PDF extraction --
+import pdfplumber
 
+# -- Google imports --
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# =========================
-# 🚫 BLOCKLIST
-# PDFs here will never be processed — no chunks created.
-# Add filenames that should always be skipped (e.g. source books
-# that have already been manually processed, or files not yet ready).
-# =========================
-BLOCKLIST: set[str] = {
-    "Gr12_CAT_Theory Book.pdf",
-    "May-memo_ 2025.pdf",
-    # Add more filenames here as needed:
-    # "some_other_file.pdf",
+load_dotenv()
+
+# -- Configuration --
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
+
+SOURCE_FOLDER_ID = os.getenv("EDUCAT_DRIVE_FOLDER_ID", "")
+OUTPUT_FOLDER_ID = os.getenv("EDUCAT_OUTPUT_FOLDER_ID", "")
+
+SUBJECT_PATTERNS = {
+    r'\bmathematics\b': 'Mathematics',
+    r'\bmaths\b': 'Mathematics',
+    r'\bmath\s+lit\b': 'Mathematical Literacy',
+    r'\btechnical\s+math\b': 'Technical Mathematics',
+    r'\bphysical\s+sciences?\b': 'Physical Sciences',
+    r'\blife\s+sciences?\b': 'Life Sciences',
+    r'\bgeography\b': 'Geography',
+    r'\bhistory\b': 'History',
+    r'\baccounting\b': 'Accounting',
+    r'\beconomics\b': 'Economics',
+    r'\bbusiness\s+studies\b': 'Business Studies',
+    r'\bcat\b': 'Computer Applications Technology',
+    r'\bit\b': 'Information Technology',
+    r'\bengineering\s+graphics\b': 'Engineering Graphics & Design',
+    r'\benglish\b': 'English',
+    r'\bafrikaans\b': 'Afrikaans',
+    r'\bisizulu\b': 'isiZulu',
+    r'\bsesotho\b': 'Sesotho',
 }
 
+_EXAM_KEYWORDS = ["exam", "paper", "question", "p1", "p2", "p3", "nov", "term", "trial"]
+_MEMO_KEYWORDS = ["memo", "memorandum", "answers", "marking"]
 
-# =========================
-# 📂 PATHS
-# =========================
-DATA_FOLDER      = "data/"
-PROCESSED_FOLDER = "processed/"
-TRACKER_FILE     = os.path.join(PROCESSED_FOLDER, "processed_files.json")
+# ===============================================================================
+# GOOGLE DRIVE & FIRESTORE SERVICES
+# ===============================================================================
 
-os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+def _get_drive_service():
+    inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if inline_json and inline_json.strip():
+        sa_info = json.loads(inline_json)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"])
+    else:
+        sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive"])
+    return build("drive", "v3", credentials=creds)
 
+def _get_firestore_client():
+    import firebase_admin
+    from firebase_admin import firestore as fs_admin
+    if not firebase_admin._apps:
+        inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if inline_json and inline_json.strip():
+            sa_dict = json.loads(inline_json)
+            cred = firebase_admin.credentials.Certificate(sa_dict)
+        else:
+            cred = firebase_admin.credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred)
+    return fs_admin.client()
 
-# =========================
-# 🔐 FILE HASH  (change detection)
-# Uses MD5 purely for file-change detection — not for security.
-# usedforsecurity=False suppresses the Python 3.9+ DeprecationWarning.
-# =========================
-def get_file_hash(filepath: str) -> str:
-    """Return MD5 hex digest of a file for change detection."""
-    h = hashlib.md5(usedforsecurity=False)
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# ===============================================================================
+# TRACKING LOGIC
+# ===============================================================================
 
-
-# =========================
-# 🧠 LOAD / SAVE TRACKER
-# Tracks which PDFs have been processed and their content hash
-# so the pipeline can detect new or modified files on re-runs.
-#
-# Tracker format:
-# {
-#   "Nov_Theory_2024.pdf": {
-#     "hash":        "abc123...",
-#     "chunks_file": "processed/Nov_Theory_2024.json",
-#     "chunk_count": 10
-#   },
-#   ...
-# }
-# =========================
-def load_tracker() -> dict:
-    """
-    Load the processing tracker from disk.
-    Migrates the old list format to the current dict format automatically.
-    """
-    if not os.path.exists(TRACKER_FILE):
-        return {}
+def _get_processed_files() -> dict:
     try:
-        with open(TRACKER_FILE) as f:
-            data = json.load(f)
-            # Migrate old list format → new dict format
-            if isinstance(data, list):
-                print("⚙️  Migrating old tracker format...")
-                return {
-                    name: {"hash": None, "chunks_file": None, "chunk_count": None}
-                    for name in data
-                }
-            return data
-    except (json.JSONDecodeError, Exception):
-        print("⚠️  Could not read tracker — starting fresh.")
+        db = _get_firestore_client()
+        docs = db.collection("chunk_processed_pdfs").stream()
+        return {doc.id: doc.to_dict() for doc in docs}
+    except Exception as e:
+        print(f"[Chunk] Firestore load error: {e}")
         return {}
 
+def _mark_file_processed(file_id, filename, subject, modified_time, chunks=0, drive_file_id=""):
+    try:
+        db = _get_firestore_client()
+        db.collection("chunk_processed_pdfs").document(file_id).set({
+            "filename": filename,
+            "subject": subject,
+            "status": "completed",
+            "modified_time": modified_time,
+            "chunks": chunks,
+            "output_drive_id": drive_file_id,
+            "processed_at": datetime.now(datetime.timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        print(f"[Chunk] Mark processed error: {e}")
 
-def save_tracker(tracker: dict) -> None:
-    with open(TRACKER_FILE, "w") as f:
-        json.dump(tracker, f, indent=2)
+def _mark_file_failed(file_id, filename, error):
+    try:
+        db = _get_firestore_client()
+        db.collection("chunk_processed_pdfs").document(file_id).set({
+            "filename": filename,
+            "status": "failed",
+            "error": error[:500],
+            "processed_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[Chunk] Mark failed error: {e}")
 
+# ===============================================================================
+# DRIVE OPERATIONS
+# ===============================================================================
 
-# =========================
-# 🧾 EXTRACT TEXT FROM PDF
-# Uses pdfplumber to pull plain text from every page.
-# Images, tables, and embedded objects are not extracted —
-# only selectable text.
-# =========================
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract all text from a PDF file using pdfplumber."""
+def _list_pdfs_in_folder(folder_id: str) -> list[dict]:
+    if not folder_id: return []
+    service = _get_drive_service()
+    query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+    results = []
+    page_token = None
+    while True:
+        response = service.files().list(q=query, spaces="drive", fields="nextPageToken, files(id, name, modifiedTime)", pageToken=page_token).execute()
+        results.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token: break
+    return results
+
+def _download_pdf(file_id: str, filename: str) -> str:
+    service = _get_drive_service()
+    request = service.files().get_media(fileId=file_id)
+    suffix = os.path.splitext(filename)[1] or ".pdf"
+    fd, local_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    with io.FileIO(local_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return local_path
+
+def _upload_to_drive(local_path, filename, parent_folder_id, mime_type="application/json"):
+    service = _get_drive_service()
+    media = MediaFileUpload(local_path, mimetype=mime_type)
+    file_metadata = {"name": filename, "parents": [parent_folder_id]}
+    file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    return file.get("id")
+
+def _ensure_drive_folder(parent_id, folder_name):
+    service = _get_drive_service()
+    query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    items = results.get("files", [])
+    if items: return items[0]["id"]
+    metadata = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+    folder = service.files().create(body=metadata, fields="id").execute()
+    return folder.get("id")
+
+# ===============================================================================
+# PROCESSING LOGIC
+# ===============================================================================
+
+def _extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+            if page_text: text += page_text + "\n"
     return text
 
-
-# =========================
-# ✂️ CHUNK TEXT
-# Splits extracted text into fixed-size word chunks.
-#
-# Each chunk carries full metadata so that downstream consumers
-# (process_exams.py, rag.py) have everything they need:
-#
-#   source       : original PDF filename — used by process_exams.py
-#                  to classify the file (exam / memo / theory) and by
-#                  rag.py to record provenance in vector metadata.
-#   chunk_index  : position in the document — used by process_exams.py
-#                  to stitch chunks back into order before sliding-window
-#                  extraction.
-#   total_chunks : total chunk count — displayed in progress logs.
-#   content      : the text of this chunk — embedded by rag.py and sent
-#                  to Groq by process_exams.py.
-#
-# chunk_size=300 words produces chunks of ~1500-2000 characters,
-# well within Groq's context window and the 6000-char sliding window
-# used in process_exams.py.
-# =========================
-def chunk_text(text: str, source_file: str, chunk_size: int = 300) -> list[dict]:
-    """
-    Split text into word-based chunks with source metadata attached.
-
-    Args:
-        text        : full extracted text from the PDF
-        source_file : original PDF filename (no path)
-        chunk_size  : words per chunk (default 300 ≈ 1500 chars)
-
-    Returns:
-        list of chunk dicts with source / chunk_index / total_chunks / content
-    """
-    words      = text.split()
-    raw_chunks = [
-        " ".join(words[i : i + chunk_size])
-        for i in range(0, len(words), chunk_size)
-    ]
-    total = len(raw_chunks)
-
-    return [
-        {
-            "source":       source_file,
-            "chunk_index":  idx,
-            "total_chunks": total,
-            "content":      chunk,
-        }
-        for idx, chunk in enumerate(raw_chunks)
-    ]
+def _chunk_text(text: str, source_file: str, subject: str) -> list[dict]:
+    words = text.split()
+    raw_chunks = []
+    step = CHUNK_SIZE - CHUNK_OVERLAP
+    for i in range(0, len(words), step):
+        chunk_words = words[i:i + CHUNK_SIZE]
+        if not chunk_words: break
+        raw_chunks.append(" ".join(chunk_words))
+    return [{"source": source_file, "chunk_index": i, "total_chunks": len(raw_chunks), "content": c, "subject": subject} for i, c in enumerate(raw_chunks)]
 
 
-# =========================
-# 🔀 MERGE CHUNKS
-# When a PDF is re-processed after changes, we merge the new chunks
-# into the existing output file rather than overwriting it blindly.
-# This preserves chunks from other sources that may share the same
-# output file (future: multi-source merging).
-# =========================
-def merge_chunks(existing_chunks: list, new_chunks: list) -> list:
-    """
-    Replace chunks from the same source with the new version.
-    Chunks from OTHER sources in the same file are kept untouched.
+def process_files():
+    print("📚 EduCAT PDF Chunking Pipeline")
+    if not SOURCE_FOLDER_ID:
+        return {"error": "SOURCE_FOLDER_ID missing"}
 
-    Args:
-        existing_chunks : chunks already in the output JSON file
-        new_chunks      : freshly extracted chunks from the updated PDF
+    processed_history = _get_processed_files()
+    drive_pdfs = _list_pdfs_in_folder(SOURCE_FOLDER_ID)
+    print(f"DEBUG: Found {len(drive_pdfs)} total PDFs in Drive")
 
-    Returns:
-        merged list with new_chunks replacing any old chunks for the same source
-    """
-    if not existing_chunks:
-        return new_chunks
+    for pdf in drive_pdfs:
+        fid, fname, mtime = pdf["id"], pdf["name"], pdf.get("modifiedTime", "")
 
-    source = new_chunks[0]["source"] if new_chunks else None
-    kept   = [c for c in existing_chunks if c.get("source") != source]
-    return kept + new_chunks
-
-
-# =========================
-# 🚀 PROCESS FILES
-# Main pipeline: scan data/, detect new/changed PDFs,
-# extract text, chunk, and save to processed/.
-# =========================
-def process_files() -> None:
-    tracker = load_tracker()
-
-    print("\n📌 Already tracked files:", list(tracker.keys()) or "none")
-
-    if not os.path.exists(DATA_FOLDER):
-        print("❌ data/ folder NOT found!")
-        return
-
-    pdf_files = [f for f in sorted(os.listdir(DATA_FOLDER)) if f.endswith(".pdf")]
-
-    if not pdf_files:
-        print("⚠️  No PDF files found in data/")
-        return
-
-    # ── Pre-flight classification ─────────────────────────
-    blocked  = [f for f in pdf_files if f in BLOCKLIST]
-    eligible = [f for f in pdf_files if f not in BLOCKLIST]
-
-    # A file is "changed" if its hash differs from the tracked value
-    new_files = [f for f in eligible if f not in tracker]
-    changed_files = [
-        f for f in eligible
-        if f in tracker
-        and tracker[f].get("hash") != get_file_hash(os.path.join(DATA_FOLDER, f))
-    ]
-    unchanged_files = [
-        f for f in eligible
-        if f in tracker
-        and tracker[f].get("hash") == get_file_hash(os.path.join(DATA_FOLDER, f))
-    ]
-
-    print(f"\n📂 Total PDFs     : {len(pdf_files)}")
-    print(f"🚫 Blocklisted    : {len(blocked)}")
-    for b in blocked:
-        print(f"     → {b}")
-    print(f"⏭️  Unchanged      : {len(unchanged_files)}")
-    print(f"🆕 New            : {len(new_files)}")
-    print(f"✏️  Changed        : {len(changed_files)}")
-
-    to_process = new_files + changed_files
-
-    if not to_process:
-        print("\n✅ All files are up to date. Nothing to do.")
-        return
-
-    print(f"\n🔄 Processing {len(to_process)} file(s)...\n")
-
-    new_count     = 0
-    updated_count = 0
-
-    for file in to_process:
-        is_update = file in tracker
-        label     = "✏️  UPDATE" if is_update else "🆕 NEW"
-
-        print(f"{label}: {file}")
-
-        pdf_path = os.path.join(DATA_FOLDER, file)
-
-        # 📥 Extract text from PDF
-        text = extract_text_from_pdf(pdf_path)
-        print(f"  📝 Extracted {len(text)} characters")
-
-        if not text.strip():
-            print(f"  ⚠️  No text extracted — skipping.\n")
+        # 1. Skip if memo or exam
+        if any(kw in fname.lower() for kw in _MEMO_KEYWORDS + _EXAM_KEYWORDS):
+            print(f"⏩ Skipping (Exam/Memo): {fname}")
             continue
 
-        # ✂️ Chunk the extracted text
-        new_chunks  = chunk_text(text, source_file=file)
-        output_path = os.path.join(PROCESSED_FOLDER, file.replace(".pdf", ".json"))
-        print(f"  🔹 {len(new_chunks)} chunk(s) created")
+        # 2. Skip if already processed and unchanged
+        if fid in processed_history and processed_history[fid].get("modified_time") == mtime:
+            if processed_history[fid].get("status") == "completed":
+                continue
 
-        # 🔀 Merge with existing chunks if this is an update
-        if is_update and os.path.exists(output_path):
+        print(f"Processing: {fname}")
+        try:
+            # 3. Download to temporary storage
+            path = _download_pdf(fid, fname)
+
+            # 4. Extract and Detect Subject
+            text = _extract_text_from_pdf(path)
+            subject = "General"
+            for patt, sub in SUBJECT_PATTERNS.items():
+                if re.search(patt, fname.lower()):
+                    subject = sub
+                    break
+
+            # 5. Create Chunks
+            chunks = _chunk_text(text, fname, subject)
+
+            # 6. SAVE LOCALLY (User-owned server storage)
+            # This creates a folder structure like: processed/Mathematics/file_chunks.json
+            local_dir = f"processed/{subject}"
+            os.makedirs(local_dir, exist_ok=True)
+            local_file_path = f"{local_dir}/{fname}_chunks.json"
+
+            with open(local_file_path, "w") as f:
+                json.dump(chunks, f, indent=2)
+
+            # 7. UPDATE TRACKING (Firestore)
+            # We explicitly pass an empty string for out_fid to avoid Google Storage Quota errors
             try:
-                with open(output_path) as f:
-                    existing_chunks = json.load(f)
-                merged = merge_chunks(existing_chunks, new_chunks)
-                print(
-                    f"  🔀 Merged: {len(existing_chunks)} old + "
-                    f"{len(new_chunks)} new → {len(merged)} total chunks"
-                )
-            except Exception:
-                merged = new_chunks
-                print("  ⚠️  Could not read existing chunks — replacing.")
-        else:
-            merged = new_chunks
+                db = _get_firestore_client()
+                db.collection("chunk_processed_pdfs").document(fid).set({
+                    "filename": fname,
+                    "subject": subject,
+                    "status": "completed",
+                    "modified_time": mtime,
+                    "chunks": len(chunks),
+                    "local_path": local_file_path,
+                    "output_drive_id": "",  # No longer using Drive for output
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as fs_err:
+                print(f"⚠️ Firestore update failed: {fs_err}")
 
-        # 💾 Save chunks to processed/<filename>.json
-        with open(output_path, "w") as f:
-            json.dump(merged, f, indent=2)
-        print(f"  💾 Saved: {output_path}")
+            # 8. Cleanup temp PDF
+            if os.path.exists(path):
+                os.unlink(path)
 
-        # ✅ Record new hash in tracker
-        tracker[file] = {
-            "hash":        get_file_hash(pdf_path),
-            "chunks_file": output_path,
-            "chunk_count": len(merged),
-        }
-        save_tracker(tracker)
+            print(f"✅ Finished {fname} -> Saved to {local_file_path}")
 
-        if is_update:
-            updated_count += 1
-        else:
-            new_count += 1
-
-        print()
-
-    # ── Final summary ─────────────────────────────────────
-    print("=" * 45)
-    print(f"🆕 New files processed    : {new_count}")
-    print(f"✏️  Updated files          : {updated_count}")
-    print(f"⏭️  Skipped (unchanged)    : {len(unchanged_files)}")
-    print(f"🚫 Skipped (blocklisted)  : {len(blocked)}")
-    print(f"📦 Total tracked          : {len(tracker)}")
-    print("✅ DONE")
-
-
-# =========================
-# ▶️ RUN
-# =========================
+        except Exception as e:
+            print(f"❌ Failed {fname}: {e}")
+            _mark_file_failed(fid, fname, str(e))
 if __name__ == "__main__":
     process_files()

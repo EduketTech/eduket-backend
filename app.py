@@ -32,18 +32,18 @@ from firebase_admin import credentials, firestore as fs_admin
 def _init_firebase():
     if firebase_admin._apps:
         return
-    inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
     if inline_json and inline_json.strip():
         try:
             sa_dict = json.loads(inline_json)
             if sa_dict.get("type") != "service_account":
                 raise ValueError(
-                    'FIREBASE_SERVICE_ACCOUNT_JSON must contain "type": "service_account".'
+                    'FIREBASE_SERVICE_ACCOUNT must contain "type": "service_account".'
                 )
             cred = credentials.Certificate(sa_dict)
             print("[Firebase] Using inline JSON credentials")
         except json.JSONDecodeError as e:
-            raise ValueError(f"FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+            raise ValueError(f"FIREBASE_SERVICE_ACCOUNT is not valid JSON: {e}")
     else:
         cred = credentials.ApplicationDefault()
         print("[Firebase] Using Application Default Credentials")

@@ -240,16 +240,11 @@ def _keyword_search_firestore(keywords: list[str], subject_filter: str = "",
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_drive():
-    inline = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if inline:
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(inline), scopes=["https://www.googleapis.com/auth/drive"]
-        )
-    else:
-        sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
-        creds = service_account.Credentials.from_service_account_file(
-            sa_path, scopes=["https://www.googleapis.com/auth/drive"]
-        )
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    info = json.loads(sa_json)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
     return build("drive", "v3", credentials=creds)
 
 

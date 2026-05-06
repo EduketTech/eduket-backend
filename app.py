@@ -1018,6 +1018,55 @@ def trigger_extract_get(exam_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/admin/debug-extract/<exam_id>", methods=["GET"])
+def debug_extract(exam_id):
+    try:
+        # Find the upload
+        meta = None
+        docs = db_admin.collection("teacherExamUploads").stream()
+        for doc in docs:
+            for upload in doc.to_dict().get("uploads", []):
+                if upload.get("examId") == exam_id:
+                    meta = upload
+                    break
+            if meta:
+                break
+
+        if not meta:
+            return jsonify({"error": "not found"}), 404
+
+        pdf_bytes = download_from_drive_bytes(meta.get("examDriveFileId"))
+        if not pdf_bytes:
+            return jsonify({"error": "download failed"}), 500
+
+        # Extract text
+        import io, fitz
+        text = ""
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+        except:
+            pass
+
+        if not text.strip():
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                text += page.get_text()
+            doc.close()
+
+        return jsonify({
+            "pdf_size_bytes": len(pdf_bytes),
+            "text_length": len(text),
+            "text_preview": text[:2000],  # first 2000 chars
+            "text_sample_middle": text[2000:4000] if len(text) > 2000 else "",
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/admin/list-raw", methods=["GET"])
 def list_raw():

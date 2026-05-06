@@ -62,6 +62,8 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": [
     "http://localhost:3000",
     "http://localhost:5176",
+    "http://localhost:5175",
+    "http://localhost:5174"
     "https://edu-cat.netlify.app",
 ]}})
 

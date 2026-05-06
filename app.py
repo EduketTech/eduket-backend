@@ -764,9 +764,16 @@ def admin_uploads():
         uploads = []
         for doc in docs:
             d = doc.to_dict()
-            d["examId"] = doc.id
-            uploads.append(d)
-        # Sort in Python instead — no Firestore index needed
+            # Handle nested uploads array structure
+            nested = d.get("uploads", [])
+            if nested:
+                for upload in nested:
+                    upload["teacherDocId"] = doc.id
+                    uploads.append(upload)
+            else:
+                # Handle flat structure as fallback
+                d["examId"] = doc.id
+                uploads.append(d)
         uploads.sort(key=lambda x: x.get("uploadedAt", ""), reverse=True)
         return jsonify({"uploads": uploads})
     except Exception as e:
@@ -890,20 +897,38 @@ def extract_exam():
 
 @app.route("/admin/trigger-extract/<exam_id>", methods=["GET"])
 def trigger_extract_get(exam_id):
-    """Temporary GET trigger for testing — remove after extraction works."""
     try:
-        # reuse your extract_exam logic directly
-        upload_ref = db_admin.collection("teacherExamUploads").document(exam_id)
-        upload_doc = upload_ref.get()
-        if not upload_doc.exists:
-            return jsonify({"error": "Upload not found"}), 404
-        meta = upload_doc.to_dict()
-        upload_ref.update({"status": "processing"})
-        pdf_bytes = download_from_drive_bytes(meta.get("examDriveFileId"))
+        # Search through all teacher docs for the matching examId
+        meta = None
+        teacher_doc_id = None
+        docs = db_admin.collection("teacherExamUploads").stream()
+        for doc in docs:
+            d = doc.to_dict()
+            uploads = d.get("uploads", [])
+            for upload in uploads:
+                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
+                    meta = upload
+                    teacher_doc_id = doc.id
+                    break
+            if meta:
+                break
+
+        if not meta:
+            return jsonify({"error": f"Exam {exam_id} not found in any teacher doc"}), 404
+
+        # Download PDF from Drive
+        exam_file_id = meta.get("examDriveFileId")
+        if not exam_file_id:
+            return jsonify({"error": "No examDriveFileId"}), 400
+
+        pdf_bytes = download_from_drive_bytes(exam_file_id)
         if not pdf_bytes:
-            upload_ref.update({"status": "error", "errorMessage": "Drive download failed"})
             return jsonify({"error": "Drive download failed"}), 500
+
+        # Extract questions
         questions = extract_questions_from_pdf(pdf_bytes, meta)
+
+        # Write exam doc to exams collection
         exam_doc = {
             "title": meta.get("title", "Exam"),
             "subject": meta.get("subject", ""),
@@ -912,15 +937,16 @@ def trigger_extract_get(exam_id):
             "curriculum": meta.get("curriculum", "CAPS"),
             "teacherName": meta.get("teacherName", ""),
             "uploadedBy": meta.get("uploadedBy", ""),
-            "examDriveFileId": meta.get("examDriveFileId"),
+            "examDriveFileId": exam_file_id,
             "memoDriveFileId": meta.get("memoDriveFileId"),
             "status": "ready",
             "totalQuestions": len(questions),
             "extractedAt": fs_admin.SERVER_TIMESTAMP,
             "sourceUploadId": exam_id,
         }
-        exam_ref = db_admin.collection("exams").document(exam_id)
-        exam_ref.set(exam_doc)
+        db_admin.collection("exams").document(exam_id).set(exam_doc)
+
+        # Write questions to exam_questions collection
         batch = db_admin.batch()
         for i, q in enumerate(questions):
             q_ref = db_admin.collection("exam_questions").document(f"{exam_id}_{i:04d}")
@@ -939,11 +965,30 @@ def trigger_extract_get(exam_id):
                 "order": i,
             })
         batch.commit()
-        upload_ref.update({"status": "extracted", "extractedAt": fs_admin.SERVER_TIMESTAMP, "totalQuestions": len(questions)})
-        return jsonify({"ok": True, "questions_extracted": len(questions)})
+
+        # Update the upload status inside the nested array
+        updated_uploads = []
+        doc_ref = db_admin.collection("teacherExamUploads").document(teacher_doc_id)
+        teacher_data = doc_ref.get().to_dict()
+        for upload in teacher_data.get("uploads", []):
+            if upload.get("examId") == exam_id:
+                upload["status"] = "extracted"
+                upload["extractedAt"] = datetime.utcnow().isoformat()
+                upload["totalQuestions"] = len(questions)
+            updated_uploads.append(upload)
+        doc_ref.update({"uploads": updated_uploads})
+
+        return jsonify({
+            "ok": True,
+            "exam_id": exam_id,
+            "questions_extracted": len(questions),
+            "teacher_doc": teacher_doc_id,
+        })
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/admin/list-raw", methods=["GET"])
 def list_raw():

@@ -942,6 +942,15 @@ def trigger_extract_get(exam_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/admin/list-raw", methods=["GET"])
+def list_raw():
+    """Temp diagnostic — lists all teacherExamUploads doc IDs."""
+    try:
+        docs = db_admin.collection("teacherExamUploads").stream()
+        return jsonify({"doc_ids": [doc.id for doc in docs]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():

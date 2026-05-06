@@ -23,4 +23,5 @@ google-api-python-client
 
 # ── Utilities ─────────────────────────────────────────────
 python-dotenv>=1.0.0
-numpy>=1.26.0anthropic
+numpy>=1.26.0
+anthropic

@@ -378,6 +378,50 @@ def flatten_exam(exam):
             })
     return flat
 
+def extract_questions_from_pdf(pdf_bytes, exam_meta):
+    """Use Claude / GPT to parse PDF bytes into structured question JSON."""
+    import anthropic
+    import base64
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    prompt = f"""You are an expert exam parser for South African NSC (CAPS) exams.
+Extract ALL questions from this exam PDF into structured JSON.
+
+Return ONLY a JSON array of question objects. Each object must have:
+- question_number (string, e.g. "1.1", "2", "3.2.1")
+- parent_question (string, section heading if any)
+- section (string, e.g. "A", "B", "1")
+- question (string, the full question text)
+- type (one of: mcq, true_false, matching, short_answer, calculation, essay, open)
+- marks (integer)
+- options (object with A/B/C/D keys, only for mcq)
+- column_a / column_b (arrays, only for matching)
+- memo (string or null — include if answer is visible in document)
+
+Subject: {exam_meta.get('subject', '')}
+Grade: {exam_meta.get('grade', '')}
+"""
+
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=8000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": b64
+                }},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    )
+
+    raw = response.content[0].text.strip()
+    # Strip markdown fences if present
+    raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HOME UI (with MathJax + Universal Styles)
@@ -694,6 +738,135 @@ def list_exams():
 
     return jsonify({"exams": exams})
 
+@app.route("/admin/uploads", methods=["GET"])
+def admin_uploads():
+    try:
+        docs = db_admin.collection("teacherExamUploads").order_by(
+            "uploadedAt", direction=fs_admin.Query.DESCENDING
+        ).stream()
+        uploads = []
+        for doc in docs:
+            d = doc.to_dict()
+            d["examId"] = doc.id
+            uploads.append(d)
+        return jsonify({"uploads": uploads})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/extract-exam", methods=["POST"])
+def extract_exam():
+    try:
+        data = request.get_json()
+        exam_id = data.get("exam_id", "").strip()
+        if not exam_id:
+            return jsonify({"error": "exam_id required"}), 400
+
+        # 1. Load the upload doc
+        upload_ref = db_admin.collection("teacherExamUploads").document(exam_id)
+        upload_doc = upload_ref.get()
+        if not upload_doc.exists:
+            return jsonify({"error": "Upload not found"}), 404
+
+        meta = upload_doc.to_dict()
+
+        # 2. Mark as processing
+        upload_ref.update({"status": "processing"})
+
+        # 3. Download exam PDF from Drive
+        exam_file_id = meta.get("examDriveFileId")
+        if not exam_file_id:
+            upload_ref.update({"status": "error", "errorMessage": "No examDriveFileId"})
+            return jsonify({"error": "No exam Drive file ID"}), 400
+
+        pdf_bytes = download_from_drive_bytes(exam_file_id)
+        if not pdf_bytes:
+            upload_ref.update({"status": "error", "errorMessage": "Failed to download from Drive"})
+            return jsonify({"error": "Drive download failed"}), 500
+
+        # 4. Extract questions via AI
+        questions = extract_questions_from_pdf(pdf_bytes, meta)
+
+        # 5. Also download memo if available
+        memo_map = {}
+        memo_file_id = meta.get("memoDriveFileId")
+        if memo_file_id:
+            memo_bytes = download_from_drive_bytes(memo_file_id)
+            if memo_bytes:
+                # Parse memo separately and match by question number
+                memo_questions = extract_questions_from_pdf(memo_bytes, {
+                    **meta, "subject": meta.get("subject", "") + " MEMO"
+                })
+                memo_map = {q.get("question_number"): q.get("memo") or q.get("question", "")
+                            for q in memo_questions if q.get("question_number")}
+
+        # 6. Merge memo answers into questions
+        for q in questions:
+            qn = q.get("question_number")
+            if qn and qn in memo_map and not q.get("memo"):
+                q["memo"] = memo_map[qn]
+
+        # 7. Write exam doc to `exams` collection
+        exam_doc = {
+            "title": meta.get("title", meta.get("examFileName", "Exam")),
+            "subject": meta.get("subject", ""),
+            "grade": meta.get("grade", ""),
+            "year": meta.get("year", ""),
+            "curriculum": meta.get("curriculum", "CAPS"),
+            "teacherName": meta.get("teacherName", ""),
+            "uploadedBy": meta.get("uploadedBy", ""),
+            "examDriveFileId": exam_file_id,
+            "memoDriveFileId": memo_file_id,
+            "status": "ready",
+            "totalQuestions": len(questions),
+            "extractedAt": fs_admin.SERVER_TIMESTAMP,
+            "sourceUploadId": exam_id,
+        }
+        exam_ref = db_admin.collection("exams").document(exam_id)
+        exam_ref.set(exam_doc)
+
+        # 8. Write each question to `exam_questions` collection
+        batch = db_admin.batch()
+        for i, q in enumerate(questions):
+            q_ref = db_admin.collection("exam_questions").document(f"{exam_id}_{i:04d}")
+            batch.set(q_ref, {
+                "examId": exam_id,
+                "questionNumber": q.get("question_number", str(i + 1)),
+                "parentQuestion": q.get("parent_question", ""),
+                "parentContext": q.get("parent_context"),
+                "section": q.get("section", "A"),
+                "questionText": q.get("question", ""),
+                "type": q.get("type", "open"),
+                "marks": q.get("marks", 1),
+                "options": q.get("options"),
+                "columnA": q.get("column_a"),
+                "columnB": q.get("column_b"),
+                "memo": q.get("memo", ""),
+                "order": i,
+            })
+        batch.commit()
+
+        # 9. Update upload doc to extracted
+        upload_ref.update({
+            "status": "extracted",
+            "extractedAt": fs_admin.SERVER_TIMESTAMP,
+            "totalQuestions": len(questions),
+        })
+
+        return jsonify({
+            "ok": True,
+            "exam_id": exam_id,
+            "questions_extracted": len(questions),
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        # Mark as error so admin can retry
+        try:
+            upload_ref.update({"status": "error", "errorMessage": str(e)})
+        except Exception:
+            pass
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():

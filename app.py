@@ -757,18 +757,19 @@ def list_exams():
 @app.route("/admin/uploads", methods=["GET"])
 def admin_uploads():
     try:
-        docs = db_admin.collection("teacherExamUploads").order_by(
-            "uploadedAt", direction=fs_admin.Query.DESCENDING
-        ).stream()
+        docs = db_admin.collection("teacherExamUploads").stream()
         uploads = []
         for doc in docs:
             d = doc.to_dict()
             d["examId"] = doc.id
             uploads.append(d)
+        # Sort in Python instead — no Firestore index needed
+        uploads.sort(key=lambda x: x.get("uploadedAt", ""), reverse=True)
         return jsonify({"uploads": uploads})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/extract-exam", methods=["POST"])
 def extract_exam():

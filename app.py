@@ -305,17 +305,20 @@ def download_from_drive_bytes(file_id):
     try:
         from google.oauth2 import service_account
         from google.auth.transport.requests import Request as GoogleRequest
-        inline_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-        if inline_json:
-            sa_info = json.loads(inline_json)
-            creds = service_account.Credentials.from_service_account_info(
-                sa_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-            )
-        else:
-            sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
-            creds = service_account.Credentials.from_service_account_file(
-                sa_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-            )
+
+        # Try both env var names
+        inline_json = (
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+            os.getenv("FIREBASE_SERVICE_ACCOUNT")
+        )
+        if not inline_json:
+            print("[Drive] No service account credentials found")
+            return None
+
+        sa_info = json.loads(inline_json)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
         creds.refresh(GoogleRequest())
         token = creds.token
         url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"

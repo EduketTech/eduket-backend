@@ -384,23 +384,51 @@ def flatten_exam(exam):
     return flat
 
 def extract_questions_from_pdf(pdf_bytes, exam_meta):
-    """Use Groq to parse PDF bytes into structured question JSON."""
-    import base64
-    import pdfplumber
+    """Extract questions from PDF using OCR fallback for scanned papers."""
     import io
+    import pdfplumber
 
-    # Extract text from PDF bytes using pdfplumber (already in your requirements)
     text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                text += page_text + "\n"
+
+    # Try pdfplumber first (works for text-based PDFs)
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    text += page_text + "\n"
+    except Exception as e:
+        print(f"[Extract] pdfplumber error: {e}")
+
+    # If no text extracted, try pymupdf (handles more PDF types)
+    if not text.strip():
+        try:
+            import fitz  # pymupdf
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                text += page.get_text() + "\n"
+            doc.close()
+            print(f"[Extract] pymupdf extracted {len(text)} chars")
+        except Exception as e:
+            print(f"[Extract] pymupdf error: {e}")
+
+    # If still no text, PDF is scanned — extract page count at least
+    if not text.strip():
+        try:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = len(doc)
+            doc.close()
+            # For scanned PDFs, ask Groq to generate placeholder structure
+            text = f"[SCANNED PDF - {page_count} pages - text extraction not possible]"
+            print(f"[Extract] PDF appears scanned, {page_count} pages")
+        except Exception as e:
+            text = "[SCANNED PDF - could not determine page count]"
 
     if not text.strip():
         raise ValueError("No text could be extracted from PDF")
 
-    # Trim to avoid Groq token limits (keep first 12000 chars ~ 20 pages)
+    # Trim to Groq token limit
     text = text[:12000]
 
     from groq import Groq
@@ -430,16 +458,16 @@ EXAM TEXT:
 """
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",   # free, handles long context well
+        model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=8000,
         temperature=0.1,
     )
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if Groq adds them
     raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

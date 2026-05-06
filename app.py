@@ -381,49 +381,63 @@ def flatten_exam(exam):
     return flat
 
 def extract_questions_from_pdf(pdf_bytes, exam_meta):
-    """Use Claude / GPT to parse PDF bytes into structured question JSON."""
-    import anthropic
+    """Use Groq to parse PDF bytes into structured question JSON."""
     import base64
+    import pdfplumber
+    import io
 
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    # Extract text from PDF bytes using pdfplumber (already in your requirements)
+    text = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                text += page_text + "\n"
+
+    if not text.strip():
+        raise ValueError("No text could be extracted from PDF")
+
+    # Trim to avoid Groq token limits (keep first 12000 chars ~ 20 pages)
+    text = text[:12000]
+
+    from groq import Groq
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
     prompt = f"""You are an expert exam parser for South African NSC (CAPS) exams.
-Extract ALL questions from this exam PDF into structured JSON.
+Extract ALL questions from this exam text into structured JSON.
 
-Return ONLY a JSON array of question objects. Each object must have:
-- question_number (string, e.g. "1.1", "2", "3.2.1")
-- parent_question (string, section heading if any)
-- section (string, e.g. "A", "B", "1")
-- question (string, the full question text)
+Return ONLY a valid JSON array. No extra text, no markdown fences.
+Each object must have:
+- question_number (string e.g. "1.1", "2", "3.2.1")
+- parent_question (string, section heading if any, else "")
+- section (string e.g. "A", "B", "1")
+- question (string, full question text)
 - type (one of: mcq, true_false, matching, short_answer, calculation, essay, open)
 - marks (integer)
-- options (object with A/B/C/D keys, only for mcq)
-- column_a / column_b (arrays, only for matching)
-- memo (string or null — include if answer is visible in document)
+- options (object with A/B/C/D keys, ONLY for mcq, else null)
+- column_a (array, ONLY for matching, else null)
+- column_b (array, ONLY for matching, else null)
+- memo (string if answer visible in text, else null)
 
 Subject: {exam_meta.get('subject', '')}
 Grade: {exam_meta.get('grade', '')}
+
+EXAM TEXT:
+{text}
 """
 
-    response = client.messages.create(
-        model="claude-opus-4-6",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",   # free, handles long context well
+        messages=[{"role": "user", "content": prompt}],
         max_tokens=8000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document", "source": {
-                    "type": "base64", "media_type": "application/pdf", "data": b64
-                }},
-                {"type": "text", "text": prompt}
-            ]
-        }]
+        temperature=0.1,
     )
 
-    raw = response.content[0].text.strip()
-    # Strip markdown fences if present
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown fences if Groq adds them
     raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HOME UI (with MathJax + Universal Styles)

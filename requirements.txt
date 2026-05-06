@@ -25,3 +25,5 @@ google-api-python-client
 python-dotenv>=1.0.0
 numpy>=1.26.0
 anthropic
+
+pdfplumber

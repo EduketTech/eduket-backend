@@ -951,6 +951,24 @@ def list_raw():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/admin/check-drive", methods=["GET"])
+def check_drive():
+    """Temp: check Drive access and env vars."""
+    try:
+        file_id = "1gZPAkgaP5qHDEqvRAIQdaMuEYA6J_-kl"  # your exam PDF
+        has_sa = bool(os.getenv("FIREBASE_SERVICE_ACCOUNT"))
+        has_sa_json = bool(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
+        result = download_from_drive_bytes(file_id)
+        return jsonify({
+            "FIREBASE_SERVICE_ACCOUNT_set": has_sa,
+            "FIREBASE_SERVICE_ACCOUNT_JSON_set": has_sa_json,
+            "download_success": result is not None,
+            "bytes_downloaded": len(result) if result else 0,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)})
+
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():

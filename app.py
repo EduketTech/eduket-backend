@@ -1250,6 +1250,24 @@ def debug_drive_perms():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# debugging
+@app.route("/admin/debug-drive-config/<user_id>", methods=["GET"])
+def debug_drive_config(user_id):
+    try:
+        doc = db_admin.collection("userDriveConfig").document(user_id).get()
+        if not doc.exists:
+            return jsonify({"exists": False})
+        d = doc.to_dict()
+        # Don't expose full tokens — just show keys
+        return jsonify({
+            "exists": True,
+            "fields": list(d.keys()),
+            "has_access_token": bool(d.get("access_token") or (d.get("token") and d.get("token", {}).get("access_token"))),
+            "has_refresh_token": bool(d.get("refresh_token") or (d.get("token") and d.get("token", {}).get("refresh_token"))),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():
     try:

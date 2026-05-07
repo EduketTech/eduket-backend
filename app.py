@@ -181,9 +181,12 @@ def _groq_vision_ocr(pdf_bytes: bytes, max_pages: int = 10) -> str:
                                 "text": (
                                     "This is a page from a South African NSC/CAPS exam paper. "
                                     "Extract ALL text exactly as it appears. "
-                                    "Preserve question numbers (e.g. 1.1, 2.3.1), marks in brackets, "
-                                    "and multiple choice options (A B C D). "
-                                    "Output plain text only, no commentary."
+                                    "Preserve question numbers (e.g. 1.1, 1.2, 2.1.1), marks in brackets like (2), "
+                                    "multiple choice options labeled A B C D, "
+                                    "table contents row by row, "
+                                    "and any diagram descriptions or figure labels. "
+                                    "For diagrams or images you can see, write: [DIAGRAM: brief description of what it shows] "
+                                    "Output plain text only, no commentary, no markdown."
                                 )
                             }
                         ]
@@ -226,43 +229,46 @@ def parse_questions_from_text(text: str, subject: str, grade: str) -> list:
 
     prompt = f"""You are an expert parser for South African NSC CAPS exam papers.
 
-Extract EVERY question from the text below into a JSON array.
+    Extract EVERY question from the text below into a JSON array.
 
-Rules:
-- Include ALL sub-questions (1.1, 1.2, 2.1.1 etc.)
-- For MCQ questions include options as {{"A": "...", "B": "...", "C": "...", "D": "..."}}
-- For True/False use type "true_false"
-- For matching columns use type "matching" with column_a and column_b arrays
-- For calculations use type "calculation"
-- For short written answers use type "short_answer"
-- For essays use type "essay"
-- Default type is "open"
-- marks must be an integer (look for numbers in brackets like (2) or [3])
-- section is the letter/number of the section (A, B, 1, 2 etc.)
-- memo: if an answer is visible in the text (e.g. in a memo/marking guide), include it, else null
+    Rules:
+    - Include ALL sub-questions (1.1, 1.2, 2.1.1 etc.)
+    - For MCQ include options as {{"A": "...", "B": "...", "C": "...", "D": "..."}}
+    - For True/False use type "true_false"
+    - For matching use type "matching" with column_a and column_b arrays
+    - For calculations use type "calculation"
+    - For short answers use type "short_answer"
+    - For essays use type "essay"
+    - Default type is "open"
+    - marks must be an integer (look for numbers in brackets like (2) or [3])
+    - section is the letter/number of the section (A, B, 1, 2 etc.)
+    - If the question refers to a diagram, table or figure, include [DIAGRAM: description] in the question text
+    - memo: include if answer visible in text, else null
+    - If a question has sub-parts, create a SEPARATE item for each sub-part
+    - Never skip questions even if they refer to diagrams
 
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
+    Return ONLY a valid JSON array. No markdown, no explanation.
 
-Each item:
-{{
-  "question_number": "1.1",
-  "parent_question": "QUESTION 1",
-  "section": "A",
-  "question": "full question text here",
-  "type": "mcq",
-  "marks": 2,
-  "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
-  "column_a": null,
-  "column_b": null,
-  "memo": null
-}}
+    Each item:
+    {{
+      "question_number": "1.1",
+      "parent_question": "QUESTION 1",
+      "section": "A",
+      "question": "full question text here",
+      "type": "mcq",
+      "marks": 2,
+      "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+      "column_a": null,
+      "column_b": null,
+      "memo": null
+    }}
 
-Subject: {subject}
-Grade: {grade}
+    Subject: {subject}
+    Grade: {grade}
 
-EXAM TEXT:
-{text}
-"""
+    EXAM TEXT:
+    {text}
+    """
 
     try:
         response = client.chat.completions.create(
@@ -344,7 +350,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
             print(f"[Pipeline] Downloading memo PDF: {memo_file_id}")
             memo_bytes = download_pdf_bytes(memo_file_id)
             if memo_bytes:
-                memo_text = extract_text_from_pdf(memo_bytes, max_pages=12)
+                memo_text = extract_text_from_pdf(memo_bytes, max_pages=20)
                 if memo_text.strip():
                     memo_questions = parse_questions_from_text(
                         memo_text, subject + " MEMO", grade

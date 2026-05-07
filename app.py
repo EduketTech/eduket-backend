@@ -302,35 +302,67 @@ def load_exam_from_firestore(exam_id):
         return None, []
 
 
-def download_from_drive_bytes(file_id):
+def extract_text_from_drive_pdf_ocr(file_id):
+    """Upload PDF to Drive as Google Doc (triggers OCR), read text, delete temp doc."""
     try:
         from google.oauth2 import service_account
         from google.auth.transport.requests import Request as GoogleRequest
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
 
-        # Try both env var names
         inline_json = (
             os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
             os.getenv("FIREBASE_SERVICE_ACCOUNT")
         )
-        if not inline_json:
-            print("[Drive] No service account credentials found")
-            return None
-
         sa_info = json.loads(inline_json)
         creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
         )
         creds.refresh(GoogleRequest())
-        token = creds.token
+        drive = build("drive", "v3", credentials=creds)
+
+        # Download original PDF bytes
         url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        res = http_requests.get(url, headers={"Authorization": f"Bearer {token}"})
-        if res.status_code == 200:
-            return res.content
-        print(f"[Drive] download failed: {res.status_code} {res.text[:200]}")
-        return None
+        res = http_requests.get(
+            url, headers={"Authorization": f"Bearer {creds.token}"}
+        )
+        if res.status_code != 200:
+            print(f"[OCR] Download failed: {res.status_code}")
+            return ""
+        pdf_bytes = res.content
+
+        # Re-upload as Google Doc — Drive OCRs it automatically
+        media = MediaIoBaseUpload(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            resumable=False
+        )
+        gdoc = drive.files().create(
+            body={"name": f"ocr_temp_{file_id}", "mimeType": "application/vnd.google-apps.document"},
+            media_body=media,
+            fields="id"
+        ).execute()
+        gdoc_id = gdoc["id"]
+        print(f"[OCR] Temp Google Doc created: {gdoc_id}")
+
+        # Export as plain text
+        export_res = http_requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{gdoc_id}/export?mimeType=text/plain",
+            headers={"Authorization": f"Bearer {creds.token}"}
+        )
+        text = export_res.text if export_res.status_code == 200 else ""
+        print(f"[OCR] Extracted {len(text)} chars")
+
+        # Delete temp doc
+        drive.files().delete(fileId=gdoc_id).execute()
+        print(f"[OCR] Temp doc deleted")
+
+        return text
+
     except Exception as e:
         traceback.print_exc()
-        return None
+        return ""
 
 
 def flatten_exam(exam):
@@ -384,72 +416,17 @@ def flatten_exam(exam):
             })
     return flat
 
-def extract_questions_from_pdf(pdf_bytes, exam_meta):
-    """Extract questions from PDF using OCR fallback for scanned papers."""
-    import io
-    import pdfplumber
-
-    text = ""
-
-    # Try pdfplumber first (works for text-based PDFs)
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    text += page_text + "\n"
-    except Exception as e:
-        print(f"[Extract] pdfplumber error: {e}")
-
-    # If no text extracted, try pymupdf (handles more PDF types)
-    if not text.strip():
-        try:
-            import fitz  # pymupdf
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            for page in doc:
-                text += page.get_text() + "\n"
-            doc.close()
-            print(f"[Extract] pymupdf extracted {len(text)} chars")
-        except Exception as e:
-            print(f"[Extract] pymupdf error: {e}")
-
-    # If still no text, PDF is scanned — extract page count at least
-    if not text.strip():
-        try:
-            import fitz
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            page_count = len(doc)
-            doc.close()
-            # For scanned PDFs, ask Groq to generate placeholder structure
-            text = f"[SCANNED PDF - {page_count} pages - text extraction not possible]"
-            print(f"[Extract] PDF appears scanned, {page_count} pages")
-        except Exception as e:
-            text = "[SCANNED PDF - could not determine page count]"
-
-    if not text.strip():
-        raise ValueError("No text could be extracted from PDF")
-
-    # Trim to Groq token limit
-    text = text[:12000]
-
+def extract_questions_from_pdf_text(text, exam_meta):
+    """Parse questions from already-extracted text string."""
     from groq import Groq
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
+    text = text[:12000]
     prompt = f"""You are an expert exam parser for South African NSC (CAPS) exams.
 Extract ALL questions from this exam text into structured JSON.
-
 Return ONLY a valid JSON array. No extra text, no markdown fences.
 Each object must have:
-- question_number (string e.g. "1.1", "2", "3.2.1")
-- parent_question (string, section heading if any, else "")
-- section (string e.g. "A", "B", "1")
-- question (string, full question text)
-- type (one of: mcq, true_false, matching, short_answer, calculation, essay, open)
-- marks (integer)
-- options (object with A/B/C/D keys, ONLY for mcq, else null)
-- column_a (array, ONLY for matching, else null)
-- column_b (array, ONLY for matching, else null)
-- memo (string if answer visible in text, else null)
+- question_number, parent_question, section, question, type, marks
+- options (for mcq), column_a/column_b (for matching), memo
 
 Subject: {exam_meta.get('subject', '')}
 Grade: {exam_meta.get('grade', '')}
@@ -457,18 +434,15 @@ Grade: {exam_meta.get('grade', '')}
 EXAM TEXT:
 {text}
 """
-
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=8000,
         temperature=0.1,
     )
-
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -950,12 +924,26 @@ def trigger_extract_get(exam_id):
         if not exam_file_id:
             return jsonify({"error": "No examDriveFileId"}), 400
 
+        # Inside trigger_extract_get, replace the pdf_bytes + questions lines with:
         pdf_bytes = download_from_drive_bytes(exam_file_id)
         if not pdf_bytes:
             return jsonify({"error": "Drive download failed"}), 500
 
-        # Extract questions
-        questions = extract_questions_from_pdf(pdf_bytes, meta)
+        # Try normal extraction first
+        try:
+            questions = extract_questions_from_pdf(pdf_bytes, meta)
+        except ValueError as e:
+            if "SCANNED_PDF" in str(e):
+                # Scanned PDF — use Drive OCR
+                print("[Trigger] Scanned PDF detected, using Drive OCR...")
+                ocr_text = extract_text_from_drive_pdf_ocr(exam_file_id)
+                if not ocr_text.strip():
+                    return jsonify({"error": "Could not extract text even with OCR"}), 500
+                # Inject OCR text into a fake meta for Groq
+                meta["_ocr_text"] = ocr_text
+                questions = extract_questions_from_pdf_text(ocr_text, meta)
+            else:
+                raise
 
         # Write exam doc to exams collection
         exam_doc = {

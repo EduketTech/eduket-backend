@@ -27,3 +27,4 @@ numpy>=1.26.0
 anthropic
 pymupdf
 pdfplumber
+groq

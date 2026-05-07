@@ -459,18 +459,16 @@ def load_exam_from_firestore(exam_id: str):
         meta = doc.to_dict()
         meta["id"] = doc.id
 
-        # Load questions ordered by their index
+        # Load questions — sort in Python to avoid needing Firestore composite index
         q_docs = (
             db.collection("exam_questions")
             .where("examId", "==", exam_id)
-            .order_by("order")
             .stream()
         )
 
         questions = []
         for q in q_docs:
             d = q.to_dict()
-            # Normalise options — backend stores as dict {A: ..., B: ...}
             options = d.get("options")
             if isinstance(options, dict) and options:
                 options = [{"key": k, "value": v} for k, v in sorted(options.items())]
@@ -493,13 +491,21 @@ def load_exam_from_firestore(exam_id: str):
                 "marks": d.get("marks", 1),
                 "memo": d.get("memo", ""),
                 "saved_answer": "",
+                "order": d.get("order", 0),
             })
 
+        # Sort by order in Python — no index needed
+        questions.sort(key=lambda x: x.get("order", 0))
+
+        # Remove the order field before sending to frontend
+        for q in questions:
+            q.pop("order", None)
+
         return meta, questions
+
     except Exception as e:
         traceback.print_exc()
         return None, []
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES — ADMIN

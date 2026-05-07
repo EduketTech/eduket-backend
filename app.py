@@ -1093,7 +1093,7 @@ def debug_extract(exam_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
+#debugging
 @app.route("/admin/extraction-status/<exam_id>", methods=["GET"])
 def extraction_status(exam_id):
     """Check extraction status without triggering it."""
@@ -1126,7 +1126,7 @@ def extraction_status(exam_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
+# debugging
 @app.route("/admin/check-drive", methods=["GET"])
 def check_drive():
     """Temp: check Drive access and env vars."""
@@ -1145,6 +1145,7 @@ def check_drive():
         traceback.print_exc()
         return jsonify({"error": str(e)})
 
+# debugging
 @app.route("/admin/debug-ocr/<exam_id>", methods=["GET"])
 def debug_ocr(exam_id):
     try:
@@ -1193,6 +1194,61 @@ EXAM TEXT:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+# debugging
+@app.route("/admin/debug-drive-perms", methods=["GET"])
+def debug_drive_perms():
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request as GoogleRequest
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+
+        inline_json = (
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+            os.getenv("FIREBASE_SERVICE_ACCOUNT")
+        )
+        sa_info = json.loads(inline_json)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        creds.refresh(GoogleRequest())
+        drive = build("drive", "v3", credentials=creds)
+
+        # Test 1: can we read the file?
+        file_id = "1gZPAkgaP5qHDEqvRAIQdaMuEYA6J_-kl"
+        try:
+            file_meta = drive.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+            can_read = True
+            file_name = file_meta.get("name")
+        except Exception as e:
+            can_read = False
+            file_name = str(e)
+
+        # Test 2: can we create a file in Drive?
+        try:
+            test_doc = drive.files().create(
+                body={"name": "educat_permission_test", "mimeType": "application/vnd.google-apps.document"},
+                fields="id"
+            ).execute()
+            can_write = True
+            # Clean up
+            drive.files().delete(fileId=test_doc["id"]).execute()
+        except Exception as e:
+            can_write = False
+            write_error = str(e)
+
+        return jsonify({
+            "service_account_email": sa_info.get("client_email"),
+            "can_read_exam_file": can_read,
+            "exam_file_name": file_name,
+            "can_write_to_drive": can_write,
+            "write_error": write_error if not can_write else None,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():

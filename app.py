@@ -1145,6 +1145,54 @@ def check_drive():
         traceback.print_exc()
         return jsonify({"error": str(e)})
 
+@app.route("/admin/debug-ocr/<exam_id>", methods=["GET"])
+def debug_ocr(exam_id):
+    try:
+        meta = None
+        docs = db_admin.collection("teacherExamUploads").stream()
+        for doc in docs:
+            for upload in doc.to_dict().get("uploads", []):
+                if upload.get("examId") == exam_id:
+                    meta = upload
+                    break
+            if meta:
+                break
+
+        if not meta:
+            return jsonify({"error": "not found"}), 404
+
+        # Get OCR text
+        ocr_text = extract_text_from_drive_pdf_ocr(meta.get("examDriveFileId"))
+
+        # Get raw Groq response
+        from groq import Groq
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        prompt = f"""You are an expert exam parser for South African NSC (CAPS) exams.
+Extract ALL questions from this exam text into structured JSON.
+Return ONLY a valid JSON array. No extra text, no markdown fences.
+Each object must have: question_number, parent_question, section, question, type, marks, options, column_a, column_b, memo.
+Subject: {meta.get('subject', '')}
+Grade: {meta.get('grade', '')}
+EXAM TEXT:
+{ocr_text[:12000]}
+"""
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8000,
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content.strip()
+
+        return jsonify({
+            "ocr_text_length": len(ocr_text),
+            "ocr_preview": ocr_text[:1000],
+            "groq_raw_response": raw[:3000],
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():

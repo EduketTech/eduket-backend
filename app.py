@@ -22,6 +22,7 @@ import re
 import traceback
 import requests as http_requests
 from datetime import datetime
+import threading
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -898,17 +899,18 @@ def extract_exam():
             pass
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/admin/trigger-extract/<exam_id>", methods=["GET"])
 def trigger_extract_get(exam_id):
+    """Returns immediately, runs extraction in background."""
     try:
-        # Search through all teacher docs for the matching examId
+        # Find the upload first (fast)
         meta = None
         teacher_doc_id = None
         docs = db_admin.collection("teacherExamUploads").stream()
         for doc in docs:
             d = doc.to_dict()
-            uploads = d.get("uploads", [])
-            for upload in uploads:
+            for upload in d.get("uploads", []):
                 if upload.get("examId") == exam_id or upload.get("id") == exam_id:
                     meta = upload
                     teacher_doc_id = doc.id
@@ -917,89 +919,125 @@ def trigger_extract_get(exam_id):
                 break
 
         if not meta:
-            return jsonify({"error": f"Exam {exam_id} not found in any teacher doc"}), 404
+            return jsonify({"error": f"Exam {exam_id} not found"}), 404
 
-        # Download PDF from Drive
         exam_file_id = meta.get("examDriveFileId")
         if not exam_file_id:
             return jsonify({"error": "No examDriveFileId"}), 400
 
-        # Inside trigger_extract_get, replace the pdf_bytes + questions lines with:
-        pdf_bytes = download_from_drive_bytes(exam_file_id)
-        if not pdf_bytes:
-            return jsonify({"error": "Drive download failed"}), 500
-
-        # Try normal extraction first
-        try:
-            questions = extract_questions_from_pdf(pdf_bytes, meta)
-        except ValueError as e:
-            if "SCANNED_PDF" in str(e):
-                # Scanned PDF — use Drive OCR
-                print("[Trigger] Scanned PDF detected, using Drive OCR...")
-                ocr_text = extract_text_from_drive_pdf_ocr(exam_file_id)
-                if not ocr_text.strip():
-                    return jsonify({"error": "Could not extract text even with OCR"}), 500
-                # Inject OCR text into a fake meta for Groq
-                meta["_ocr_text"] = ocr_text
-                questions = extract_questions_from_pdf_text(ocr_text, meta)
-            else:
-                raise
-
-        # Write exam doc to exams collection
-        exam_doc = {
-            "title": meta.get("title", "Exam"),
-            "subject": meta.get("subject", ""),
-            "grade": meta.get("grade", ""),
-            "year": meta.get("year", ""),
-            "curriculum": meta.get("curriculum", "CAPS"),
-            "teacherName": meta.get("teacherName", ""),
-            "uploadedBy": meta.get("uploadedBy", ""),
-            "examDriveFileId": exam_file_id,
-            "memoDriveFileId": meta.get("memoDriveFileId"),
-            "status": "ready",
-            "totalQuestions": len(questions),
-            "extractedAt": fs_admin.SERVER_TIMESTAMP,
-            "sourceUploadId": exam_id,
-        }
-        db_admin.collection("exams").document(exam_id).set(exam_doc)
-
-        # Write questions to exam_questions collection
-        batch = db_admin.batch()
-        for i, q in enumerate(questions):
-            q_ref = db_admin.collection("exam_questions").document(f"{exam_id}_{i:04d}")
-            batch.set(q_ref, {
-                "examId": exam_id,
-                "questionNumber": q.get("question_number", str(i+1)),
-                "parentQuestion": q.get("parent_question", ""),
-                "section": q.get("section", "A"),
-                "questionText": q.get("question", ""),
-                "type": q.get("type", "open"),
-                "marks": q.get("marks", 1),
-                "options": q.get("options"),
-                "columnA": q.get("column_a"),
-                "columnB": q.get("column_b"),
-                "memo": q.get("memo", ""),
-                "order": i,
-            })
-        batch.commit()
-
-        # Update the upload status inside the nested array
-        updated_uploads = []
+        # Mark as processing immediately
         doc_ref = db_admin.collection("teacherExamUploads").document(teacher_doc_id)
         teacher_data = doc_ref.get().to_dict()
+        updated_uploads = []
         for upload in teacher_data.get("uploads", []):
             if upload.get("examId") == exam_id:
-                upload["status"] = "extracted"
-                upload["extractedAt"] = datetime.utcnow().isoformat()
-                upload["totalQuestions"] = len(questions)
+                upload["status"] = "processing"
             updated_uploads.append(upload)
         doc_ref.update({"uploads": updated_uploads})
 
+        # Run extraction in background thread
+        def run_extraction():
+            try:
+                print(f"[BG] Starting extraction for {exam_id}")
+
+                # Download PDF
+                pdf_bytes = download_from_drive_bytes(exam_file_id)
+                if not pdf_bytes:
+                    raise ValueError("Drive download failed")
+
+                # Try normal text extraction first
+                questions = []
+                try:
+                    questions = extract_questions_from_pdf(pdf_bytes, meta)
+                except ValueError as e:
+                    if "SCANNED_PDF" in str(e):
+                        print("[BG] Scanned PDF — using Drive OCR")
+                        ocr_text = extract_text_from_drive_pdf_ocr(exam_file_id)
+                        if not ocr_text.strip():
+                            raise ValueError("OCR returned no text")
+                        questions = extract_questions_from_pdf_text(ocr_text, meta)
+                    else:
+                        raise
+
+                print(f"[BG] Extracted {len(questions)} questions")
+
+                # Write to exams collection
+                db_admin.collection("exams").document(exam_id).set({
+                    "title": meta.get("title", "Exam"),
+                    "subject": meta.get("subject", ""),
+                    "grade": meta.get("grade", ""),
+                    "year": meta.get("year", ""),
+                    "curriculum": meta.get("curriculum", "CAPS"),
+                    "teacherName": meta.get("teacherName", ""),
+                    "uploadedBy": meta.get("uploadedBy", ""),
+                    "examDriveFileId": exam_file_id,
+                    "memoDriveFileId": meta.get("memoDriveFileId"),
+                    "status": "ready",
+                    "totalQuestions": len(questions),
+                    "extractedAt": fs_admin.SERVER_TIMESTAMP,
+                    "sourceUploadId": exam_id,
+                })
+
+                # Write questions in batches
+                batch = db_admin.batch()
+                for i, q in enumerate(questions):
+                    q_ref = db_admin.collection("exam_questions").document(f"{exam_id}_{i:04d}")
+                    batch.set(q_ref, {
+                        "examId": exam_id,
+                        "questionNumber": q.get("question_number", str(i+1)),
+                        "parentQuestion": q.get("parent_question", ""),
+                        "section": q.get("section", "A"),
+                        "questionText": q.get("question", ""),
+                        "type": q.get("type", "open"),
+                        "marks": q.get("marks", 1),
+                        "options": q.get("options"),
+                        "columnA": q.get("column_a"),
+                        "columnB": q.get("column_b"),
+                        "memo": q.get("memo", ""),
+                        "order": i,
+                    })
+                    # Commit every 400 to stay under Firestore batch limit
+                    if (i + 1) % 400 == 0:
+                        batch.commit()
+                        batch = db_admin.batch()
+                batch.commit()
+
+                # Update upload status to extracted
+                teacher_data = doc_ref.get().to_dict()
+                updated = []
+                for upload in teacher_data.get("uploads", []):
+                    if upload.get("examId") == exam_id:
+                        upload["status"] = "extracted"
+                        upload["extractedAt"] = datetime.utcnow().isoformat()
+                        upload["totalQuestions"] = len(questions)
+                    updated.append(upload)
+                doc_ref.update({"uploads": updated})
+                print(f"[BG] Extraction complete for {exam_id}")
+
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[BG] Extraction failed: {e}")
+                # Mark as error in Firestore
+                try:
+                    teacher_data = doc_ref.get().to_dict()
+                    updated = []
+                    for upload in teacher_data.get("uploads", []):
+                        if upload.get("examId") == exam_id:
+                            upload["status"] = "error"
+                            upload["errorMessage"] = str(e)
+                        updated.append(upload)
+                    doc_ref.update({"uploads": updated})
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=run_extraction, daemon=True)
+        thread.start()
+
         return jsonify({
             "ok": True,
+            "message": "Extraction started in background",
             "exam_id": exam_id,
-            "questions_extracted": len(questions),
-            "teacher_doc": teacher_doc_id,
+            "check_status": f"/admin/extraction-status/{exam_id}",
         })
 
     except Exception as e:
@@ -1056,14 +1094,38 @@ def debug_extract(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/admin/list-raw", methods=["GET"])
-def list_raw():
-    """Temp diagnostic — lists all teacherExamUploads doc IDs."""
+@app.route("/admin/extraction-status/<exam_id>", methods=["GET"])
+def extraction_status(exam_id):
+    """Check extraction status without triggering it."""
     try:
+        # Check exams collection first
+        exam_doc = db_admin.collection("exams").document(exam_id).get()
+        if exam_doc.exists:
+            d = exam_doc.to_dict()
+            q_count = db_admin.collection("exam_questions").where("examId", "==", exam_id).stream()
+            actual_q = sum(1 for _ in q_count)
+            return jsonify({
+                "status": d.get("status"),
+                "questions_in_firestore": actual_q,
+                "title": d.get("title"),
+                "student_accessible": d.get("status") == "ready",
+            })
+
+        # Check upload doc for processing/error status
         docs = db_admin.collection("teacherExamUploads").stream()
-        return jsonify({"doc_ids": [doc.id for doc in docs]})
+        for doc in docs:
+            for upload in doc.to_dict().get("uploads", []):
+                if upload.get("examId") == exam_id:
+                    return jsonify({
+                        "status": upload.get("status"),
+                        "error": upload.get("errorMessage"),
+                        "student_accessible": False,
+                    })
+
+        return jsonify({"status": "not_found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/admin/check-drive", methods=["GET"])
 def check_drive():

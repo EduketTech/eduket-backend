@@ -642,6 +642,25 @@ def extraction_status(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
+def save_session_to_fs(sid: str, data: dict):
+    db.collection("exam_sessions").document(sid).set({
+        **data,
+        "createdAt": fs_admin.SERVER_TIMESTAMP,
+    })
+
+def get_session_from_fs(sid: str) -> dict | None:
+    if not sid:
+        return None
+    doc = db.collection("exam_sessions").document(sid).get()
+    return doc.to_dict() if doc.exists else None
+
+def update_session_answers(sid: str, answers: dict):
+    db.collection("exam_sessions").document(sid).update({"answers": answers})
+
+def delete_session_from_fs(sid: str):
+    db.collection("exam_sessions").document(sid).delete()
+
+
 @app.route("/exams", methods=["GET"])
 def list_exams():
     exams = []
@@ -673,10 +692,8 @@ def start_exam():
             return jsonify({"error": "No exam specified"})
 
         meta, questions = load_exam_from_firestore(exam_id)
-
         if meta is None:
             return jsonify({"error": f"Exam '{exam_id}' not found"})
-
         if not questions:
             return jsonify({"error": (
                 f"This exam has no questions yet — extraction may still be in progress "
@@ -685,14 +702,15 @@ def start_exam():
 
         mem.ensure_student(student_id)
         sid = str(uuid.uuid4())
-        sessions[sid] = {
-            "exam_id":   exam_id,
-            "exam":      meta.get("title", exam_id),
-            "subject":   meta.get("subject", ""),
+
+        save_session_to_fs(sid, {
+            "exam_id":    exam_id,
+            "exam":       meta.get("title", exam_id),
+            "subject":    meta.get("subject", ""),
             "student_id": student_id,
-            "questions": questions,
-            "answers":   {},
-        }
+            "questions":  questions,
+            "answers":    {},
+        })
 
         return jsonify({
             "session_id":      sid,
@@ -707,11 +725,28 @@ def start_exam():
         return jsonify({"error": str(e)})
 
 
+@app.route("/answer", methods=["POST"])
+def save_answer():
+    try:
+        data    = request.get_json()
+        sid     = data.get("session_id")
+        session = get_session_from_fs(sid)
+        if not session:
+            return jsonify({"error": "Invalid session"})
+
+        answers = session.get("answers", {})
+        answers[str(data.get("index"))] = data.get("answer", "")
+        update_session_answers(sid, answers)
+        return jsonify({"status": "saved"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/question", methods=["POST"])
 def get_question():
     try:
         data    = request.get_json()
-        session = sessions.get(data.get("session_id"))
+        session = get_session_from_fs(data.get("session_id"))
         if not session:
             return jsonify({"error": "Invalid session"})
         idx = int(data.get("index", 0))
@@ -719,23 +754,10 @@ def get_question():
         if idx < 0 or idx >= len(qs):
             return jsonify({"error": "Index out of range"})
         q = qs[idx].copy()
-        q["saved_answer"] = session["answers"].get(str(idx), "")
+        q["saved_answer"] = session.get("answers", {}).get(str(idx), "")
         return jsonify(q)
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e)})
-
-
-@app.route("/answer", methods=["POST"])
-def save_answer():
-    try:
-        data    = request.get_json()
-        session = sessions.get(data.get("session_id"))
-        if not session:
-            return jsonify({"error": "Invalid session"})
-        session["answers"][str(data.get("index"))] = data.get("answer", "")
-        return jsonify({"status": "saved"})
-    except Exception as e:
         return jsonify({"error": str(e)})
 
 
@@ -743,15 +765,16 @@ def save_answer():
 def submit_exam():
     try:
         data       = request.get_json()
-        session    = sessions.get(data.get("session_id"))
+        sid        = data.get("session_id")
         student_id = data.get("student_id", "anonymous")
+        session    = get_session_from_fs(sid)
 
         if not session:
             return jsonify({"error": "Invalid session"})
 
         subject   = session.get("subject", "")
         questions = session["questions"]
-        answers   = session["answers"]
+        answers   = session.get("answers", {})
         results   = []
         total_score = 0
         total_marks = 0
@@ -808,28 +831,45 @@ def submit_exam():
             total_marks += marks
 
         percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
-        mem.save_session(student_id, session["exam"], total_score, total_marks, percentage, subject=subject)
-        feedback = generate_exam_feedback(results, total_score, total_marks, percentage, subject=subject)
 
+        mem.save_session(
+            student_id, session["exam"],
+            total_score, total_marks, percentage,
+            subject=subject,
+        )
+
+        feedback = generate_exam_feedback(
+            results, total_score, total_marks, percentage,
+            subject=subject,
+        )
+
+        # Update study plan in background if student has weak topics
         weak = mem.get_weak_topics(student_id)
         if weak:
             try:
-                run_agent(student_id,
+                run_agent(
+                    student_id,
                     f"I scored {percentage}% on {session['exam']} ({subject}). Update my study plan.",
-                    rag=rag)
-            except Exception:
-                pass
+                    rag=rag,
+                )
+            except Exception as agent_err:
+                print(f"[submit] Agent update failed (non-fatal): {agent_err}")
+
+        # Clean up Firestore session — no longer needed after submit
+        delete_session_from_fs(sid)
 
         return jsonify({
-            "score": total_score, "total": total_marks,
-            "percentage": percentage, "results": results,
-            "feedback": feedback, "subject": subject,
+            "score":      total_score,
+            "total":      total_marks,
+            "percentage": percentage,
+            "results":    results,
+            "feedback":   feedback,
+            "subject":    subject,
         })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)})
-
 
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():
@@ -852,6 +892,18 @@ def clear_history():
     mem.clear_history(data.get("student_id", ""))
     return jsonify({"status": "cleared"})
 
+@app.route("/admin/cleanup-sessions", methods=["POST"])
+def cleanup_sessions():
+    """Delete exam sessions older than 24 hours."""
+    from datetime import timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    deleted = 0
+    for doc in db.collection("exam_sessions").stream():
+        created = doc.to_dict().get("createdAt")
+        if created and created < cutoff:
+            doc.reference.delete()
+            deleted += 1
+    return jsonify({"deleted": deleted})
 
 @app.route("/dashboard", methods=["POST"])
 def dashboard():

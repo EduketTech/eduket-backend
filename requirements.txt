@@ -28,3 +28,4 @@ anthropic
 pymupdf
 pdfplumber
 groq
+python-docx

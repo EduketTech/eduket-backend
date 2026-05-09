@@ -510,13 +510,8 @@ def load_exam_from_firestore(exam_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
-
 @app.route("/auto-extract", methods=["POST"])
 def auto_extract():
-    """
-    Called by frontend immediately after teacher uploads.
-    Finds the upload in Firestore and starts background extraction.
-    """
     try:
         data = request.get_json()
         exam_id = data.get("exam_id", "").strip()
@@ -525,6 +520,8 @@ def auto_extract():
 
         meta = None
         teacher_doc_id = None
+
+        # Stream all teacher upload docs to find the matching exam_id
         for doc in db.collection("teacherExamUploads").stream():
             for upload in doc.to_dict().get("uploads", []):
                 if upload.get("examId") == exam_id or upload.get("id") == exam_id:
@@ -562,7 +559,6 @@ def auto_extract():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/admin/trigger-extract/<exam_id>", methods=["GET"])
 def trigger_extract(exam_id):

@@ -108,11 +108,11 @@ def ensure_student(student_id: str, name: str = "Student"):
 
 
 # ── Session history ───────────────────────────────────────────────────────────
-def save_session(student_id: str, exam_name: str, score: int, total: int, percentage: float):
+def save_session(student_id: str, exam_name: str, score: int, total: int, percentage: float, subject=""):
     with _conn() as c:
         c.execute(
             "INSERT INTO sessions(student_id,exam_name,score,total,percentage) VALUES(?,?,?,?,?)",
-            (student_id, exam_name, score, total, percentage),
+            (student_id, exam_name, score, total, percentage, subject),
         )
 
 

@@ -41,7 +41,6 @@ def _conn():
 def init_db():
     with _conn() as c:
         c.executescript("""
-        -- Original tables — unchanged
         CREATE TABLE IF NOT EXISTS students (
             student_id  TEXT PRIMARY KEY,
             created_at  TEXT DEFAULT (datetime('now')),
@@ -55,6 +54,7 @@ def init_db():
             score       INTEGER,
             total       INTEGER,
             percentage  REAL,
+            subject     TEXT DEFAULT '',
             played_at   TEXT DEFAULT (datetime('now'))
         );
 
@@ -86,16 +86,20 @@ def init_db():
             updated_at  TEXT DEFAULT (datetime('now'))
         );
 
-        -- NEW: LangChain SQLChatMessageHistory writes here.
-        -- Schema follows LangChain's convention.
-        -- agent.py's RunnableWithMessageHistory manages this table;
-        -- we never read or write it directly.
         CREATE TABLE IF NOT EXISTS lc_message_store (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
             message    TEXT NOT NULL
         );
         """)
+
+        # Migration — adds subject to existing databases that already
+        # have the sessions table without the column. Safe to run every
+        # startup; silently ignored if the column already exists.
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN subject TEXT DEFAULT ''")
+        except Exception:
+            pass  # column already exists — nothing to do
 
 
 # ── Student ───────────────────────────────────────────────────────────────────
@@ -108,12 +112,14 @@ def ensure_student(student_id: str, name: str = "Student"):
 
 
 # ── Session history ───────────────────────────────────────────────────────────
-def save_session(student_id: str, exam_name: str, score: int, total: int, percentage: float, subject=""):
+def save_session(student_id, exam, score, total, percentage, subject=""):
     with _conn() as c:
         c.execute(
-            "INSERT INTO sessions(student_id,exam_name,score,total,percentage) VALUES(?,?,?,?,?)",
-            (student_id, exam_name, score, total, percentage, subject),
+            "INSERT INTO sessions (student_id, exam_name, score, total, percentage, subject) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (student_id, exam, score, total, percentage, subject)
         )
+
 
 
 def get_sessions(student_id: str, limit: int = 5) -> list:

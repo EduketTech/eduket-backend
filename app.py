@@ -66,9 +66,6 @@ CORS(app, resources={r"/*": {"origins": [
 rag = RAGIndex()
 agent.set_rag(rag)
 
-sessions = {}  # in-memory session store
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # DRIVE DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════

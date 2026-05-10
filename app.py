@@ -60,7 +60,7 @@ CORS(app, resources={r"/*": {"origins": [
     "http://localhost:5174",
     "http://localhost:5175",
     "http://localhost:5176",
-    "https://edu-cat.netlify.app",
+    "https://eduket.netlify.app",
 ]}})
 
 rag = RAGIndex()

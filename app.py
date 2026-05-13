@@ -251,11 +251,44 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_questions_from_text(text: str, subject: str, grade: str) -> list:
+    """Parse questions in chunks to handle full-length papers."""
     if not text or not text.strip():
         return []
+
+    # Split into overlapping 12000-char chunks
+    CHUNK = 12000
+    OVERLAP = 500
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + CHUNK])
+        start += CHUNK - OVERLAP
+
+    all_questions = []
+    seen_numbers = set()
+
+    for i, chunk in enumerate(chunks):
+        print(f"[Parse] Chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+        qs = _parse_chunk(chunk, subject, grade)
+        for q in qs:
+            qn = _normalise_qnum(q.get("question_number", ""))
+            if qn and qn not in seen_numbers:
+                seen_numbers.add(qn)
+                all_questions.append(q)
+
+    print(f"[Parse] Total unique questions: {len(all_questions)}")
+    return all_questions
+
+
+def _normalise_qnum(qn: str) -> str:
+    """Normalise question number for matching — strip dots, spaces, lowercase."""
+    return re.sub(r"[\s\.\-]+", "", str(qn)).lower().strip()
+
+
+def _parse_chunk(text: str, subject: str, grade: str) -> list:
+    """Parse a single text chunk into questions."""
     from groq import Groq
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    trimmed = text[:14000]
     prompt = f"""You are an expert parser for South African NSC CAPS exam papers.
 
 Extract EVERY question from the text below into a JSON array.
@@ -266,39 +299,21 @@ RULES:
 - For True/False: type="true_false"
 - For matching columns: type="matching", column_a=[...], column_b=[...]
 - For calculations: type="calculation"
-- For short written answers: type="short_answer"
-- For paragraph/essay answers: type="essay"
+- For short answers: type="short_answer"
+- For essays: type="essay"
 - Default: type="open"
 - marks = integer from brackets e.g. (2) or [3] — default 1 if not found
-- section = section letter or number (A, B, 1, 2 etc.)
-- parent_question = main question heading e.g. "QUESTION 1"
-- If question refers to a diagram, include [DIAGRAM: description] in question text
-- memo = correct answer if visible in text, else null
-- NEVER skip a question even if it refers to a diagram
+- section = section letter/number (A, B, 1, 2 etc.)
+- parent_question = main heading e.g. "QUESTION 1"
+- For diagrams include [DIAGRAM: description] in question text
+- memo = correct answer if visible, else null
+- NEVER skip questions
 
 Return ONLY a valid JSON array. No markdown, no explanation.
-
-FORMAT:
-[
-  {{
-    "question_number": "1.1",
-    "parent_question": "QUESTION 1",
-    "section": "A",
-    "question": "Full question text here",
-    "type": "mcq",
-    "marks": 2,
-    "options": {{"A": "Option text", "B": "Option text", "C": "Option text", "D": "Option text"}},
-    "column_a": null,
-    "column_b": null,
-    "memo": null
-  }}
-]
-
-Subject: {subject}
-Grade: {grade}
+Subject: {subject} | Grade: {grade}
 
 EXAM TEXT:
-{trimmed}
+{text}
 """
     try:
         response = client.chat.completions.create(
@@ -309,15 +324,89 @@ EXAM TEXT:
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-        questions = json.loads(raw)
-        print(f"[Parse] {len(questions)} questions")
-        return questions if isinstance(questions, list) else []
-    except json.JSONDecodeError as e:
-        print(f"[Parse] JSON error: {e}")
-        return []
+        result = json.loads(raw)
+        return result if isinstance(result, list) else []
     except Exception as e:
-        print(f"[Parse] Groq error: {e}")
+        print(f"[Parse] Chunk error: {e}")
         return []
+
+
+    #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    #MEMO PARSER
+    #==============================================================
+def parse_memo_answers(text: str, subject: str, grade: str) -> dict:
+    """
+    Parse a memo document into a question_number → answer map.
+    Uses answer-focused prompt instead of question-focused prompt.
+    Processes in chunks to cover full document.
+    """
+    if not text or not text.strip():
+        return {}
+
+    CHUNK = 12000
+    OVERLAP = 500
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + CHUNK])
+        start += CHUNK - OVERLAP
+
+    memo_map = {}
+
+    for i, chunk in enumerate(chunks):
+        print(f"[Memo] Chunk {i+1}/{len(chunks)}")
+        chunk_map = _parse_memo_chunk(chunk, subject, grade)
+        memo_map.update(chunk_map)
+
+    print(f"[Memo] Total answers extracted: {len(memo_map)}")
+    return memo_map
+
+
+def _parse_memo_chunk(text: str, subject: str, grade: str) -> dict:
+    """Parse one chunk of memo text into {question_number: answer} dict."""
+    from groq import Groq
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    prompt = f"""You are reading a South African NSC CAPS exam MARKING MEMORANDUM.
+
+Extract EVERY answer from the text below.
+
+Return ONLY a valid JSON object mapping question_number to answer string.
+Include ALL sub-questions (1.1, 1.2, 2.1.1 etc.)
+For MCQ answers just give the letter (e.g. "C").
+For True/False give "True" or "False".
+For written answers give the full expected answer text.
+For matching give the correct pairs.
+
+No markdown, no explanation. Just the JSON object.
+
+Example format:
+{{
+  "1.1": "C",
+  "1.2": "True",
+  "1.3": "The CPU processes instructions by fetching, decoding and executing them.",
+  "2.1": "A",
+  "2.2": "RAM is volatile memory that loses data when power is off."
+}}
+
+Subject: {subject} | Grade: {grade}
+
+MEMO TEXT:
+{text}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8000,
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else {}
+    except Exception as e:
+        print(f"[Memo] Chunk error: {e}")
+        return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -367,26 +456,25 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         questions = parse_questions_from_text(exam_text, subject, grade)
         print(f"[Pipeline] Questions: {len(questions)}")
 
-        # 4. Download and parse memo
+        # ── 4. Download and parse memo ─────────────────────────────────────
         memo_map = {}
         if memo_fid:
             memo_bytes = download_file_bytes(memo_fid)
             if memo_bytes:
                 memo_text = extract_text_from_file(memo_bytes, memo_fn)
                 if memo_text.strip():
-                    memo_qs = parse_questions_from_text(memo_text, f"{subject} MEMO", grade)
-                    for mq in memo_qs:
-                        qn = mq.get("question_number")
-                        ans = mq.get("memo") or mq.get("question", "")
-                        if qn and ans:
-                            memo_map[qn] = ans
+                    # Use dedicated memo parser — not question parser
+                    memo_map = parse_memo_answers(memo_text, subject, grade)
                     print(f"[Pipeline] Memo answers: {len(memo_map)}")
 
-        # 5. Merge memo into questions
+        # ── 5. Merge memo into questions using fuzzy number matching ────────
+        # Build normalised lookup for fast matching
+        norm_memo = {_normalise_qnum(k): v for k, v in memo_map.items()}
+
         for q in questions:
-            qn = q.get("question_number")
-            if qn and qn in memo_map and not q.get("memo"):
-                q["memo"] = memo_map[qn]
+            qn_norm = _normalise_qnum(q.get("question_number", ""))
+            if qn_norm and qn_norm in norm_memo and not q.get("memo"):
+                q["memo"] = norm_memo[qn_norm]
 
         # 6. Safety net placeholder
         if not questions:

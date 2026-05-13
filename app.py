@@ -105,39 +105,57 @@ def download_file_bytes(file_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    """
-    Extract all text from a .docx Word document using python-docx.
-    Handles paragraphs and tables. Best format for exam papers — no OCR needed.
-    """
     try:
         from docx import Document
         from docx.oxml.ns import qn
+
         doc = Document(io.BytesIO(file_bytes))
         lines = []
+
+        def collect_text(element) -> str:
+            """Recursively collect all w:t text from any element."""
+            return "".join(
+                node.text or ""
+                for node in element.iter()
+                if node.tag in (
+                    qn("w:t"),
+                    "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+                )
+            )
 
         for element in doc.element.body:
             tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
 
             if tag == "p":
-                para_text = "".join(
-                    node.text or "" for node in element.iter()
-                    if node.tag in (qn("w:t"), "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-                )
-                if para_text.strip():
-                    lines.append(para_text.strip())
+                text = collect_text(element).strip()
+                if text:
+                    lines.append(text)
 
             elif tag == "tbl":
                 for row in element.iter(qn("w:tr")):
-                    cells = []
-                    for cell in row.iter(qn("w:tc")):
-                        cell_text = "".join(
-                            node.text or "" for node in cell.iter()
-                            if node.tag in (qn("w:t"), "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-                        )
-                        if cell_text.strip():
-                            cells.append(cell_text.strip())
-                    if cells:
-                        lines.append(" | ".join(cells))
+                    cells = [
+                        collect_text(cell).strip()
+                        for cell in row.iter(qn("w:tc"))
+                    ]
+                    row_text = " | ".join(c for c in cells if c)
+                    if row_text:
+                        lines.append(row_text)
+
+        # Also grab text boxes (drawing objects) — common in SA exam papers
+        for txbx in doc.element.body.iter(qn("w:txbxContent")):
+            text = collect_text(txbx).strip()
+            if text:
+                lines.append(text)
+
+        # Also grab headers and footers
+        for section in doc.sections:
+            for hdr in [section.header, section.first_page_header, section.even_page_header]:
+                try:
+                    text = hdr.text.strip()
+                    if text:
+                        lines.append(text)
+                except Exception:
+                    pass
 
         text = "\n".join(lines)
         print(f"[DOCX] Extracted {len(text)} chars, {len(lines)} lines")
@@ -147,7 +165,6 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         traceback.print_exc()
         print(f"[DOCX] Error: {e}")
         return ""
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEXT EXTRACTION — PDF
@@ -226,24 +243,17 @@ def _groq_vision_ocr(pdf_bytes: bytes, max_pages: int = 20) -> str:
 
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-    """Route to correct extractor based on file extension."""
     name = filename.lower()
     if name.endswith(".docx") or name.endswith(".doc"):
         print(f"[Extract] Word doc: {filename}")
-        text = extract_text_from_docx(file_bytes)
-        if not text.strip():
-            print("[Extract] DOCX empty — trying PDF fallback")
-            text = extract_text_from_pdf(file_bytes)
-        return text
+        return extract_text_from_docx(file_bytes)   # done — no PDF fallback
     elif name.endswith(".pdf"):
         print(f"[Extract] PDF: {filename}")
         return extract_text_from_pdf(file_bytes)
     else:
         print(f"[Extract] Unknown type {filename} — trying docx then pdf")
         text = extract_text_from_docx(file_bytes)
-        if not text.strip():
-            text = extract_text_from_pdf(file_bytes)
-        return text
+        return text if text.strip() else extract_text_from_pdf(file_bytes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -323,13 +333,12 @@ EXAM TEXT:
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        raw = re.sub(r"^```(?:json)?\s*|```\s*$", "", raw.strip(), flags=re.MULTILINE).strip()
         result = json.loads(raw)
         return result if isinstance(result, list) else []
     except Exception as e:
         print(f"[Parse] Chunk error: {e}")
         return []
-
 
     #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     #MEMO PARSER

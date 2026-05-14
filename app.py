@@ -336,6 +336,9 @@ Extract EVERY question from the text below into a JSON array.
 
 RULES:
 - Create a SEPARATE item for EACH sub-question (1.1, 1.2, 2.1.1 etc.)
+- If MCQs are listed as plain paragraphs without sub-numbers under a heading like
+  "QUESTION 1: MULTIPLE CHOICE", auto-number them 1.1, 1.2, 1.3 etc.
+- The question text ends at the A/B/C/D options — do not include option text in question field
 - For MCQ: type="mcq", options={{"A":"...","B":"...","C":"...","D":"..."}}
 - For True/False: type="true_false"
 - For matching columns: type="matching", column_a=[...], column_b=[...]
@@ -364,8 +367,11 @@ EXAM TEXT:
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*|```\s*$", "", raw.strip(), flags=re.MULTILINE).strip()
-        result = json.loads(raw)
+        match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+        if not match:
+            print(f"[Parse] No JSON array in Groq response. Preview: {raw[:300]}")
+            return []
+        result = json.loads(match.group())
         return result if isinstance(result, list) else []
     except Exception as e:
         print(f"[Parse] Chunk error: {e}")

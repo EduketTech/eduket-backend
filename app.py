@@ -482,7 +482,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         set_upload_status("processing")
 
         # 1. Download exam file
-        exam_bytes = download_file_bytes(exam_fid)
+        exam_bytes = download_file_bytes(exam_fid, exam_fn)
         if not exam_bytes:
             raise ValueError(f"Could not download exam file (Drive id: {exam_fid})")
 
@@ -499,7 +499,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         # ── 4. Download and parse memo ─────────────────────────────────────
         memo_map = {}
         if memo_fid:
-            memo_bytes = download_file_bytes(memo_fid)
+            memo_bytes = download_file_bytes(memo_fid, memo_fn)
             if memo_bytes:
                 memo_text = extract_text_from_file(memo_bytes, memo_fn)
                 if memo_text.strip():

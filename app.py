@@ -82,24 +82,55 @@ def _drive_token() -> str:
     return creds.token
 
 
-def download_file_bytes(file_id: str):
+def download_file_bytes(file_id: str, filename: str = ""):
+    """Download file from Drive — handles both regular files and native Google Docs."""
     try:
         token = _drive_token()
-        res = http_requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+
+        # First check what type of file this is
+        meta_res = http_requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=mimeType,name",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=120,
+            timeout=30,
         )
+        mime = meta_res.json().get("mimeType", "") if meta_res.status_code == 200 else ""
+        print(f"[Drive] File mime type: {mime}")
+
+        # Google Docs → export as docx
+        if mime == "application/vnd.google-apps.document":
+            print(f"[Drive] Google Doc detected — exporting as docx")
+            res = http_requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
+                f"?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=120,
+            )
+        # Google Sheets → export as xlsx (future use)
+        elif mime == "application/vnd.google-apps.spreadsheet":
+            res = http_requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
+                f"?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=120,
+            )
+        # Regular file (pdf, docx uploaded directly) → download as-is
+        else:
+            res = http_requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=120,
+            )
+
         if res.status_code == 200:
             print(f"[Drive] Downloaded {len(res.content)} bytes for {file_id}")
             return res.content
+
         print(f"[Drive] Failed {res.status_code}: {res.text[:300]}")
         return None
+
     except Exception as e:
         print(f"[Drive] Error: {e}")
         return None
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEXT EXTRACTION — WORD DOC
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -554,6 +554,69 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         except Exception:
             pass
 
+@app.route("/admin/debug-memo/<exam_id>", methods=["GET"])
+def debug_memo(exam_id):
+    """Show exactly what memo text was extracted and what answers were parsed."""
+    try:
+        meta = None
+        for doc in db.collection("teacherExamUploads").stream():
+            for upload in doc.to_dict().get("uploads", []):
+                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
+                    meta = upload
+                    break
+            if meta:
+                break
+
+        if not meta:
+            return jsonify({"error": "not found"}), 404
+
+        memo_fid = meta.get("memoDriveFileId")
+        memo_fn  = meta.get("memoFileName", "memo.pdf")
+
+        if not memo_fid:
+            return jsonify({"error": "No memo file on this upload"})
+
+        # Download memo
+        memo_bytes = download_file_bytes(memo_fid)
+        if not memo_bytes:
+            return jsonify({"error": "Could not download memo from Drive"})
+
+        # Extract text
+        memo_text = extract_text_from_file(memo_bytes, memo_fn)
+
+        # Parse answers
+        memo_map = parse_memo_answers(memo_text, meta.get("subject",""), meta.get("grade","12"))
+
+        # Also get exam question numbers for comparison
+        exam_q_nums = []
+        for q in db.collection("exam_questions").where("examId","==",exam_id).stream():
+            exam_q_nums.append(q.to_dict().get("questionNumber",""))
+
+        # Check which exam questions have a matching memo answer
+        matched = []
+        unmatched = []
+        norm_memo = {_normalise_qnum(k): v for k, v in memo_map.items()}
+        for qn in exam_q_nums:
+            if _normalise_qnum(qn) in norm_memo:
+                matched.append(qn)
+            else:
+                unmatched.append(qn)
+
+        return jsonify({
+            "memo_file":        memo_fn,
+            "memo_text_length": len(memo_text),
+            "memo_text_preview": memo_text[:2000],
+            "memo_answers_count": len(memo_map),
+            "memo_answers_sample": dict(list(memo_map.items())[:10]),
+            "exam_questions_count": len(exam_q_nums),
+            "matched_count":    len(matched),
+            "unmatched_count":  len(unmatched),
+            "unmatched_sample": unmatched[:20],
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXAM LOADING

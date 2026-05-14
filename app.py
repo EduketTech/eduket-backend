@@ -868,6 +868,38 @@ def list_exams():
         print(f"[list_exams] {e}")
     return jsonify({"exams": exams})
 
+# debugging
+@app.route("/admin/debug-exam-text/<exam_id>", methods=["GET"])
+def debug_exam_text(exam_id):
+    """Show raw extracted text from exam file."""
+    try:
+        meta = None
+        for doc in db.collection("teacherExamUploads").stream():
+            for upload in doc.to_dict().get("uploads", []):
+                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
+                    meta = upload
+                    break
+            if meta:
+                break
+
+        if not meta:
+            return jsonify({"error": "not found"}), 404
+
+        exam_bytes = download_file_bytes(meta.get("examDriveFileId"), meta.get("examFileName",""))
+        if not exam_bytes:
+            return jsonify({"error": "download failed"})
+
+        exam_text = extract_text_from_file(exam_bytes, meta.get("examFileName","exam.pdf"))
+
+        return jsonify({
+            "filename": meta.get("examFileName"),
+            "text_length": len(exam_text),
+            "full_text": exam_text,  # show everything
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/start-exam", methods=["POST"])
 def start_exam():

@@ -657,6 +657,42 @@ def debug_memo(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
+# debugging
+@app.route("/admin/reset-exam/<exam_id>", methods=["GET"])
+def reset_exam(exam_id):
+    """Wipe exam + questions from Firestore so extraction runs fresh."""
+    try:
+        # Delete all questions
+        batch = db.batch()
+        count = 0
+        for doc in db.collection("exam_questions").where("examId", "==", exam_id).stream():
+            batch.delete(doc.reference)
+            count += 1
+            if count % 400 == 0:
+                batch.commit()
+                batch = db.batch()
+        batch.commit()
+
+        # Delete exam doc
+        db.collection("exams").document(exam_id).delete()
+
+        # Reset upload status to pending so trigger-extract will run
+        for doc in db.collection("teacherExamUploads").stream():
+            uploads = doc.to_dict().get("uploads", [])
+            updated = False
+            for u in uploads:
+                if u.get("examId") == exam_id or u.get("id") == exam_id:
+                    u["status"] = "pending"
+                    updated = True
+            if updated:
+                doc.reference.update({"uploads": uploads})
+                break
+
+        return jsonify({"ok": True, "deleted_questions": count, "exam_id": exam_id})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXAM LOADING
 # ═══════════════════════════════════════════════════════════════════════════════

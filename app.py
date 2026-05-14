@@ -441,13 +441,15 @@ MEMO TEXT:
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-        result = json.loads(raw)
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            print(f"[Memo] No JSON object in Groq response. Preview: {raw[:300]}")
+            return {}
+        result = json.loads(match.group())
         return result if isinstance(result, dict) else {}
     except Exception as e:
         print(f"[Memo] Chunk error: {e}")
         return {}
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXTRACTION PIPELINE (background thread)

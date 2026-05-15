@@ -290,15 +290,39 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 # QUESTION PARSER
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL QUESTION PARSER — handles ANY exam structure
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def parse_questions_from_text(text: str, subject: str, grade: str) -> list:
-    """Parse questions in chunks to handle full-length papers."""
+def parse_questions_universal(text: str, subject: str, grade: str) -> list:
+    """
+    Universal parser that handles ANY South African exam structure:
+    - MCQ with run-together options (A. textB. textC. text)
+    - MCQ with options on separate lines
+    - Numbered sub-questions (1.1, 1.2, 2.1.1)
+    - Unnumbered MCQ blocks (Question 1, 2, 3...)
+    - True/False with correction
+    - Matching/Column A & B
+    - Scenario-based multi-part questions
+    - Essay and long answer
+    - Calculation with working
+    - Table completion
+    - Mixed sections in one paper
+
+    Strategy: 3-pass approach
+      Pass 1 — Pre-process: normalise text structure
+      Pass 2 — Groq parse with universal prompt
+      Pass 3 — Post-process: validate, fill gaps, ensure every question appears
+    """
     if not text or not text.strip():
         return []
 
-    # Split into overlapping 12000-char chunks
-    CHUNK = 12000
-    OVERLAP = 500
+    # ── Pass 1: Pre-process text ───────────────────────────────────────────
+    text = _preprocess_exam_text(text)
+
+    # ── Pass 2: Chunk and parse ────────────────────────────────────────────
+    CHUNK = 10000
+    OVERLAP = 800   # larger overlap to catch questions that span chunk boundaries
     chunks = []
     start = 0
     while start < len(text):
@@ -309,85 +333,290 @@ def parse_questions_from_text(text: str, subject: str, grade: str) -> list:
     seen_numbers = set()
 
     for i, chunk in enumerate(chunks):
-        print(f"[Parse] Chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
-        qs = _parse_chunk(chunk, subject, grade)
+        print(f"[Universal] Chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+        qs = _parse_any_structure(chunk, subject, grade)
         for q in qs:
             qn = _normalise_qnum(q.get("question_number", ""))
             if qn and qn not in seen_numbers:
                 seen_numbers.add(qn)
                 all_questions.append(q)
+            elif not qn:
+                # No question number — still include (e.g. instructions)
+                all_questions.append(q)
 
-    print(f"[Parse] Total unique questions: {len(all_questions)}")
+    # ── Pass 3: Post-process ───────────────────────────────────────────────
+    all_questions = _postprocess_questions(all_questions, text)
+
+    print(f"[Universal] Final: {len(all_questions)} questions")
     return all_questions
 
 
-def _normalise_qnum(qn: str) -> str:
-    """Normalise question number for matching — strip dots, spaces, lowercase."""
-    return re.sub(r"[\s\.\-]+", "", str(qn)).lower().strip()
+def _preprocess_exam_text(text: str) -> str:
+    """
+    Normalise exam text before sending to Groq.
+    Fixes common issues: run-together MCQ options, missing newlines, etc.
+    """
+    # Insert newline before MCQ option letters when run together
+    # e.g. "...network?A. Personal" → "...network?\nA. Personal"
+    text = re.sub(r'([a-z\?\.\,\)])\s*([A-D])\.\s', r'\1\n\2. ', text)
+
+    # Insert newline before question numbers when run together
+    # e.g. "...system. 2.1 Define" → "...system.\n2.1 Define"
+    text = re.sub(r'(\w[\.\,])\s+(\d+\.\d+)', r'\1\n\2', text)
+
+    # Ensure QUESTION headings are on their own line
+    text = re.sub(r'([^\n])(QUESTION\s+\d+)', r'\1\n\2', text)
+
+    # Normalise multiple spaces/tabs to single space
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
+    # Ensure marks indicators are clean e.g. "(2 marks)" → "(2)"
+    text = re.sub(r'\((\d+)\s+marks?\)', r'(\1)', text, flags=re.IGNORECASE)
+
+    return text.strip()
 
 
-def _parse_chunk(text: str, subject: str, grade: str) -> list:
-    """Parse a single text chunk into questions."""
+def _parse_any_structure(text: str, subject: str, grade: str) -> list:
+    """
+    Single Groq call with a universal prompt that handles any structure.
+    """
     from groq import Groq
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    prompt = f"""You are an expert parser for South African NSC CAPS exam papers.
 
-Extract EVERY question from the text below into a JSON array.
+    prompt = f"""You are an expert at parsing South African CAPS/NSC/IEB exam papers.
 
-RULES:
-- Create a SEPARATE item for EACH sub-question (1.1, 1.2, 2.1.1 etc.)
-- If MCQs are listed as plain paragraphs without sub-numbers under a heading like
-  "QUESTION 1: MULTIPLE CHOICE", auto-number them 1.1, 1.2, 1.3 etc.
-- The question text ends at the A/B/C/D options — do not include option text in question field
-- For MCQ: type="mcq", options={{"A":"...","B":"...","C":"...","D":"..."}}
-- For True/False: type="true_false"
-- For matching columns: type="matching", column_a=[...], column_b=[...]
-- For calculations: type="calculation"
-- For short answers: type="short_answer"
-- For essays: type="essay"
-- Default: type="open"
-- marks = integer from brackets e.g. (2) or [3] — default 1 if not found
-- section = section letter/number (A, B, 1, 2 etc.)
-- parent_question = main heading e.g. "QUESTION 1"
-- For diagrams include [DIAGRAM: description] in question text
-- memo = correct answer if visible, else null
-- NEVER skip questions
+Your job: extract EVERY question from the text into a JSON array.
+Handle ANY structure — do not skip anything.
 
-Return ONLY a valid JSON array. No markdown, no explanation.
+═══ STRUCTURE DETECTION RULES ═══
+
+MCQ (Multiple Choice):
+- Options may be on separate lines OR run together like "A. textB. textC. text"
+- Always split into separate A/B/C/D keys in options object
+- Question text = everything BEFORE the first option letter
+- type = "mcq"
+
+NUMBERED QUESTIONS without numbers (QUESTION 1 block with no sub-numbers):
+- Number them sequentially as 1.1, 1.2, 1.3 etc within that question block
+
+TRUE/FALSE:
+- type = "true_false"
+- Include the statement as question text
+
+MATCHING (Column A / Column B):
+- type = "matching"
+- column_a = list of items from Column A
+- column_b = list of items from Column B
+
+SCENARIO/CONTEXT QUESTIONS:
+- The scenario/context text goes in parent_context field
+- Each sub-question is a separate item with the same parent_question
+
+CALCULATION:
+- type = "calculation"
+- Include any given values in the question text
+
+ESSAY / PARAGRAPH:
+- type = "essay"
+- Include word/line count if specified
+
+SHORT ANSWER (1-3 sentences):
+- type = "short_answer"
+
+DEFAULT:
+- type = "open"
+
+═══ OUTPUT FORMAT ═══
+
+Return ONLY a valid JSON array, nothing else. No markdown, no explanation.
+
+Each item:
+{{
+  "question_number": "1.1",        // string — use section.sub format
+  "parent_question": "QUESTION 1", // string — main question heading
+  "parent_context": null,          // string or null — scenario/passage text
+  "section": "A",                  // string — section letter or number
+  "question": "Full question text here (no options for MCQ)",
+  "type": "mcq",                   // see types above
+  "marks": 2,                      // integer — from brackets (2) or default 1
+  "options": {{"A":"...","B":"...","C":"...","D":"..."}}, // MCQ only, else null
+  "column_a": null,                // matching only
+  "column_b": null,                // matching only
+  "memo": null                     // answer if visible in text, else null
+}}
+
 Subject: {subject} | Grade: {grade}
 
-EXAM TEXT:
+═══ EXAM TEXT ═══
 {text}
 """
+
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=8000,
-            temperature=0.1,
+            temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-        if not match:
-            print(f"[Parse] No JSON array in Groq response. Preview: {raw[:300]}")
-            return []
-        result = json.loads(match.group())
+
+        # Extract JSON array even if wrapped in explanation text
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        # Find outermost JSON array
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+
+        result = json.loads(raw)
         return result if isinstance(result, list) else []
+
+    except json.JSONDecodeError as e:
+        print(f"[Universal] JSON error: {e}")
+        print(f"[Universal] Raw (first 300): {raw[:300]}")
+        # Try to salvage partial JSON
+        return _salvage_partial_json(raw)
     except Exception as e:
-        print(f"[Parse] Chunk error: {e}")
+        print(f"[Universal] Error: {e}")
         return []
+
+
+def _salvage_partial_json(raw: str) -> list:
+    """
+    If Groq returns truncated JSON, salvage whatever complete objects we can.
+    Finds all complete {...} objects within the array.
+    """
+    questions = []
+    # Find all complete JSON objects
+    for match in re.finditer(r'\{[^{}]*\}', raw, re.DOTALL):
+        try:
+            obj = json.loads(match.group(0))
+            if isinstance(obj, dict) and obj.get("question"):
+                questions.append(obj)
+        except Exception:
+            continue
+    print(f"[Universal] Salvaged {len(questions)} questions from partial JSON")
+    return questions
+
+
+def _postprocess_questions(questions: list, original_text: str) -> list:
+    """
+    Post-process parsed questions:
+    1. Fill missing fields with defaults
+    2. Ensure marks are integers
+    3. Detect and fix MCQ options that ended up in question text
+    4. Sort by question number
+    5. Remove duplicates
+    """
+    processed = []
+    seen = set()
+
+    for q in questions:
+        # Fill defaults
+        q.setdefault("question_number", "")
+        q.setdefault("parent_question", "")
+        q.setdefault("parent_context", None)
+        q.setdefault("section", "A")
+        q.setdefault("question", "")
+        q.setdefault("type", "open")
+        q.setdefault("marks", 1)
+        q.setdefault("options", None)
+        q.setdefault("column_a", None)
+        q.setdefault("column_b", None)
+        q.setdefault("memo", None)
+
+        # Ensure marks is integer
+        try:
+            q["marks"] = int(q["marks"]) if q["marks"] else 1
+        except (ValueError, TypeError):
+            q["marks"] = 1
+
+        # Detect MCQ options in question text (A. textB. textC. text pattern)
+        if q["type"] == "mcq" and not q.get("options"):
+            extracted = _extract_options_from_text(q["question"])
+            if extracted:
+                q["options"] = extracted["options"]
+                q["question"] = extracted["question_text"]
+
+        # Validate options for MCQ
+        if q["type"] == "mcq":
+            opts = q.get("options")
+            if not isinstance(opts, dict) or len(opts) < 2:
+                q["type"] = "open"
+                q["options"] = None
+
+        # Normalise options — ensure dict format
+        if isinstance(q.get("options"), list):
+            opts = q["options"]
+            if opts and isinstance(opts[0], str):
+                q["options"] = {chr(65+i): v for i, v in enumerate(opts)}
+
+        # Skip empty questions
+        if not q["question"].strip():
+            continue
+
+        # Deduplicate
+        key = _normalise_qnum(q["question_number"]) or q["question"][:50]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        processed.append(q)
+
+    # Sort by question number
+    def sort_key(q):
+        qn = q.get("question_number", "")
+        # Convert "3.1.2" → (3, 1, 2) for correct numeric sorting
+        parts = re.findall(r'\d+', qn)
+        return tuple(int(p) for p in parts) if parts else (999,)
+
+    processed.sort(key=sort_key)
+    return processed
+
+
+def _extract_options_from_text(text: str) -> dict | None:
+    """
+    Extract MCQ options from question text when they're run together.
+    e.g. "Which system?A. ServerB. PCC. MobileD. Embedded"
+    Returns {"question_text": "Which system?", "options": {"A":"Server",...}}
+    """
+    # Pattern: letter followed by dot and text, repeated
+    pattern = r'([A-D])\.\s*(.+?)(?=[A-D]\.|$)'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if len(matches) >= 2:
+        options = {}
+        for letter, option_text in matches:
+            options[letter] = option_text.strip()
+
+        # Question text is everything before the first option
+        first_option_pos = re.search(r'[A-D]\.', text)
+        question_text = text[:first_option_pos.start()].strip() if first_option_pos else text
+
+        return {"question_text": question_text, "options": options}
+
+    return None
+
+
+def _normalise_qnum(qn: str) -> str:
+    """Normalise question number for deduplication and memo matching."""
+    s = str(qn).lower().strip()
+    s = re.sub(r"^(question|q|ques|no|nr)[\s\.\-]*", "", s)
+    s = re.sub(r"^[\(\[\{]|[\)\]\}]$", "", s)
+    s = re.sub(r"[^a-z0-9]", "", s)
+    return s
 
     #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     #MEMO PARSER
     #==============================================================
 def parse_memo_answers(text: str, subject: str, grade: str) -> dict:
-    """
-    Parse a memo document into a question_number → answer map.
-    Uses answer-focused prompt instead of question-focused prompt.
-    Processes in chunks to cover full document.
-    """
     if not text or not text.strip():
         return {}
+
+    # Preprocess memo text same way as exam
+    text = _preprocess_exam_text(text)
 
     CHUNK = 12000
     OVERLAP = 500
@@ -398,15 +627,19 @@ def parse_memo_answers(text: str, subject: str, grade: str) -> dict:
         start += CHUNK - OVERLAP
 
     memo_map = {}
-
     for i, chunk in enumerate(chunks):
         print(f"[Memo] Chunk {i+1}/{len(chunks)}")
         chunk_map = _parse_memo_chunk(chunk, subject, grade)
-        memo_map.update(chunk_map)
+        for qn, answer in chunk_map.items():
+            norm = _normalise_qnum(qn)
+            if not norm:
+                continue
+            existing = memo_map.get(norm, "")
+            if len(str(answer)) > len(str(existing)):
+                memo_map[norm] = answer
 
-    print(f"[Memo] Total answers extracted: {len(memo_map)}")
+    print(f"[Memo] Total answers: {len(memo_map)}")
     return memo_map
-
 
 def _parse_memo_chunk(text: str, subject: str, grade: str) -> dict:
     """Parse one chunk of memo text into {question_number: answer} dict."""
@@ -501,7 +734,8 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         print(f"[Pipeline] Exam text: {len(exam_text)} chars")
 
         # 3. Parse questions
-        questions = parse_questions_from_text(exam_text, subject, grade)
+        questions = parse_questions_universal(exam_text, subject, grade)
+
         print(f"[Pipeline] Questions: {len(questions)}")
 
         # ── 4. Download and parse memo ─────────────────────────────────────

@@ -1003,10 +1003,10 @@ def auto_extract():
             return jsonify({"error": "No examDriveFileId"}), 400
 
         # Skip if already extracted
-        if meta.get("status") == "extracted":
+        if meta.get("status") in ("extracted", "ready", "processing"):
             exam_doc = db.collection("exams").document(exam_id).get()
             if exam_doc.exists and exam_doc.to_dict().get("status") == "ready":
-                return jsonify({"ok": True, "message": "Already extracted", "exam_id": exam_id})
+                return jsonify({"ok": True, "message": "Already extracted - skipping", "exam_id": exam_id})
 
         thread = threading.Thread(
             target=run_extraction_pipeline,

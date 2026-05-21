@@ -1189,48 +1189,73 @@ def debug_exam_text(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/start-exam", methods=["POST"])
+@app.route("/start_exam", methods=["POST"])
 def start_exam():
     try:
-        data       = request.get_json()
-        exam_id    = data.get("exam", "").strip()
+        data = request.get_json()
+
+        # SUPPORT BOTH exam_id and exam
+        exam_id = (
+            data.get("exam_id")
+            or data.get("exam")
+            or ""
+        ).strip()
+
         student_id = data.get("student_id", "anonymous")
 
         if not exam_id:
-            return jsonify({"error": "No exam specified"})
+            return jsonify({
+                "error": "No exam specified"
+            }), 400
 
         meta, questions = load_exam_from_firestore(exam_id)
+
         if meta is None:
-            return jsonify({"error": f"Exam '{exam_id}' not found"})
+            return jsonify({
+                "error": f"Exam '{exam_id}' not found"
+            }), 404
+
         if not questions:
-            return jsonify({"error": (
-                f"This exam has no questions yet — extraction may still be in progress "
-                f"(status: {meta.get('status', 'unknown')}). Please wait a minute and try again."
-            )})
+            return jsonify({
+                "error": (
+                    "This exam has no questions yet. "
+                    "Extraction may still be processing."
+                ),
+                "status": meta.get("status", "unknown")
+            }), 400
 
         mem.ensure_student(student_id)
-        sid = str(uuid.uuid4())
 
-        save_session_to_fs(sid, {
-            "exam_id":    exam_id,
-            "exam":       meta.get("title", exam_id),
-            "subject":    meta.get("subject", ""),
+        session_id = str(uuid.uuid4())
+
+        save_session_to_fs(session_id, {
+            "exam_id": exam_id,
+            "exam": meta.get("title", exam_id),
+            "title": meta.get("title", ""),
+            "subject": meta.get("subject", ""),
             "student_id": student_id,
-            "questions":  questions,
-            "answers":    {},
+            "questions": questions,
+            "answers": {},
+            "started_at": datetime.utcnow().isoformat(),
         })
 
         return jsonify({
-            "session_id":      sid,
+            "success": True,
+            "session_id": session_id,
+            "exam_id": exam_id,
+            "title": meta.get("title", ""),
+            "subject": meta.get("subject", ""),
             "total_questions": len(questions),
-            "memo_merged":     meta.get("memoMerged", False),
-            "subject":         meta.get("subject", ""),
-            "title":           meta.get("title", ""),
+            "memo_merged": meta.get("memoMerged", False),
+            "status": meta.get("status", "ready"),
         })
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e)})
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
 @app.route("/answer", methods=["POST"])

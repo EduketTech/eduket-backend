@@ -1107,7 +1107,7 @@ def extraction_status(exam_id):
             })
         for doc in db.collection("teacherExamUploads").stream():
             for upload in doc.to_dict().get("uploads", []):
-                if upload.get("examId") == exam_id:
+                if str(upload.get("examId") or upload.get("id") or "").strip() == exam_id.strip():
                     return jsonify({
                         "status":             upload.get("status", "pending_extraction"),
                         "error":              upload.get("errorMessage"),

@@ -87,7 +87,7 @@ def _drive_token() -> str:
 
     creds = service_account.Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        scopes = ["https://www.googleapis.com/auth/drive"]
     )
     creds.refresh(GoogleRequest())
     return creds.token
@@ -1042,6 +1042,99 @@ def _launch_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
         daemon=True,
     ).start()
     return True
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEVELOPER DRIVE UPLOAD — teacher uploads go to developer's service account Drive
+# No teacher OAuth or sharing required
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_or_create_school_folder(school_id: str, token: str) -> str:
+    """
+    Returns a Drive folder ID for the school, creating it if needed.
+    Cached in Firestore so we don't hit Drive API every upload.
+    Structure: Eduket Exam Uploads / {school_id} /
+    """
+    # Check Firestore cache
+    try:
+        snap = db.collection("schoolDriveFolders").document(school_id).get()
+        if snap.exists and snap.to_dict().get("folderId"):
+            return snap.to_dict()["folderId"]
+    except Exception:
+        pass
+
+    root_folder = os.getenv("SA_UPLOAD_FOLDER_ID", "")
+    if not root_folder:
+        raise ValueError("SA_UPLOAD_FOLDER_ID not set in environment")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+
+    # Search for existing folder
+    q = (
+        f"name='{school_id}' and "
+        f"'{root_folder}' in parents and "
+        f"mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    search = http_requests.get(
+        f"https://www.googleapis.com/drive/v3/files?q={http_requests.utils.quote(q)}&fields=files(id)",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    files = search.json().get("files", [])
+    if files:
+        folder_id = files[0]["id"]
+    else:
+        # Create school subfolder
+        res = http_requests.post(
+            "https://www.googleapis.com/drive/v3/files?fields=id",
+            headers=headers,
+            json={
+                "name":     school_id,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents":  [root_folder],
+            },
+            timeout=30,
+        )
+        folder_id = res.json().get("id")
+        if not folder_id:
+            raise ValueError(f"Could not create school folder for {school_id}")
+
+    # Cache in Firestore
+    try:
+        db.collection("schoolDriveFolders").document(school_id).set({
+            "schoolId":  school_id,
+            "folderId":  folder_id,
+            "createdAt": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[Drive] Folder cache write failed (non-fatal): {e}")
+
+    return folder_id
+
+
+@app.route("/get-upload-token", methods=["POST"])
+def get_upload_token():
+    """
+    Returns a short-lived service account Drive token + upload folder ID.
+    Frontend uses this to upload directly to developer's Drive.
+    Token expires in ~55 minutes — refresh by calling this again.
+    """
+    try:
+        data      = request.get_json() or {}
+        school_id = data.get("school_id", "shared")
+
+        token     = _drive_token()
+        folder_id = _get_or_create_school_folder(school_id, token)
+
+        return jsonify({
+            "token":     token,
+            "folder_id": folder_id,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

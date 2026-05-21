@@ -988,94 +988,232 @@ def load_exam_from_firestore(exam_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS — find upload meta by exam_id
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_upload_meta(exam_id: str):
+    """
+    Search all teacherExamUploads docs for an upload matching exam_id.
+    Returns (meta_dict, teacher_doc_id) or (None, None).
+    """
+    for doc in db.collection("teacherExamUploads").stream():
+        for upload in doc.to_dict().get("uploads", []):
+            if upload.get("examId") == exam_id or upload.get("id") == exam_id:
+                return upload, doc.id
+    return None, None
+
+
+def _is_already_processing(exam_id: str) -> bool:
+    """
+    Returns True if the exam is already being processed or is done.
+    Prevents duplicate pipeline threads.
+    """
+    try:
+        exam_doc = db.collection("exams").document(exam_id).get()
+        if exam_doc.exists:
+            return exam_doc.to_dict().get("status") in ("ready", "extracted", "processing")
+    except Exception:
+        pass
+    return False
+
+
+def _launch_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
+    """
+    Mark exam as processing and launch extraction in a background thread.
+    Safe to call multiple times — checks before launching.
+    """
+    if _is_already_processing(exam_id):
+        print(f"[Pipeline] Skipping {exam_id} — already processing/ready")
+        return False
+
+    # Mark as processing immediately to prevent duplicate triggers
+    try:
+        db.collection("exams").document(exam_id).set(
+            {"status": "processing", "startedAt": fs_admin.SERVER_TIMESTAMP},
+            merge=True,
+        )
+    except Exception as e:
+        print(f"[Pipeline] Could not mark processing: {e}")
+
+    threading.Thread(
+        target=run_extraction_pipeline,
+        args=(exam_id, meta, teacher_doc_id),
+        daemon=True,
+    ).start()
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIRESTORE LISTENER — auto-triggers extraction when new exam saved
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _start_auto_extraction_listener():
+    """
+    Watches teacherExamUploads collection.
+    Any upload with status=pending_extraction automatically triggers the pipeline.
+    Frontend never needs to call /auto-extract.
+    """
+    def on_snapshot(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name not in ("ADDED", "MODIFIED"):
+                continue
+
+            doc_data       = change.document.to_dict() or {}
+            teacher_doc_id = change.document.id
+
+            for upload in doc_data.get("uploads", []):
+                exam_id = upload.get("examId") or upload.get("id")
+                status  = upload.get("status", "")
+
+                if not exam_id:
+                    continue
+                if status != "pending_extraction":
+                    continue
+                if not upload.get("examDriveFileId"):
+                    continue
+                if _is_already_processing(exam_id):
+                    continue
+
+                print(f"[AutoListener] Detected pending exam: {exam_id} — launching pipeline")
+                _launch_pipeline(exam_id, upload, teacher_doc_id)
+
+    db.collection("teacherExamUploads").on_snapshot(on_snapshot)
+    print("[AutoListener] Firestore extraction listener active")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STARTUP SWEEP — catches exams missed while server was asleep (Render cold start)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _sweep_pending_on_startup():
+    """
+    On boot, find any uploads stuck in pending_extraction that have no
+    corresponding ready/processing exam doc, and process them.
+    Handles the case where Render was asleep when the teacher uploaded.
+    """
+    print("[Startup] Sweeping for missed pending extractions...")
+    count = 0
+    try:
+        for doc in db.collection("teacherExamUploads").stream():
+            teacher_doc_id = doc.id
+            for upload in doc.to_dict().get("uploads", []):
+                exam_id = upload.get("examId") or upload.get("id")
+                status  = upload.get("status", "")
+
+                if not exam_id:
+                    continue
+                if status != "pending_extraction":
+                    continue
+                if not upload.get("examDriveFileId"):
+                    continue
+                if _is_already_processing(exam_id):
+                    continue
+
+                print(f"[Startup] Found missed extraction: {exam_id}")
+                launched = _launch_pipeline(exam_id, upload, teacher_doc_id)
+                if launched:
+                    count += 1
+
+    except Exception as e:
+        print(f"[Startup] Sweep failed: {e}")
+
+    print(f"[Startup] Sweep complete — launched {count} missed extraction(s)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.route("/auto-extract", methods=["POST"])
 def auto_extract():
+    """
+    Called by frontend after upload. Now mostly a fallback —
+    the Firestore listener handles extraction automatically.
+    Still useful for manual retries or direct API calls.
+    """
     try:
-        data = request.get_json()
+        data    = request.get_json()
         exam_id = data.get("exam_id", "").strip()
         if not exam_id:
             return jsonify({"error": "exam_id required"}), 400
 
-        meta = None
-        teacher_doc_id = None
-
-        # Stream all teacher upload docs to find the matching exam_id
-        for doc in db.collection("teacherExamUploads").stream():
-            for upload in doc.to_dict().get("uploads", []):
-                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
-                    meta = upload
-                    teacher_doc_id = doc.id
-                    break
-            if meta:
-                break
+        meta, teacher_doc_id = _find_upload_meta(exam_id)
 
         if not meta:
             return jsonify({"error": f"Upload {exam_id} not found"}), 404
         if not meta.get("examDriveFileId"):
-            return jsonify({"error": "No examDriveFileId"}), 400
+            return jsonify({"error": "No examDriveFileId on this upload"}), 400
 
-        # Skip if already extracted
-        if meta.get("status") in ("extracted", "ready", "processing"):
+        # Already done — return early
+        if _is_already_processing(exam_id):
             exam_doc = db.collection("exams").document(exam_id).get()
             if exam_doc.exists and exam_doc.to_dict().get("status") == "ready":
-                return jsonify({"ok": True, "message": "Already extracted - skipping", "exam_id": exam_id})
+                return jsonify({
+                    "ok":      True,
+                    "message": "Already extracted — skipping",
+                    "exam_id": exam_id,
+                })
+            return jsonify({
+                "ok":      True,
+                "message": "Extraction already in progress",
+                "exam_id": exam_id,
+            })
 
-        thread = threading.Thread(
-            target=run_extraction_pipeline,
-            args=(exam_id, meta, teacher_doc_id),
-            daemon=True,
-        )
-        thread.start()
+        launched = _launch_pipeline(exam_id, meta, teacher_doc_id)
 
         return jsonify({
-            "ok": True,
-            "message": "Extraction started",
-            "exam_id": exam_id,
+            "ok":          True,
+            "message":     "Extraction started" if launched else "Already running",
+            "exam_id":     exam_id,
             "poll_status": f"/admin/extraction-status/{exam_id}",
         })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/admin/trigger-extract/<exam_id>", methods=["GET"])
 def trigger_extract(exam_id):
-    """Manual admin trigger — same as auto-extract."""
+    """
+    Manual admin trigger — forces re-extraction even if already processed.
+    Useful for fixing failed or incomplete extractions.
+    """
     try:
-        meta = None
-        teacher_doc_id = None
-        for doc in db.collection("teacherExamUploads").stream():
-            for upload in doc.to_dict().get("uploads", []):
-                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
-                    meta = upload
-                    teacher_doc_id = doc.id
-                    break
-            if meta:
-                break
+        meta, teacher_doc_id = _find_upload_meta(exam_id)
 
         if not meta:
-            return jsonify({"error": f"Exam {exam_id} not found"}), 404
+            return jsonify({"error": f"Exam {exam_id} not found in any upload doc"}), 404
         if not meta.get("examDriveFileId"):
-            return jsonify({"error": "No examDriveFileId"}), 400
+            return jsonify({"error": "No examDriveFileId on this upload"}), 400
 
-        thread = threading.Thread(
+        # Force re-extraction: reset status so _is_already_processing returns False
+        try:
+            db.collection("exams").document(exam_id).set(
+                {"status": "pending_extraction"},
+                merge=True,
+            )
+        except Exception:
+            pass
+
+        # Launch directly without the already-processing guard
+        threading.Thread(
             target=run_extraction_pipeline,
             args=(exam_id, meta, teacher_doc_id),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
         return jsonify({
-            "ok": True,
-            "message": "Extraction started in background",
-            "exam_id": exam_id,
+            "ok":          True,
+            "message":     "Extraction started in background",
+            "exam_id":     exam_id,
             "poll_status": f"/admin/extraction-status/{exam_id}",
         })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/admin/uploads", methods=["GET"])
 def admin_uploads():
@@ -1512,6 +1650,10 @@ def watch_uploads():
 
         time.sleep(10)
 
+
+# Start listener for all environments (including Render/gunicorn)
+_start_auto_extraction_listener()
+_sweep_pending_on_startup()
 
 if __name__ == "__main__":
     app.run(debug=True, port=8000)

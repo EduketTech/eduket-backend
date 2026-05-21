@@ -60,6 +60,7 @@ CORS(app, resources={r"/*": {"origins": [
     "http://localhost:5174",
     "http://localhost:5175",
     "http://localhost:5176",
+    "http://localhost:5177",
     "https://eduket.netlify.app",
 ]}})
 
@@ -69,17 +70,26 @@ agent.set_rag(rag)
 # ═══════════════════════════════════════════════════════════════════════════════
 # DRIVE DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
-
 def _drive_token() -> str:
     from google.oauth2 import service_account
     from google.auth.transport.requests import Request as GoogleRequest
-    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or os.getenv("FIREBASE_SERVICE_ACCOUNT")
+
+    sa_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or os.getenv("FIREBASE_SERVICE_ACCOUNT")
+
+    if sa_json:
+        info = json.loads(sa_json.strip())
+    else:
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+        with open(creds_path) as f:
+            info = json.load(f)
+
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(raw),
+        info,
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
     creds.refresh(GoogleRequest())
     return creds.token
+
 
 
 def download_file_bytes(file_id: str, filename: str = ""):

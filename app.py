@@ -29,6 +29,8 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests as http_requests
+import threading
+import time
 
 # ── Firebase ──────────────────────────────────────────────────────────────────
 import firebase_admin
@@ -1471,6 +1473,44 @@ def health():
             "admin_status":  "GET  /admin/extraction-status/<exam_id>",
         }
     })
+
+def watch_uploads():
+    print("[Watcher] Starting Firestore upload watcher...")
+
+    seen = set()
+
+    while True:
+        try:
+            docs = db.collection("teacherExamUploads").stream()
+
+            for doc in docs:
+                data = doc.to_dict()
+                uploads = data.get("uploads", [])
+
+                for upload in uploads:
+                    exam_id = upload.get("examId") or upload.get("id")
+                    status = upload.get("status")
+
+                    if not exam_id:
+                        continue
+
+                    key = f"{doc.id}_{exam_id}"
+
+                    if status in ("pending", None) and key not in seen:
+                        print(f"[Watcher] Auto-extracting: {exam_id}")
+
+                        seen.add(key)
+
+                        threading.Thread(
+                            target=run_extraction_pipeline,
+                            args=(exam_id, upload, doc.id),
+                            daemon=True
+                        ).start()
+
+        except Exception as e:
+            print("[Watcher Error]", e)
+
+        time.sleep(10)
 
 
 if __name__ == "__main__":

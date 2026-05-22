@@ -36,6 +36,8 @@ import time
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin
 
+_token_cache = {"token": None, "expires_at": 0}
+
 def _init_firebase():
     if firebase_admin._apps:
         return
@@ -1115,19 +1117,14 @@ def _get_or_create_school_folder(school_id: str, token: str) -> str:
 
     return folder_id
 
-
 @app.route("/get-upload-token", methods=["POST"])
 def get_upload_token():
-    """
-    Returns a short-lived service account Drive token + upload folder ID.
-    Frontend uses this to upload directly to developer's Drive.
-    Token expires in ~55 minutes — refresh by calling this again.
-    """
     try:
         data      = request.get_json() or {}
         school_id = data.get("school_id", "shared")
 
-        token     = _drive_token()
+        # Use drive.file scope — lighter, safer, only accesses files the app creates
+        token     = _drive_upload_token()
         folder_id = _get_or_create_school_folder(school_id, token)
 
         return jsonify({
@@ -1138,6 +1135,33 @@ def get_upload_token():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+def _drive_upload_token() -> str:
+    """Separate token function for uploads — uses drive.file scope."""
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleRequest
+
+    sa_json = (
+        os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+        os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    )
+
+    if sa_json:
+        info = json.loads(sa_json.strip())
+    else:
+        creds_path = os.getenv(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "serviceAccountKey.json"
+        )
+        with open(creds_path) as f:
+            info = json.load(f)
+
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    creds.refresh(GoogleRequest())
+    return creds.token
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIRESTORE LISTENER — auto-triggers extraction when new exam saved

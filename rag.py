@@ -451,7 +451,7 @@ def _groq_rerank(query: str, candidates: list[dict], k: int = 4) -> list[dict]:
     if not candidates:
         return []
 
-    # Build numbered context block — trim to avoid hitting token limits
+    # Build numbered context block — trim context to avoid hitting token limits
     context_lines = []
     for i, c in enumerate(candidates, 1):
         preview = c.get("content", "")[:400].replace("\n", " ")
@@ -496,7 +496,7 @@ EXCERPTS:
 
         # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        raw = re.sub(r"\s*$", "", raw)
 
         ranked = json.loads(raw)
         results = []
@@ -516,11 +516,11 @@ EXCERPTS:
         return results[:k]
 
     except json.JSONDecodeError:
-        # Groq didn't return clean JSON — fall back to top-k by keyword hits
-        print("[RAG] Groq rerank JSON parse failed — using raw candidates")
+        # Fixes structural bug: Use full untruncated content on JSON parse failures
+        print("[RAG] Groq rerank JSON parse failed — falling back to candidate structures.")
         return [
             {
-                "content":  c.get("content", "")[:400],
+                "content":  c.get("content", ""),
                 "source":   c.get("source", ""),
                 "subject":  c.get("subject", ""),
                 "page_num": c.get("page_num", 0),

@@ -42,16 +42,18 @@ from firebase_admin import credentials, storage, firestore as fs_admin
 def _init_firebase():
     if firebase_admin._apps:
         return
-    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
-    bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET")
-
+    raw = (
+        os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+        os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
+    )
     if raw.strip():
         cred = credentials.Certificate(json.loads(raw))
     else:
         cred = credentials.ApplicationDefault()
 
+    # ✅ Pass storageBucket so firebase_admin.storage.bucket() works
     firebase_admin.initialize_app(cred, {
-        'storageBucket': bucket_name
+        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", "eduket.firebasestorage.app")
     })
 
 
@@ -97,30 +99,65 @@ def download_file_bytes_from_storage(storage_path: str) -> bytes | None:
         print(f"[Storage] Error downloading {storage_path}: {e}")
         return None
 
-
-def download_file_for_extraction(meta: dict, file_type: str) -> tuple[bytes | None, str]:
+def download_file_for_extraction(meta: dict, file_type: str) -> tuple:
     """
-    Downloads exam or memo file from wherever it was stored.
-    Supports both Google Drive (old) and Firebase Storage (new).
+    Downloads exam or memo file from Firebase Storage or Google Drive.
+    Tries Storage first (new uploads), falls back to Drive (old uploads).
     Returns (bytes, filename) or (None, filename).
-
-    file_type: "exam" or "memo"
     """
-    # ── Firebase Storage path (new) ────────────────────────────────────
-    storage_url = meta.get(f"{file_type}StorageUrl")
     filename = meta.get(f"{file_type}FileName", f"{file_type}.pdf")
 
+    # ── Firebase Storage URL (direct download) ─────────────────────────
+    storage_url = meta.get(f"{file_type}StorageUrl")
     if storage_url:
-        print(f"[Download] Fetching {file_type} from Firebase Storage")
+        print(f"[Download] Fetching {file_type} from Firebase Storage URL")
         try:
             res = http_requests.get(storage_url, timeout=60)
             if res.status_code == 200:
-                print(f"[Download] Got {len(res.content)} bytes from Storage")
+                print(f"[Download] Got {len(res.content)} bytes")
                 return res.content, filename
-            print(f"[Download] Storage fetch failed: {res.status_code}")
+            print(f"[Download] URL fetch failed: {res.status_code}")
         except Exception as e:
-            print(f"[Download] Storage error: {e}")
-        return None, filename
+            print(f"[Download] URL fetch error: {e}")
+
+    # ── Firebase Storage path (Admin SDK) ──────────────────────────────
+    storage_path = meta.get(f"{file_type}StoragePath")
+    if storage_path:
+        print(f"[Download] Fetching {file_type} from Storage path: {storage_path}")
+        try:
+            from firebase_admin import storage as fb_storage
+            bucket = fb_storage.bucket()
+            blob   = bucket.blob(storage_path)
+            data   = blob.download_as_bytes(timeout=60)
+            print(f"[Download] Got {len(data)} bytes from Storage SDK")
+            return data, filename
+        except Exception as e:
+            print(f"[Download] Storage SDK error: {e}")
+
+    # ── Firebase Storage — reconstruct path from examId + filename ──────
+    exam_id = meta.get("examId") or meta.get("id", "")
+    if exam_id and filename:
+        prefix     = "exam_" if file_type == "exam" else "memo_"
+        auto_path  = f"exams/{exam_id}/{prefix}{filename}"
+        print(f"[Download] Trying auto-path: {auto_path}")
+        try:
+            from firebase_admin import storage as fb_storage
+            bucket = fb_storage.bucket()
+            blob   = bucket.blob(auto_path)
+            data   = blob.download_as_bytes(timeout=60)
+            print(f"[Download] Got {len(data)} bytes from auto-path")
+            return data, filename
+        except Exception as e:
+            print(f"[Download] Auto-path failed: {e}")
+
+    # ── Google Drive fallback (old uploads) ────────────────────────────
+    drive_id = meta.get(f"{file_type}DriveFileId")
+    if drive_id and drive_id != "storage":
+        print(f"[Download] Falling back to Drive: {drive_id}")
+        return download_file_bytes(drive_id, filename), filename
+
+    print(f"[Download] No source found for {file_type}")
+    return None, filename
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEXT EXTRACTION — WORD DOC

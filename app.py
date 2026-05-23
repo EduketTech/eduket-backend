@@ -98,6 +98,30 @@ def download_file_bytes_from_storage(storage_path: str) -> bytes | None:
         return None
 
 
+def download_file_for_extraction(meta: dict, file_type: str) -> tuple[bytes | None, str]:
+    """
+    Downloads exam or memo file from wherever it was stored.
+    Supports both Google Drive (old) and Firebase Storage (new).
+    Returns (bytes, filename) or (None, filename).
+
+    file_type: "exam" or "memo"
+    """
+    # ── Firebase Storage path (new) ────────────────────────────────────
+    storage_url = meta.get(f"{file_type}StorageUrl")
+    filename = meta.get(f"{file_type}FileName", f"{file_type}.pdf")
+
+    if storage_url:
+        print(f"[Download] Fetching {file_type} from Firebase Storage")
+        try:
+            res = http_requests.get(storage_url, timeout=60)
+            if res.status_code == 200:
+                print(f"[Download] Got {len(res.content)} bytes from Storage")
+                return res.content, filename
+            print(f"[Download] Storage fetch failed: {res.status_code}")
+        except Exception as e:
+            print(f"[Download] Storage error: {e}")
+        return None, filename
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEXT EXTRACTION — WORD DOC
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -587,107 +611,112 @@ def run_extraction_pipeline(exam_id: str, meta: dict, teacher_doc_id: str):
 
     try:
         subject = meta.get("subject", "General")
-        grade = meta.get("grade", "12")
-        title = meta.get("title", meta.get("examFileName", "Exam"))
-        exam_path = meta.get("examStoragePath")  # Path inside your bucket (e.g., 'uploads/exams/file.pdf')
-        memo_path = meta.get("memoStoragePath")  # Path inside your bucket (e.g., 'uploads/memos/file.pdf')
-        exam_fn = meta.get("examFileName", "exam.pdf")
-        memo_fn = meta.get("memoFileName", "memo.pdf")
+        grade   = meta.get("grade", "12")
+        title   = meta.get("title", meta.get("examFileName", "Exam"))
 
         print(f"\n[Pipeline] ═══ Starting: {exam_id} | {subject} Gr{grade}")
         set_upload_status("processing")
 
-        if not exam_path:
-            raise ValueError("Missing 'examStoragePath' metadata parameter.")
-
-        # 1. Download exam file from Firebase Cloud Storage
-        exam_bytes = download_file_bytes_from_storage(exam_path)
+        # ── 1. Download exam file ──────────────────────────────────────
+        exam_bytes, exam_fn = download_file_for_extraction(meta, "exam")
         if not exam_bytes:
-            raise ValueError(f"Could not download exam file from Firebase Storage path: {exam_path}")
+            raise ValueError(
+                "Could not download exam file. "
+                "Check examStorageUrl or examDriveFileId in the upload record."
+            )
 
-        # 2. Extract text
+        # ── 2. Extract text ────────────────────────────────────────────
         exam_text = extract_text_from_file(exam_bytes, exam_fn)
         if not exam_text.strip():
             raise ValueError("No text extracted from exam file")
         print(f"[Pipeline] Exam text: {len(exam_text)} chars")
 
-        # 3. Parse questions
+        # ── 3. Parse questions ─────────────────────────────────────────
         questions = parse_questions_universal(exam_text, subject, grade)
         print(f"[Pipeline] Questions: {len(questions)}")
 
-        # ── 4. Download and parse memo from Firebase Cloud Storage ──────────
+        # ── 4. Download and parse memo ─────────────────────────────────
         memo_map = {}
-        if memo_path:
-            memo_bytes = download_file_bytes_from_storage(memo_path)
-            if memo_bytes:
-                memo_text = extract_text_from_file(memo_bytes, memo_fn)
-                if memo_text.strip():
-                    memo_map = parse_memo_answers(memo_text, subject, grade)
-                    print(f"[Pipeline] Memo answers: {len(memo_map)}")
+        memo_bytes, memo_fn = download_file_for_extraction(meta, "memo")
+        if memo_bytes:
+            memo_text = extract_text_from_file(memo_bytes, memo_fn)
+            if memo_text.strip():
+                memo_map = parse_memo_answers(memo_text, subject, grade)
+                print(f"[Pipeline] Memo answers: {len(memo_map)}")
 
-        # ── 5. Merge memo into questions using fuzzy number matching ────────
+        # ── 5. Merge memo into questions ───────────────────────────────
         norm_memo = {_normalise_qnum(k): v for k, v in memo_map.items()}
-
         for q in questions:
             qn_norm = _normalise_qnum(q.get("question_number", ""))
             if qn_norm and qn_norm in norm_memo and not q.get("memo"):
                 q["memo"] = norm_memo[qn_norm]
 
-        # 6. Safety net placeholder
+        # ── 6. Safety net placeholder ──────────────────────────────────
         if not questions:
             print("[Pipeline] 0 questions — placeholder")
             questions = [{
                 "question_number": "1", "parent_question": "", "section": "A",
                 "question": (
                     f"[Questions could not be auto-parsed from this {subject} paper "
-                    f"({len(exam_text)} chars extracted). Please ask your teacher to "
-                    f"re-upload in Word (.docx) format for best results.]"
+                    f"({len(exam_text)} chars extracted). Please re-upload in "
+                    f"Word (.docx) format for best results.]"
                 ),
                 "type": "open", "marks": 0,
                 "options": None, "column_a": None, "column_b": None, "memo": None,
             }]
 
-        # 7. Write exam doc
+        # ── 7. Write exam doc ──────────────────────────────────────────
         db.collection("exams").document(exam_id).set({
-            "title": title, "subject": subject, "grade": grade,
-            "year": meta.get("year", ""), "curriculum": meta.get("curriculum", "CAPS"),
-            "teacherName": meta.get("teacherName", ""),
-            "uploadedBy": meta.get("uploadedBy", ""),
-            "examStoragePath": exam_path, "memoStoragePath": memo_path,
-            "memoMerged": bool(memo_map), "status": "ready",
+            "title":          title,
+            "subject":        subject,
+            "grade":          grade,
+            "year":           meta.get("year", ""),
+            "curriculum":     meta.get("curriculum", "CAPS"),
+            "teacherName":    meta.get("teacherName", ""),
+            "uploadedBy":     meta.get("uploadedBy", ""),
+            "schoolId":       meta.get("schoolId", ""),
+            "examDuration":   meta.get("examDuration", 0),
+            "memoMerged":     bool(memo_map),
+            "status":         "ready",
             "totalQuestions": len(questions),
-            "extractedAt": fs_admin.SERVER_TIMESTAMP,
+            "extractedAt":    fs_admin.SERVER_TIMESTAMP,
             "sourceUploadId": exam_id,
+            # Keep storage URLs so they're accessible from the exam doc
+            "examStorageUrl": meta.get("examStorageUrl", ""),
+            "memoStorageUrl": meta.get("memoStorageUrl", ""),
+            # Keep Drive IDs for backwards compatibility
+            "examDriveFileId": meta.get("examDriveFileId", ""),
+            "memoDriveFileId": meta.get("memoDriveFileId", ""),
         })
 
-        # 8. Write questions in batches of 400
+        # ── 8. Write questions in batches ──────────────────────────────
         batch = db.batch()
         for i, q in enumerate(questions):
             ref = db.collection("exam_questions").document(f"{exam_id}_{i:04d}")
             batch.set(ref, {
-                "examId": exam_id,
+                "examId":         exam_id,
                 "questionNumber": q.get("question_number", str(i + 1)),
                 "parentQuestion": q.get("parent_question", ""),
-                "section": q.get("section", "A"),
-                "questionText": q.get("question", ""),
-                "type": q.get("type", "open"),
-                "marks": int(q.get("marks") or 1),
-                "options": q.get("options"),
-                "columnA": q.get("column_a"),
-                "columnB": q.get("column_b"),
-                "memo": q.get("memo") or "",
-                "order": i,
+                "section":        q.get("section", "A"),
+                "questionText":   q.get("question", ""),
+                "type":           q.get("type", "open"),
+                "marks":          int(q.get("marks") or 1),
+                "options":        q.get("options"),
+                "columnA":        q.get("column_a"),
+                "columnB":        q.get("column_b"),
+                "memo":           q.get("memo") or "",
+                "order":          i,
             })
             if (i + 1) % 400 == 0:
                 batch.commit()
                 batch = db.batch()
         batch.commit()
 
-        # 9. Mark upload extracted
+        # ── 9. Mark complete ───────────────────────────────────────────
         set_upload_status("extracted", {
-            "extractedAt": datetime.utcnow().isoformat(),
+            "extractedAt":    datetime.utcnow().isoformat(),
             "totalQuestions": len(questions),
-            "memoMerged": bool(memo_map),
+            "memoMerged":     bool(memo_map),
         })
         print(f"[Pipeline] Done: {len(questions)} questions, {len(memo_map)} memo answers\n")
 

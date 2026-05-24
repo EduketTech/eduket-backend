@@ -563,16 +563,20 @@ def safe_int(value, default=1):
         return default
 
 def run_extraction_pipeline(
-    exam_id,
-    meta,
-    teacher_doc_id
+        exam_id,
+        meta,
+        school_id,
+        subject_name
 ):
     batch = db.batch()
     written = 0
 
-    doc_ref = db.collection(
-        "teacherExamUploads"
-    ).document(teacher_doc_id)
+    doc_ref = (
+        db.collection("teacherExamUploads")
+        .document(school_id)
+        .collection("subjects")
+        .document(subject_name)
+    )
 
     def set_upload_status(status, extra=None):
 
@@ -922,10 +926,12 @@ def run_extraction_pipeline(
         _unmark_processing(exam_id)
 
 # ═══════════════════════════════════════════════════════════════
-# AUTO LISTENER
+# AUTO EXTRACTION LISTENER (NEW SCHOOL/SUBJECT STRUCTURE)
 # ═══════════════════════════════════════════════════════════════
 
 def _start_auto_extraction_listener():
+
+    subjects_ref = db.collection_group("subjects")
 
     def on_snapshot(
         col_snapshot,
@@ -943,9 +949,26 @@ def _start_auto_extraction_listener():
 
             data = change.document.to_dict() or {}
 
-            teacher_doc_id = change.document.id
+            # ───────────────────────────────────────
+            # PATH:
+            # teacherExamUploads/{schoolId}/subjects/{subject}
+            # ───────────────────────────────────────
 
-            for upload in data.get("uploads", []):
+            subject_doc_ref = change.document.reference
+
+            school_doc_ref = (
+                subject_doc_ref.parent.parent
+            )
+
+            school_id = school_doc_ref.id
+
+            subject_name = (
+                change.document.id
+            )
+
+            uploads = data.get("uploads", [])
+
+            for upload in uploads:
 
                 exam_id = (
                     upload.get("examId")
@@ -955,31 +978,57 @@ def _start_auto_extraction_listener():
                 if not exam_id:
                     continue
 
-                if upload.get("status") != "pending_extraction":
-                    continue
+                # ───────────────────────────────
+                # STATUS CHECK
+                # ───────────────────────────────
 
-                if not (
-                        upload.get("examStoragePath")
-                        or upload.get("examStorageUrl")
+                if (
+                    upload.get("status")
+                    != "pending_extraction"
                 ):
                     continue
+
+                # ───────────────────────────────
+                # FILE CHECK
+                # ───────────────────────────────
+
+                if not (
+                    upload.get("examStoragePath")
+                    or upload.get("examStorageUrl")
+                ):
+                    continue
+
+                # ───────────────────────────────
+                # DUPLICATE PROTECTION
+                # ───────────────────────────────
 
                 if _is_already_processing(exam_id):
                     continue
 
-                print(f"[Listener] {exam_id}")
+                print(
+                    f"[Listener] "
+                    f"{school_id} | "
+                    f"{subject_name} | "
+                    f"{exam_id}"
+                )
+
+                # ───────────────────────────────
+                # LAUNCH PIPELINE
+                # ───────────────────────────────
 
                 _launch_pipeline(
                     exam_id,
                     upload,
-                    teacher_doc_id
+                    school_id,
+                    subject_name
                 )
 
-    db.collection(
-        "teacherExamUploads"
-    ).on_snapshot(on_snapshot)
+    subjects_ref.on_snapshot(on_snapshot)
 
-    print("[Listener] ACTIVE")
+    print(
+        "[Listener] SCHOOL/SUBJECT "
+        "EXTRACTION ACTIVE"
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # STARTUP SWEEP
@@ -1050,7 +1099,7 @@ def home():
     })
 
 @app.route("/auto-extract", methods=["POST"])
-def auto_extract():
+def auto_extract(subject_name=None, school_id=None):
 
     try:
 
@@ -1100,7 +1149,9 @@ def auto_extract():
         launched = _launch_pipeline(
             exam_id,
             meta,
-            teacher_id
+            school_id,
+            subject_name
+
         )
 
         return jsonify({

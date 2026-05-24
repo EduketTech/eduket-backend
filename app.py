@@ -722,7 +722,7 @@ def run_extraction_pipeline(
             "subject": subject,
             "grade": grade,
 
-            "questionsExtracted": written > 0,
+            "questionsExtracted": True,
 
             "status": "ready",
 
@@ -1118,6 +1118,128 @@ def auto_extract():
             "error": str(e)
         }), 500
 
+# ═══════════════════════════════════════════════
+# START EXAM
+# ═══════════════════════════════════════════════
+
+@app.route("/start-exam", methods=["POST"])
+def start_exam():
+
+    try:
+
+        data = request.get_json()
+
+        exam_id = data.get("examId")
+
+        student_id = data.get("studentId")
+
+        if not exam_id:
+            return jsonify({
+                "error": "examId required"
+            }), 400
+
+        # ─────────────────────────────────────
+        # LOAD EXAM
+        # ─────────────────────────────────────
+
+        exam_doc = db.collection(
+            "exams"
+        ).document(exam_id).get()
+
+        if not exam_doc.exists:
+            return jsonify({
+                "error": "Exam not found"
+            }), 404
+
+        exam = exam_doc.to_dict()
+
+        # ─────────────────────────────────────
+        # LOAD QUESTIONS
+        # ─────────────────────────────────────
+
+        questions = []
+
+        docs = db.collection(
+            "exam_questions"
+        ).where(
+            "examId",
+            "==",
+            exam_id
+        ).order_by("order").stream()
+
+        for doc in docs:
+
+            q = doc.to_dict()
+
+            questions.append({
+
+                "id":
+                    doc.id,
+
+                "questionNumber":
+                    q.get("questionNumber"),
+
+                "questionText":
+                    q.get("questionText"),
+
+                "type":
+                    q.get("type"),
+
+                "marks":
+                    q.get("marks", 1),
+
+                "options":
+                    q.get("options"),
+
+                "columnA":
+                    q.get("columnA"),
+
+                "columnB":
+                    q.get("columnB"),
+            })
+
+        print(
+            f"[StartExam] "
+            f"{exam_id}: "
+            f"{len(questions)} questions"
+        )
+
+        return jsonify({
+
+            "ok": True,
+
+            "exam": {
+
+                "examId":
+                    exam_id,
+
+                "title":
+                    exam.get("title"),
+
+                "subject":
+                    exam.get("subject"),
+
+                "grade":
+                    exam.get("grade"),
+
+                "duration":
+                    exam.get(
+                        "examDuration",
+                        60
+                    ),
+
+                "questions":
+                    questions
+            }
+        })
+
+    except Exception as e:
+
+        traceback.print_exc()
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 # ═══════════════════════════════════════════════════════════════
 # START SERVICES
 # ═══════════════════════════════════════════════════════════════

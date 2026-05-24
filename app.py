@@ -131,42 +131,74 @@ def _unmark_processing(exam_id):
 # ═══════════════════════════════════════════════════════════════
 
 def download_file_for_extraction(meta, file_type):
-    """
-    Downloads exam/memo from Firebase Storage.
-    """
 
     filename = meta.get(
         f"{file_type}FileName",
         f"{file_type}.pdf"
     )
 
+    # ── Try Storage Path First ─────────────────────────────
+
     storage_path = meta.get(
         f"{file_type}StoragePath"
     )
 
-    if not storage_path:
-        print(f"[Storage] Missing path for {file_type}")
-        return None, filename
+    if storage_path:
 
-    try:
-        blob = bucket.blob(storage_path)
+        try:
+            blob = bucket.blob(storage_path)
 
-        if not blob.exists():
-            print(f"[Storage] Missing blob: {storage_path}")
-            return None, filename
+            if blob.exists():
 
-        data = blob.download_as_bytes(timeout=120)
+                data = blob.download_as_bytes(
+                    timeout=120
+                )
 
-        print(
-            f"[Storage] Downloaded "
-            f"{storage_path} ({len(data)} bytes)"
-        )
+                print(
+                    f"[Storage] Path download success "
+                    f"{storage_path}"
+                )
 
-        return data, filename
+                return data, filename
 
-    except Exception as e:
-        print(f"[Storage] Download failed: {e}")
-        return None, filename
+        except Exception as e:
+            print(f"[Storage] Path failed: {e}")
+
+    # ── FALLBACK TO URL DOWNLOAD ───────────────────────────
+
+    storage_url = meta.get(
+        f"{file_type}StorageUrl"
+    )
+
+    if storage_url:
+
+        try:
+            import requests
+
+            response = requests.get(
+                storage_url,
+                timeout=120
+            )
+
+            if response.status_code == 200:
+
+                print(
+                    f"[Storage] URL download success"
+                )
+
+                return response.content, filename
+
+            print(
+                f"[Storage] URL status "
+                f"{response.status_code}"
+            )
+
+        except Exception as e:
+            print(f"[Storage] URL failed: {e}")
+
+    print(f"[Storage] Could not download {file_type}")
+
+    return None, filename
 
 # ═══════════════════════════════════════════════════════════════
 # DOCX EXTRACTION
@@ -524,12 +556,21 @@ def _launch_pipeline(
 # ═══════════════════════════════════════════════════════════════
 # EXTRACTION PIPELINE
 # ═══════════════════════════════════════════════════════════════
+def safe_int(value, default=1):
+    try:
+        if value in [None, "", "null"]:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
 
 def run_extraction_pipeline(
     exam_id,
     meta,
     teacher_doc_id
 ):
+    batch = db.batch()
+    written = 0
 
     doc_ref = db.collection(
         "teacherExamUploads"
@@ -681,6 +722,8 @@ def run_extraction_pipeline(
             "subject": subject,
             "grade": grade,
 
+            "questionsExtracted": written > 0,
+
             "status": "ready",
 
             "uploadedBy":
@@ -712,11 +755,54 @@ def run_extraction_pipeline(
         })
 
         # ── Save questions ──────────────────────────────────
+        # ─────────────────────────────────────────────
+        # WRITE QUESTIONS (PRODUCTION SAFE)
+        # ─────────────────────────────────────────────
 
-        batch = db.batch()
 
         for i, q in enumerate(questions):
 
+            # ── SAFE MARKS HANDLING ──────────────────
+            raw_marks = q.get("marks", 1)
+
+            try:
+                if raw_marks is None:
+                    marks = 1
+                elif isinstance(raw_marks, str):
+                    cleaned = raw_marks.strip()
+
+                    # Handles "(2)" or "2 marks"
+                    cleaned = re.sub(r"[^0-9]", "", cleaned)
+
+                    marks = int(cleaned) if cleaned else 1
+                else:
+                    marks = int(raw_marks)
+
+            except Exception:
+                marks = 1
+
+            # ── SAFE OPTIONS ─────────────────────────
+            options = q.get("options")
+
+            if not isinstance(options, dict):
+                options = None
+
+            # ── SAFE QUESTION NUMBER ─────────────────
+            qnum = str(
+                q.get("question_number")
+                or i + 1
+            )
+
+            # ── SAFE QUESTION TEXT ───────────────────
+            qtext = str(
+                q.get("question")
+                or ""
+            ).strip()
+
+            if not qtext:
+                continue
+
+            # ── FIRESTORE DOC ────────────────────────
             ref = db.collection(
                 "exam_questions"
             ).document(
@@ -725,34 +811,77 @@ def run_extraction_pipeline(
 
             batch.set(ref, {
 
-                "examId": exam_id,
+                "examId":
+                    exam_id,
 
                 "questionNumber":
-                    q.get("question_number", ""),
+                    qnum,
+
+                "parentQuestion":
+                    q.get(
+                        "parent_question",
+                        ""
+                    ),
+
+                "parentContext":
+                    q.get(
+                        "parent_context",
+                        None
+                    ),
+
+                "section":
+                    q.get(
+                        "section",
+                        "A"
+                    ),
 
                 "questionText":
-                    q.get("question", ""),
+                    qtext,
 
                 "type":
-                    q.get("type", "open"),
+                    q.get(
+                        "type",
+                        "open"
+                    ),
 
                 "marks":
-                    int(q.get("marks", 1)),
+                    marks,
 
                 "options":
-                    q.get("options"),
+                    options,
+
+                "columnA":
+                    q.get("column_a"),
+
+                "columnB":
+                    q.get("column_b"),
 
                 "memo":
-                    q.get("memo", ""),
+                    str(
+                        q.get("memo") or ""
+                    ),
 
-                "order": i
+                "order":
+                    i,
+
+                "createdAt":
+                    fs_admin.SERVER_TIMESTAMP,
             })
 
-            if (i + 1) % 400 == 0:
+            written += 1
+
+            # Firestore batch limit safety
+            if written % 400 == 0:
                 batch.commit()
                 batch = db.batch()
 
+        # Final commit
         batch.commit()
+
+        print(
+            f"[Pipeline] Successfully wrote "
+            f"{written} questions"
+        )
 
         # ── Complete ────────────────────────────────────────
 
@@ -762,8 +891,7 @@ def run_extraction_pipeline(
                 "extractedAt":
                     datetime.utcnow().isoformat(),
 
-                "totalQuestions":
-                    len(questions),
+                "totalQuestions": written,
 
                 "memoMerged":
                     bool(memo_map)
@@ -832,7 +960,10 @@ def _start_auto_extraction_listener():
                 if upload.get("status") != "pending_extraction":
                     continue
 
-                if not upload.get("examStoragePath"):
+                if not (
+                        upload.get("examStoragePath")
+                        or upload.get("examStorageUrl")
+                ):
                     continue
 
                 if _is_already_processing(exam_id):

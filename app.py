@@ -89,6 +89,7 @@ bucket = storage.bucket()
 
 app = Flask(__name__)
 
+# ⚡ Use a compiled regex pattern to safely allow all Netlify preview & production subdomains
 CORS(app, resources={r"/*": {
     "origins": [
         "http://localhost:3000",
@@ -97,7 +98,7 @@ CORS(app, resources={r"/*": {
         "http://localhost:5175",
         "http://localhost:5176",
         "https://eduket.netlify.app",
-        "https://*.netlify.app",
+        re.compile(r"^https://.*\.netlify\.app$")
     ]
 }}, supports_credentials=True)
 

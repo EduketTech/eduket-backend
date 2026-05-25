@@ -773,6 +773,37 @@ def start_exam():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/submit", methods=["POST"])
+def submit_exam():
+    try:
+        data = request.get_json() or {}
+
+        exam_id = data.get("examId")
+        student_id = data.get("studentId")
+        answers = data.get("answers", [])
+
+        print(f"[Submit] Exam: {exam_id}")
+        print(f"[Submit] Student: {student_id}")
+
+        # Example Firestore save
+        db.collection("exam_submissions").add({
+            "examId": exam_id,
+            "studentId": student_id,
+            "answers": answers,
+            "submittedAt": fs_admin.SERVER_TIMESTAMP
+        })
+
+        return jsonify({
+            "success": True,
+            "message": "Exam submitted successfully"
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     # Standard local debug server runner execution profile pattern logic block

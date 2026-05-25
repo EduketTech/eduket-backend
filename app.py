@@ -1,24 +1,20 @@
 """
-app.py — Eduket Production Exam Extraction API
+app.py — Eduket Production Exam Extraction & Marking API
 ═══════════════════════════════════════════════════════════════
 
-PRODUCTION FEATURES
-──────────────────────────────────────────────────────────────
-✅ Firebase Storage only (NO Google Drive)
-✅ Automatic extraction listener
-✅ Startup recovery sweep
-✅ Duplicate extraction prevention
-✅ Robust DOCX extraction
-✅ PDF OCR fallback
-✅ Memo merging
-✅ Production-safe threading
-✅ Firestore status tracking
-✅ Ready-for-student exam availability
-✅ Render-compatible
+FEATURES
+─────────────────────────────────────────────────────────────
+✅ Firebase Storage (ODT, DOCX, PDF support)
+✅ Automatic extraction listener + startup sweep
+✅ Duplicate extraction prevention (thread-safe)
+✅ Memo-based marking with partial credit
+✅ AI marking fallback where memo is missing
+✅ Per-question feedback + concept gap analysis
+✅ Autosave + resume support
+✅ Render-compatible gunicorn deployment
 """
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
 import os
@@ -30,20 +26,24 @@ import base64
 import traceback
 import threading
 import tempfile
-import requests
+import uuid
+
+import requests as http_requests
 import fitz  # PyMuPDF
 
 from datetime import datetime
+from difflib import SequenceMatcher
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from PIL import Image
 
-from odf.opendocument import load
-from odf import text, teletype
+from odf.opendocument import load as load_odt
+from odf import text as odf_text
+from odf import teletype
 import mammoth
 from groq import Groq
 
@@ -52,521 +52,725 @@ from groq import Groq
 # ═══════════════════════════════════════════════════════════════
 
 import firebase_admin
-from firebase_admin import (
-    credentials,
-    firestore as fs_admin,
-    storage
-)
+from firebase_admin import credentials, firestore as fs_admin, storage
 
 
 def _init_firebase():
     if firebase_admin._apps:
         return
-
     raw = (
-            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-            or os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
+        os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+        os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
     )
-
     if raw.strip():
         cred = credentials.Certificate(json.loads(raw))
     else:
         cred = credentials.ApplicationDefault()
-
     firebase_admin.initialize_app(cred, {
-        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")
+        "storageBucket": os.getenv(
+            "FIREBASE_STORAGE_BUCKET",
+            "eduket.firebasestorage.app"
+        )
     })
 
 
 _init_firebase()
-
-db = fs_admin.client()
+db     = fs_admin.client()
 bucket = storage.bucket()
 
 # ═══════════════════════════════════════════════════════════════
-# APP CONFIGURATION
+# APP + CORS
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 
-# ⚡ Use a compiled regex pattern to safely allow all Netlify preview & production subdomains
-CORS(app, resources={r"/*": {
-    "origins": [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://localhost:5176",
-        "https://eduket.netlify.app",
-        re.compile(r"^https://.*\.netlify\.app$")
-    ]
-}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://localhost:5176",
+    "http://localhost:5177",
+    "https://eduket.netlify.app",
+    re.compile(r"^https://.*\.netlify\.app$"),
+]}}, supports_credentials=True)
 
 # ═══════════════════════════════════════════════════════════════
-# PROCESS TRACKING (THREAD SAFETY)
+# THREAD-SAFE PROCESSING TRACKER
 # ═══════════════════════════════════════════════════════════════
 
-PROCESSING_EXAMS = set()
-PROCESSING_LOCK = threading.Lock()
+_PROCESSING      = set()
+_PROCESSING_LOCK = threading.Lock()
 
 
-def _is_already_processing(exam_id):
-    with PROCESSING_LOCK:
-        return exam_id in PROCESSING_EXAMS
+def _is_already_processing(exam_id: str) -> bool:
+    with _PROCESSING_LOCK:
+        return exam_id in _PROCESSING
 
 
-def _mark_processing(exam_id):
-    with PROCESSING_LOCK:
-        PROCESSING_EXAMS.add(exam_id)
+def _mark_processing(exam_id: str):
+    with _PROCESSING_LOCK:
+        _PROCESSING.add(exam_id)
 
 
-def _unmark_processing(exam_id):
-    with PROCESSING_LOCK:
-        PROCESSING_EXAMS.discard(exam_id)
+def _unmark_processing(exam_id: str):
+    with _PROCESSING_LOCK:
+        _PROCESSING.discard(exam_id)
 
 
 # ═══════════════════════════════════════════════════════════════
-# STORAGE DOWNLOAD
+# FIREBASE STORAGE DOWNLOAD
 # ═══════════════════════════════════════════════════════════════
 
-def download_file_for_extraction(meta, file_type):
-    filename = meta.get(
-        f"{file_type}FileName",
-        f"{file_type}.pdf"
-    )
+def download_file_for_extraction(meta: dict, file_type: str):
+    """
+    Downloads exam or memo file from Firebase Storage.
+    Tries Storage SDK path first, falls back to public download URL.
+    Returns (bytes, filename) or (None, filename).
+    """
+    filename = meta.get(f"{file_type}FileName", f"{file_type}.pdf")
 
-    # ── Try Storage Path First ─────────────────────────────
+    # 1. Storage SDK path
     storage_path = meta.get(f"{file_type}StoragePath")
     if storage_path:
         try:
             blob = bucket.blob(storage_path)
             if blob.exists():
                 data = blob.download_as_bytes(timeout=120)
-                print(f"[Storage] Path download success {storage_path}")
+                print(f"[Storage] SDK download OK: {storage_path} ({len(data)} bytes)")
                 return data, filename
         except Exception as e:
-            print(f"[Storage] Path failed: {e}")
+            print(f"[Storage] SDK failed: {e}")
 
-    # ── Fallback To URL Download ───────────────────────────
+    # 2. Public download URL fallback
     storage_url = meta.get(f"{file_type}StorageUrl")
     if storage_url:
         try:
-            response = requests.get(storage_url, timeout=120)
-            if response.status_code == 200:
-                print(f"[Storage] URL download success")
-                return response.content, filename
-            print(f"[Storage] URL status {response.status_code}")
+            res = http_requests.get(storage_url, timeout=120)
+            if res.status_code == 200:
+                print(f"[Storage] URL download OK ({len(res.content)} bytes)")
+                return res.content, filename
+            print(f"[Storage] URL returned {res.status_code}")
         except Exception as e:
             print(f"[Storage] URL failed: {e}")
 
-    print(f"[Storage] Could not download {file_type}")
+    print(f"[Storage] No source found for {file_type}")
     return None, filename
 
 
 # ═══════════════════════════════════════════════════════════════
-# DOCX STRUCTURED EXTRACTION
+# TEXT EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
-def iter_block_items(parent):
+def _iter_block_items(parent):
     from docx.oxml.table import CT_Tbl
     from docx.oxml.text.paragraph import CT_P
-
-    parent_elm = parent.element.body
-    for child in parent_elm.iterchildren():
+    for child in parent.element.body.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, parent)
         elif isinstance(child, CT_Tbl):
             yield Table(child, parent)
 
 
-def extract_structured_docx(file_bytes):
-    doc = Document(io.BytesIO(file_bytes))
-    blocks = []
-
-    for block in iter_block_items(doc):
-        if isinstance(block, Paragraph):
-            text_str = block.text.strip()
-            if text_str:
-                blocks.append({
-                    "type": "paragraph",
-                    "text": text_str
-                })
-
-        elif isinstance(block, Table):
-            rows = []
-            for row in block.rows:
-                row_data = []
-                for cell in row.cells:
-                    row_data.append(cell.text.strip())
-                rows.append(row_data)
-
-            blocks.append({
-                "type": "table",
-                "rows": rows
-            })
-
-    # Image Extraction Pipeline
-    rels = doc.part._rels
-    for rel in rels:
-        rel_obj = rels[rel]
-        if "image" in rel_obj.target_ref:
-            try:
-                image_bytes = rel_obj.target_part.blob
-                encoded = base64.b64encode(image_bytes).decode()
-                blocks.append({
-                    "type": "image",
-                    "imageBase64": encoded[:5000]  # Chunked safety tracking preview
-                })
-            except Exception:
-                pass
-
-    return blocks
-
-
-# ═══════════════════════════════════════════════════════════════
-# PDF NATIVE & VISION OCR EXTRACTION
-# ═══════════════════════════════════════════════════════════════
-
-def extract_text_from_pdf(file_bytes):
-    text_content = ""
+def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        for page in doc:
-            text_content += page.get_text() + "\n"
-        doc.close()
-
-        if len(text_content.strip()) > 200:
-            print(f"[PDF] Native extraction success: {len(text_content)} chars")
-            return text_content
+        doc   = Document(io.BytesIO(file_bytes))
+        lines = []
+        for block in _iter_block_items(doc):
+            if isinstance(block, Paragraph):
+                t = block.text.strip()
+                if t:
+                    lines.append(t)
+            elif isinstance(block, Table):
+                for row in block.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    row_text = " | ".join(c for c in cells if c)
+                    if row_text:
+                        lines.append(row_text)
+        text = "\n".join(lines)
+        print(f"[DOCX] Extracted {len(text)} chars")
+        return text
     except Exception as e:
-        print(f"[PDF] Native parsing failed, falling back to OCR: {e}")
+        print(f"[DOCX] Failed: {e}")
+        return ""
 
+
+def extract_text_from_odt(file_bytes: bytes) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp.flush()
+            odt_doc    = load_odt(tmp.name)
+            paragraphs = odt_doc.getElementsByType(odf_text.P)
+            content    = "\n".join(
+                teletype.extractText(p) for p in paragraphs
+            )
+        print(f"[ODT] Extracted {len(content)} chars")
+        return content
+    except Exception as e:
+        print(f"[ODT] Failed: {e}")
+        return ""
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    # Stage 1: native text
+    try:
+        doc  = fitz.open(stream=file_bytes, filetype="pdf")
+        text = "".join(page.get_text() + "\n" for page in doc)
+        doc.close()
+        if len(text.strip()) > 200:
+            print(f"[PDF] Native: {len(text)} chars")
+            return text
+    except Exception as e:
+        print(f"[PDF] Native failed: {e}")
+
+    # Stage 2: Groq vision OCR
+    print("[PDF] Falling back to Groq vision OCR")
     return _groq_vision_ocr(file_bytes)
 
 
-def _groq_vision_ocr(pdf_bytes):
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+def _groq_vision_ocr(pdf_bytes: bytes) -> str:
+    client   = Groq(api_key=os.getenv("GROQ_API_KEY"))
     all_text = ""
-
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for i, page in enumerate(doc):
             try:
-                pix = page.get_pixmap()
-                img = base64.b64encode(pix.tobytes("png")).decode()
-
-                response = client.chat.completions.create(
+                pix  = page.get_pixmap()
+                img  = base64.b64encode(pix.tobytes("png")).decode()
+                resp = client.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img}"}
-                            },
-                            {
-                                "type": "text",
-                                "text": "Extract ALL exam text exactly down to layout structural representation."
-                            }
-                        ]
-                    }],
-                    max_tokens=2000
+                    messages=[{"role": "user", "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{img}"}},
+                        {"type": "text",
+                         "text": (
+                             "South African NSC/CAPS exam page. "
+                             "Extract ALL text exactly. Preserve question numbers, "
+                             "marks in brackets, MCQ options A B C D. Plain text only."
+                         )},
+                    ]}],
+                    max_tokens=2000,
                 )
-                txt = response.choices[0].message.content
-                all_text += txt + "\n"
-                print(f"[OCR] Processed Page {i + 1}")
+                all_text += resp.choices[0].message.content.strip() + "\n"
+                print(f"[OCR] Page {i+1} done")
             except Exception as e:
-                print(f"[OCR] Page {i + 1} failed: {e}")
+                print(f"[OCR] Page {i+1} failed: {e}")
         doc.close()
     except Exception as e:
-        print(f"[OCR] General Pipeline Failure: {e}")
-
+        print(f"[OCR] Fatal: {e}")
     return all_text
 
 
-# ═══════════════════════════════════════════════════════════════
-# UNIVERSAL FILE CONTROLLER
-# ═══════════════════════════════════════════════════════════════
-
-def extract_text_from_file(file_bytes, filename):
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Returns plain text regardless of file format."""
     lower = filename.lower()
-
     if lower.endswith(".docx"):
+        return extract_text_from_docx(file_bytes)
+    if lower.endswith(".odt"):
+        return extract_text_from_odt(file_bytes)
+    if lower.endswith(".pdf"):
+        return extract_text_from_pdf(file_bytes)
+    if lower.endswith(".doc"):
         try:
-            blocks = extract_structured_docx(file_bytes)
-            return {"type": "structured", "blocks": blocks}
-        except Exception:
-            traceback.print_exc()
-
-    elif lower.endswith(".pdf"):
-        try:
-            raw_text = extract_text_from_pdf(file_bytes)
-            return {"type": "text", "text": raw_text}
-        except Exception:
-            traceback.print_exc()
-
-    elif lower.endswith(".odt"):
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp.flush()
-                odt_doc = load(tmp.name)
-                paragraphs = odt_doc.getElementsByType(text.P)
-                content = "\n".join([teletype.extractText(p) for p in paragraphs])
-            return {"type": "text", "text": content}
-        except Exception:
-            traceback.print_exc()
-
-    elif lower.endswith(".doc"):
-        try:
-            # Safe production conversion strategy without crashing textract dependencies
             result = mammoth.extract_raw_text(io.BytesIO(file_bytes))
-            return {"type": "text", "text": result.value}
-        except Exception:
-            traceback.print_exc()
-
-    return {"type": "text", "text": ""}
-
-
-MAX_CHARS = 10000
-
-
-def chunk_text(text_data):
-    return [text_data[i:i + MAX_CHARS] for i in range(0, len(text_data), MAX_CHARS)]
+            return result.value
+        except Exception as e:
+            print(f"[DOC] mammoth failed: {e}")
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════
-# QUESTION & MEMO ARTIFICIAL INTELLIGENCE PARSERS
+# QUESTION PARSER
 # ═══════════════════════════════════════════════════════════════
 
-def parse_questions_universal(text_data, subject, grade):
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    all_questions = []
-    chunks = chunk_text(text_data)
+def parse_questions_universal(exam_text: str, subject: str, grade: str) -> list:
+    client      = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    CHUNK       = 10000
+    OVERLAP     = 800
+    all_qs      = []
+    seen        = set()
+
+    chunks = []
+    start  = 0
+    while start < len(exam_text):
+        chunks.append(exam_text[start:start + CHUNK])
+        start += CHUNK - OVERLAP
 
     for idx, chunk in enumerate(chunks):
-        print(f"[Parser] Processing Chunk {idx + 1}/{len(chunks)}")
-        prompt = f"""
-Extract ALL exam questions into a single valid JSON array.
+        print(f"[Parser] Chunk {idx+1}/{len(chunks)}")
+        prompt = f"""You are an expert at parsing South African CAPS/NSC/IEB exam papers.
 
-IMPORTANT:
-- Preserve structural tables.
-- Keep match columns intact.
-- Keep Multiple Choice Option layout blocks intact.
-- Keep accurate numbering keys.
-- Return raw JSON formatting ONLY. Do markdown blocks wrapping or commentary strings.
+Extract EVERY question from the text below into a JSON array.
 
-[
- {{
-   "question_number": "1.1",
-   "question": "Question text data content",
-   "type": "open",
-   "marks": 2,
-   "options": null,
-   "memo": null,
-   "table": null,
-   "image_required": false
- }}
-]
+Rules:
+- MCQ: split options into A/B/C/D dict, type="mcq"
+- True/False: type="true_false"
+- Matching: type="matching", column_a=[], column_b=[]
+- Calculation: type="calculation"
+- Essay: type="essay"
+- Short answer: type="short_answer"
+- Default: type="open"
+- Marks: integer from brackets like (2), default 1
+- Include section, question_number, parent_question, parent_context
 
-Subject: {subject}
-Grade: {grade}
+Return ONLY a valid JSON array, no markdown, no explanation.
 
-TEXT SOURCE:
-{chunk}
-"""
+Each item:
+{{
+  "question_number": "1.1",
+  "parent_question": "QUESTION 1",
+  "parent_context": null,
+  "section": "A",
+  "question": "Full question text",
+  "type": "mcq",
+  "marks": 2,
+  "options": {{"A":"...","B":"...","C":"...","D":"..."}},
+  "column_a": null,
+  "column_b": null,
+  "memo": null
+}}
+
+Subject: {subject} | Grade: {grade}
+
+EXAM TEXT:
+{chunk}"""
+
         try:
-            response = client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=8000
+                max_tokens=8000,
             )
-            raw = response.choices[0].message.content
+            raw   = resp.choices[0].message.content.strip()
+            raw   = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+            raw   = re.sub(r"\s*```\s*$",       "", raw, flags=re.MULTILINE)
             match = re.search(r"\[.*\]", raw, re.DOTALL)
             if match:
-                parsed_json = json.loads(match.group())
-                if isinstance(parsed_json, list):
-                    all_questions.extend(parsed_json)
+                parsed = json.loads(match.group())
+                if isinstance(parsed, list):
+                    for q in parsed:
+                        qn = _normalise_qnum(q.get("question_number", ""))
+                        key = qn or q.get("question", "")[:60]
+                        if key not in seen:
+                            seen.add(key)
+                            all_qs.append(q)
         except Exception as e:
-            print(f"[Parser] Chunk compilation failed at index {idx}: {e}")
-            continue
+            print(f"[Parser] Chunk {idx+1} failed: {e}")
 
-    return all_questions
+    print(f"[Parser] Total questions: {len(all_qs)}")
+    return all_qs
 
 
-def parse_memo_answers(text_data, subject, grade):
+# ═══════════════════════════════════════════════════════════════
+# MEMO PARSER
+# ═══════════════════════════════════════════════════════════════
+
+def parse_memo_answers(memo_text: str, subject: str, grade: str) -> dict:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    prompt = f"""
-Extract ALL memorandum solution answers mappings perfectly.
-Return raw strict JSON object mapping structural properties ONLY.
+    CHUNK  = 12000
+    result = {}
 
+    chunks = [memo_text[i:i+CHUNK] for i in range(0, len(memo_text), CHUNK)]
+
+    for idx, chunk in enumerate(chunks):
+        print(f"[Memo] Chunk {idx+1}/{len(chunks)}")
+        prompt = f"""You are reading a South African CAPS/NSC exam MARKING MEMORANDUM.
+
+Extract EVERY answer. Return ONLY a valid JSON object mapping question_number to answer.
+For MCQ give just the letter. For True/False give "True" or "False".
+For written answers give the full expected answer.
+No markdown, no explanation.
+
+Example:
+{{"1.1": "C", "1.2": "True", "1.3": "RAM is volatile memory."}}
+
+Subject: {subject} | Grade: {grade}
+
+MEMO TEXT:
+{chunk}"""
+
+        try:
+            resp  = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=8000,
+            )
+            raw   = resp.choices[0].message.content.strip()
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                chunk_result = json.loads(match.group())
+                if isinstance(chunk_result, dict):
+                    for k, v in chunk_result.items():
+                        norm = _normalise_qnum(k)
+                        if norm and norm not in result:
+                            result[norm] = v
+        except Exception as e:
+            print(f"[Memo] Chunk {idx+1} failed: {e}")
+
+    print(f"[Memo] Total answers: {len(result)}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# MARKING ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def _normalise_text(v) -> str:
+    if v is None:
+        return ""
+    return str(v).strip().lower()
+
+
+def _normalise_qnum(qn: str) -> str:
+    s = str(qn).lower().strip()
+    s = re.sub(r"^(question|q|ques|no|nr)[\s.\-]*", "", s)
+    s = re.sub(r"[^a-z0-9]", "", s)
+    return s
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalise_text(a), _normalise_text(b)).ratio()
+
+
+def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
+    """
+    Mark against memo with partial credit.
+    Returns dict with score, status, feedback.
+    """
+    s_norm = _normalise_text(student_answer)
+    m_norm = _normalise_text(memo_answer)
+
+    if not s_norm:
+        return {
+            "score":       0,
+            "status":      "missing",
+            "feedback":    "No answer provided.",
+            "concept_gap": "Question not attempted.",
+        }
+
+    if not m_norm:
+        return None  # No memo — signal AI fallback
+
+    # Exact match
+    if s_norm == m_norm:
+        return {
+            "score":       marks,
+            "status":      "correct",
+            "feedback":    "Correct.",
+            "concept_gap": "",
+        }
+
+    sim = _similarity(s_norm, m_norm)
+
+    # Very close (>=85%) — full marks
+    if sim >= 0.85:
+        return {
+            "score":       marks,
+            "status":      "correct",
+            "feedback":    "Correct (closely matches memo).",
+            "concept_gap": "",
+        }
+
+    # Partial (60-84%) — half marks
+    if sim >= 0.60:
+        partial = round(marks * 0.5, 1)
+        return {
+            "score":       partial,
+            "status":      "partial",
+            "feedback":    f"Partially correct ({int(sim*100)}% match). "
+                           f"Memo: {memo_answer}",
+            "concept_gap": "Incomplete or imprecise answer.",
+        }
+
+    # MCQ: single letter check
+    if len(m_norm) == 1 and m_norm.isalpha():
+        if s_norm.startswith(m_norm):
+            return {
+                "score":       marks,
+                "status":      "correct",
+                "feedback":    "Correct option selected.",
+                "concept_gap": "",
+            }
+        return {
+            "score":       0,
+            "status":      "incorrect",
+            "feedback":    f"Incorrect. Correct answer: {memo_answer.upper()}.",
+            "concept_gap": "Wrong option selected.",
+        }
+
+    # True/False check
+    if m_norm in ("true", "false"):
+        if s_norm.startswith(m_norm):
+            return {
+                "score":       marks,
+                "status":      "correct",
+                "feedback":    "Correct.",
+                "concept_gap": "",
+            }
+        return {
+            "score":       0,
+            "status":      "incorrect",
+            "feedback":    f"Incorrect. Answer is {memo_answer}.",
+            "concept_gap": "True/False answer incorrect.",
+        }
+
+    # Keyword check — award partial if key words present
+    memo_words    = set(re.findall(r"\b\w{4,}\b", m_norm))
+    student_words = set(re.findall(r"\b\w{4,}\b", s_norm))
+    if memo_words:
+        keyword_match = len(memo_words & student_words) / len(memo_words)
+        if keyword_match >= 0.70:
+            return {
+                "score":       round(marks * keyword_match, 1),
+                "status":      "partial",
+                "feedback":    f"Contains key concepts but not complete. "
+                               f"Memo: {memo_answer}",
+                "concept_gap": "Missing some key points.",
+            }
+        if keyword_match >= 0.40:
+            return {
+                "score":       round(marks * 0.25, 1),
+                "status":      "partial",
+                "feedback":    f"Some relevant content but mostly incorrect. "
+                               f"Memo: {memo_answer}",
+                "concept_gap": "Significant gaps in understanding.",
+            }
+
+    return {
+        "score":       0,
+        "status":      "incorrect",
+        "feedback":    f"Incorrect. Expected: {memo_answer}",
+        "concept_gap": "Core concept not demonstrated.",
+    }
+
+
+def mark_with_ai(question: str, student_answer: str, marks: float,
+                 subject: str, memo: str = "") -> dict:
+    """
+    AI marking fallback used when no memo is available.
+    Uses Groq to assess answer quality against subject knowledge.
+    Supports partial marks allocation.
+    """
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    prompt = f"""You are an expert South African CAPS/NSC exam marker for {subject}.
+
+Mark the student answer fairly and strictly. Award partial marks where deserved.
+
+QUESTION: {question}
+MARKS AVAILABLE: {marks}
+MEMO/EXPECTED ANSWER: {memo if memo else "Not provided — use your subject expertise"}
+STUDENT ANSWER: {student_answer if student_answer.strip() else "No answer provided"}
+
+Instructions:
+- Award full marks for complete correct answers
+- Award partial marks (e.g. {round(marks*0.5,1)} for {marks} marks) for partially correct answers
+- Award 0 for incorrect or missing answers
+- Be specific in feedback — mention what was right and what was missing
+- Concept gap: what key idea did the student miss?
+
+Return ONLY valid JSON:
 {{
- "1.1": "Correct extraction tracking answer answer text structure summary value",
- "1.2": "answer structural verification data context text"
-}}
+  "score": <number between 0 and {marks}>,
+  "status": "<correct|partial|incorrect|missing>",
+  "feedback": "<specific examiner feedback>",
+  "concept_gap": "<what was missing or misunderstood>",
+  "model_answer": "<ideal answer>"
+}}"""
 
-CONTENT:
-{text_data[:12000]}
-"""
     try:
-        response = client.chat.completions.create(
+        resp  = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=8000
+            max_tokens=600,
         )
-        raw = response.choices[0].message.content
+        raw   = resp.choices[0].message.content.strip()
         match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            return {}
-        result = json.loads(match.group())
-        return result if isinstance(result, dict) else {}
+        if match:
+            result = json.loads(match.group())
+            # Clamp score to valid range
+            result["score"] = max(0, min(float(result.get("score", 0)), marks))
+            return result
     except Exception as e:
-        print(f"[Memo] Processing Error Failed: {e}")
-        return {}
+        print(f"[AI Mark] Failed: {e}")
+
+    return {
+        "score":        0,
+        "status":       "incorrect",
+        "feedback":     "Could not mark — AI unavailable.",
+        "concept_gap":  "Unknown.",
+        "model_answer": "",
+    }
+
+
+def generate_final_feedback(percentage: float, results: list,
+                             subject: str) -> str:
+    """Generate personalised exam feedback summary."""
+    wrong   = [r for r in results if r.get("status") in ("incorrect", "missing")]
+    partial = [r for r in results if r.get("status") == "partial"]
+    gaps    = list({
+        r.get("concept_gap", "")
+        for r in results
+        if r.get("concept_gap", "").strip()
+    })
+    gap_summary = "; ".join(gaps[:5]) if gaps else "None identified"
+
+    if percentage >= 80:
+        tone = f"Excellent work! Strong command of {subject}."
+    elif percentage >= 60:
+        tone = f"Good effort. A solid attempt at {subject}."
+    elif percentage >= 40:
+        tone = f"Average performance. More revision of {subject} is needed."
+    else:
+        tone = f"Below average. Serious revision of {subject} is required."
+
+    lines = [tone]
+    if wrong:
+        lines.append(
+            f"Questions needing attention: "
+            f"{', '.join(r['questionNumber'] for r in wrong[:8])}."
+        )
+    if partial:
+        lines.append(
+            f"Partially correct: "
+            f"{', '.join(r['questionNumber'] for r in partial[:5])} — "
+            f"expand your answers."
+        )
+    lines.append(f"Key concept gaps: {gap_summary}.")
+    return " ".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
-# DATA ROUTINE UTILITIES
+# EXTRACTION PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
-def _normalise_qnum(qn):
-    s = str(qn).lower().strip()
-    return re.sub(r"[^a-z0-9]", "", s)
-
-
-def _find_upload_meta(exam_id):
-    for doc in db.collection("teacherExamUploads").stream():
-        uploads = doc.to_dict().get("uploads", [])
-        for upload in uploads:
-            if upload.get("examId") == exam_id or upload.get("id") == exam_id:
-                return upload, doc.id
-    return None, None
-
-
-def _launch_pipeline(exam_id, meta, school_id, subject_name):
-    if _is_already_processing(exam_id):
-        return False
-
-    _mark_processing(exam_id)
-    thread = threading.Thread(
-        target=run_extraction_pipeline,
-        args=(exam_id, meta, school_id, subject_name),
-        daemon=True
-    )
-    thread.start()
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════
-# CORE EXTRACTION PIPELINE
-# ═══════════════════════════════════════════════════════════════
-
-def run_extraction_pipeline(exam_id, meta, school_id, subject_name):
-    batch = db.batch()
-    written = 0
-
-    doc_ref = (
+def _get_subject_doc_ref(school_id: str, subject_name: str):
+    return (
         db.collection("teacherExamUploads")
-        .document(school_id)
-        .collection("subjects")
-        .document(subject_name)
+          .document(school_id)
+          .collection("subjects")
+          .document(subject_name)
     )
 
-    def set_upload_status(status, extra=None):
-        extra = extra or {}
+
+def run_extraction_pipeline(exam_id: str, meta: dict,
+                             school_id: str, subject_name: str):
+    subject_ref = _get_subject_doc_ref(school_id, subject_name)
+
+    def set_upload_status(status: str, extra: dict = {}):
         try:
-            snap = doc_ref.get()
+            snap = subject_ref.get()
             if not snap.exists:
                 return
-            data = snap.to_dict() or {}
             uploads = []
-            for upload in data.get("uploads", []):
-                if upload.get("examId") == exam_id or upload.get("id") == exam_id:
-                    upload["status"] = status
-                    upload.update(extra)
-                uploads.append(upload)
-            doc_ref.update({"uploads": uploads})
+            for u in (snap.to_dict() or {}).get("uploads", []):
+                if u.get("examId") == exam_id or u.get("id") == exam_id:
+                    u["status"] = status
+                    u.update(extra)
+                uploads.append(u)
+            subject_ref.update({"uploads": uploads})
         except Exception as e:
-            print(f"[Status] Failed updates: {e}")
+            print(f"[Status] Update failed: {e}")
 
     try:
-        subject = meta.get("subject", "General")
-        grade = meta.get("grade", "12")
-        title = meta.get("title", "Exam")
+        subject = meta.get("subject", subject_name or "General")
+        grade   = meta.get("grade",   "12")
+        title   = meta.get("title",   "Exam")
 
-        print(f"\n[Pipeline] RUNNING CORE PIPELINE FOR EXAM: {exam_id}")
-        set_upload_status("processing", {"processingStartedAt": datetime.utcnow().isoformat()})
+        print(f"\n[Pipeline] ═══ {exam_id} | {subject} Gr{grade}")
+        set_upload_status("processing",
+                          {"processingStartedAt": datetime.utcnow().isoformat()})
 
-        # Download Strategy
+        # 1. Download exam
         exam_bytes, exam_fn = download_file_for_extraction(meta, "exam")
         if not exam_bytes:
-            raise Exception("Could not download target structural exam file binary data bytes pool storage content.")
+            raise ValueError(
+                f"Could not download exam file. "
+                f"Check examStoragePath/examStorageUrl in the upload record."
+            )
 
-        exam_content = extract_text_from_file(exam_bytes, exam_fn)
-        exam_text = json.dumps(exam_content["blocks"]) if exam_content["type"] == "structured" else exam_content["text"]
-
+        # 2. Extract text
+        exam_text = extract_text_from_file(exam_bytes, exam_fn)
         if not exam_text.strip():
-            raise Exception("Zero characters parsed out successfully from target system source matrix pipeline.")
+            raise ValueError("No text could be extracted from the exam file.")
+        print(f"[Pipeline] Exam text: {len(exam_text)} chars")
 
+        # 3. Parse questions
         questions = parse_questions_universal(exam_text, subject, grade)
-        print(f"[Pipeline] Parsed structural context question set count size: {len(questions)}")
+        print(f"[Pipeline] Questions parsed: {len(questions)}")
 
-        # Memo Structural Matrix Alignment
-        memo_map = {}
+        # 4. Download + parse memo
+        memo_map   = {}
         memo_bytes, memo_fn = download_file_for_extraction(meta, "memo")
         if memo_bytes:
-            memo_content = extract_text_from_file(memo_bytes, memo_fn)
-            memo_text = memo_content.get("text", "") if isinstance(memo_content, dict) else str(memo_content)
+            memo_text = extract_text_from_file(memo_bytes, memo_fn)
             if memo_text.strip():
-                memo_map = parse_memo_answers(memo_text, subject, grade)
+                raw_memo = parse_memo_answers(memo_text, subject, grade)
+                memo_map = {_normalise_qnum(k): v for k, v in raw_memo.items()}
+                print(f"[Pipeline] Memo answers: {len(memo_map)}")
 
-        norm_memo = {_normalise_qnum(k): v for k, v in memo_map.items()}
+        # 5. Merge memo into questions
         for q in questions:
-            norm = _normalise_qnum(q.get("question_number", ""))
-            if norm in norm_memo:
-                q["memo"] = norm_memo[norm]
+            qn = _normalise_qnum(q.get("question_number", ""))
+            if qn and qn in memo_map and not q.get("memo"):
+                q["memo"] = memo_map[qn]
 
+        # 6. Placeholder if no questions parsed
         if not questions:
             questions = [{
                 "question_number": "1",
-                "question": "Questions layout system tracking could not parse content records natively.",
-                "type": "open",
-                "marks": 1,
+                "parent_question": "",
+                "section":         "A",
+                "question":        (
+                    f"Questions could not be parsed from this {subject} paper. "
+                    f"Please re-upload in Word (.docx) format."
+                ),
+                "type":    "open",
+                "marks":   0,
                 "options": None,
-                "memo": None
+                "memo":    None,
             }]
 
-        # Write Core Exam Document Configuration Header
+        # 7. Write exam document
         db.collection("exams").document(exam_id).set({
-            "title": title,
-            "subject": subject,
-            "grade": grade,
+            "title":            title,
+            "subject":          subject,
+            "grade":            grade,
+            "year":             meta.get("year",        ""),
+            "curriculum":       meta.get("curriculum",  "CAPS"),
+            "teacherName":      meta.get("teacherName", ""),
+            "uploadedBy":       meta.get("uploadedBy",  ""),
+            "schoolId":         meta.get("schoolId",    school_id),
+            "examDuration":     meta.get("examDuration", 0),
+            "examStoragePath":  meta.get("examStoragePath", ""),
+            "memoStoragePath":  meta.get("memoStoragePath", ""),
+            "examStorageUrl":   meta.get("examStorageUrl",  ""),
+            "memoStorageUrl":   meta.get("memoStorageUrl",  ""),
+            "memoMerged":       bool(memo_map),
             "questionsExtracted": True,
-            "status": "ready",
-            "uploadedBy": meta.get("uploadedBy", ""),
-            "schoolId": meta.get("schoolId", ""),
-            "teacherName": meta.get("teacherName", ""),
-            "examStoragePath": meta.get("examStoragePath", ""),
-            "memoStoragePath": meta.get("memoStoragePath", ""),
-            "totalQuestions": len(questions),
-            "memoMerged": bool(memo_map),
-            "sourceUploadId": exam_id,
-            "extractedAt": fs_admin.SERVER_TIMESTAMP
+            "status":           "ready",
+            "totalQuestions":   len(questions),
+            "extractedAt":      fs_admin.SERVER_TIMESTAMP,
+            "sourceUploadId":   exam_id,
         })
 
-        # Save Structural Questions Collections Tracking Documents
+        # 8. Write questions in batches of 400
+        batch   = db.batch()
+        written = 0
         for i, q in enumerate(questions):
-            raw_marks = q.get("marks", 1)
+            qtext = str(q.get("question") or "").strip()
+            if not qtext:
+                continue
+
+            # Safe marks parsing
             try:
-                if raw_marks is None:
-                    marks = 1
-                elif isinstance(raw_marks, str):
-                    cleaned = re.sub(r"[^0-9]", "", raw_marks.strip())
-                    marks = int(cleaned) if cleaned else 1
-                else:
-                    marks = int(raw_marks)
+                raw_marks = q.get("marks", 1)
+                marks = int(re.sub(r"[^0-9]", "", str(raw_marks))) if raw_marks else 1
+                marks = max(1, marks)
             except Exception:
                 marks = 1
 
@@ -574,536 +778,602 @@ def run_extraction_pipeline(exam_id, meta, school_id, subject_name):
             if not isinstance(options, dict):
                 options = None
 
-            qnum = str(q.get("question_number") or i + 1)
-            qtext = str(q.get("question") or "").strip()
-            if not qtext:
-                continue
-
-            ref = db.collection("exam_questions").document(f"{exam_id}_{i:04d}")
+            ref = db.collection("exam_questions").document(
+                f"{exam_id}_{i:04d}"
+            )
             batch.set(ref, {
-                "examId": exam_id,
-                "questionNumber": qnum,
+                "examId":         exam_id,
+                "questionNumber": str(q.get("question_number") or i + 1),
                 "parentQuestion": q.get("parent_question", ""),
-                "parentContext": q.get("parent_context", None),
-                "section": q.get("section", "A"),
-                "questionText": qtext,
-                "type": q.get("type", "open"),
-                "marks": marks,
-                "options": options,
-                "columnA": q.get("column_a"),
-                "columnB": q.get("column_b"),
-                "memo": str(q.get("memo") or ""),
-                "order": i,
-                "createdAt": fs_admin.SERVER_TIMESTAMP,
+                "parentContext":  q.get("parent_context"),
+                "section":        q.get("section", "A"),
+                "questionText":   qtext,
+                "type":           q.get("type", "open"),
+                "marks":          marks,
+                "options":        options,
+                "columnA":        q.get("column_a"),
+                "columnB":        q.get("column_b"),
+                "memo":           str(q.get("memo") or ""),
+                "order":          i,
             })
-
             written += 1
             if written % 400 == 0:
                 batch.commit()
                 batch = db.batch()
 
         batch.commit()
-        print(f"[Pipeline] Finished posting {written} questions instances to Firestore cluster registry.")
+        print(f"[Pipeline] Done: {written} questions, {len(memo_map)} memo answers")
+
         set_upload_status("extracted", {
-            "extractedAt": datetime.utcnow().isoformat(),
+            "extractedAt":    datetime.utcnow().isoformat(),
             "totalQuestions": written,
-            "memoMerged": bool(memo_map)
+            "memoMerged":     bool(memo_map),
         })
 
     except Exception as e:
         traceback.print_exc()
-        print(f"[Pipeline] Critical Processing Exception Failure: {e}")
+        print(f"[Pipeline] FAILED: {e}")
         set_upload_status("error", {"errorMessage": str(e)[:500]})
-        db.collection("exams").document(exam_id).set({
-            "status": "error",
-            "errorMessage": str(e)[:500]
-        }, merge=True)
+        try:
+            db.collection("exams").document(exam_id).set(
+                {"status": "error", "errorMessage": str(e)[:500]},
+                merge=True,
+            )
+        except Exception:
+            pass
     finally:
         _unmark_processing(exam_id)
 
 
+def _launch_pipeline(exam_id: str, meta: dict,
+                     school_id: str, subject_name: str) -> bool:
+    if _is_already_processing(exam_id):
+        print(f"[Pipeline] Already processing: {exam_id}")
+        return False
+
+    # Check if already ready
+    try:
+        snap = db.collection("exams").document(exam_id).get()
+        if snap.exists and snap.to_dict().get("status") == "ready":
+            print(f"[Pipeline] Already ready: {exam_id}")
+            return False
+    except Exception:
+        pass
+
+    _mark_processing(exam_id)
+    db.collection("exams").document(exam_id).set(
+        {"status": "processing", "startedAt": fs_admin.SERVER_TIMESTAMP},
+        merge=True,
+    )
+    threading.Thread(
+        target=run_extraction_pipeline,
+        args=(exam_id, meta, school_id, subject_name),
+        daemon=True,
+    ).start()
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════
-# AUTO EXTRACTION BACKGROUND SNAPSHOT LISTENER
+# FIRESTORE LISTENER + STARTUP SWEEP
 # ═══════════════════════════════════════════════════════════════
 
 def _start_auto_extraction_listener():
-    subjects_ref = db.collection_group("subjects")
-
     def on_snapshot(col_snapshot, changes, read_time):
         for change in changes:
             if change.type.name not in ("ADDED", "MODIFIED"):
                 continue
-
-            data = change.document.to_dict() or {}
-            subject_doc_ref = change.document.reference
-            school_doc_ref = subject_doc_ref.parent.parent
-            school_id = school_doc_ref.id
+            data         = change.document.to_dict() or {}
+            subject_ref  = change.document.reference
+            school_id    = subject_ref.parent.parent.id
             subject_name = change.document.id
-            uploads = data.get("uploads", [])
 
-            for upload in uploads:
+            for upload in data.get("uploads", []):
                 exam_id = upload.get("examId") or upload.get("id")
                 if not exam_id:
                     continue
-
                 if upload.get("status") != "pending_extraction":
                     continue
-
-                if not (upload.get("examStoragePath") or upload.get("examStorageUrl")):
+                if not (upload.get("examStoragePath") or
+                        upload.get("examStorageUrl")):
                     continue
-
                 if _is_already_processing(exam_id):
                     continue
-
-                print(f"[Listener] Caught pending element context: {school_id} | {subject_name} | {exam_id}")
+                print(f"[Listener] Pending: {school_id}/{subject_name}/{exam_id}")
                 _launch_pipeline(exam_id, upload, school_id, subject_name)
 
-    subjects_ref.on_snapshot(on_snapshot)
-    print("[Listener] GLOBAL REALTIME SUBJECT GRUOP LISTENER ENGINE DEPLOYED SYNCED AND STABLE")
+    db.collection_group("subjects").on_snapshot(on_snapshot)
+    print("[Listener] Active — watching all subjects")
 
-
-# ═══════════════════════════════════════════════════════════════
-# ENGINE RECOVERY RUNTIME BOOT SWEEP
-# ═══════════════════════════════════════════════════════════════
 
 def _sweep_pending_on_startup():
-    print("[Startup] Initiating infrastructure safety recovery verification crash data sweeps...")
+    print("[Startup] Sweeping for pending extractions...")
     launched = 0
     try:
-        subjects = db.collection_group("subjects").stream()
-        for doc in subjects:
-            data = doc.to_dict() or {}
-            uploads = data.get("uploads", [])
-            school_doc = doc.reference.parent.parent
-            school_id = school_doc.id
+        for doc in db.collection_group("subjects").stream():
+            data         = doc.to_dict() or {}
+            school_id    = doc.reference.parent.parent.id
             subject_name = doc.id
-
-            for upload in uploads:
+            for upload in data.get("uploads", []):
                 exam_id = upload.get("examId") or upload.get("id")
-                if not exam_id or upload.get("status") != "pending_extraction":
+                if not exam_id:
                     continue
-
+                if upload.get("status") != "pending_extraction":
+                    continue
+                if not (upload.get("examStoragePath") or
+                        upload.get("examStorageUrl")):
+                    continue
                 if _is_already_processing(exam_id):
                     continue
-
-                print(f"[Startup Sweep Execution Engine Launcher]: {exam_id}")
-                launched += int(_launch_pipeline(exam_id, upload, school_id, subject_name))
+                print(f"[Startup] Launching: {exam_id}")
+                if _launch_pipeline(exam_id, upload, school_id, subject_name):
+                    launched += 1
     except Exception as e:
-        print(f"[Startup Sweep] Crash interruption exception: {e}")
+        print(f"[Startup] Sweep error: {e}")
+    print(f"[Startup] Launched {launched} missed extraction(s)")
 
-    print(f"[Startup Sweep Complete]. Booted {launched} deadlocks safely back into runtime execution threads.")
 
-
-# Run initial setup sweeps & persistent database connection listeners right on script runtime initialization
 _start_auto_extraction_listener()
 _sweep_pending_on_startup()
 
 
 # ═══════════════════════════════════════════════════════════════
-# FLASK ENDPOINT API ROUTERS
+# EXAM SESSION (in-memory, backed by Firestore)
 # ═══════════════════════════════════════════════════════════════
 
-@app.route("/")
-def home():
+def _save_session(sid: str, data: dict):
+    db.collection("exam_sessions").document(sid).set(
+        {**data, "createdAt": fs_admin.SERVER_TIMESTAMP}
+    )
+
+
+def _get_session(sid: str) -> dict | None:
+    if not sid:
+        return None
+    doc = db.collection("exam_sessions").document(sid).get()
+    return doc.to_dict() if doc.exists else None
+
+
+def _update_session_answers(sid: str, answers: dict):
+    db.collection("exam_sessions").document(sid).update(
+        {"answers": answers}
+    )
+
+
+def _delete_session(sid: str):
+    try:
+        db.collection("exam_sessions").document(sid).delete()
+    except Exception:
+        pass
+
+
+def _load_exam(exam_id: str):
+    """Load exam metadata + questions from Firestore."""
+    exam_doc = db.collection("exams").document(exam_id).get()
+    if not exam_doc.exists:
+        return None, []
+    meta = {**exam_doc.to_dict(), "id": exam_doc.id}
+
+    raw_qs = list(
+        db.collection("exam_questions")
+          .where("examId", "==", exam_id)
+          .stream()
+    )
+    raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
+
+    questions = []
+    for q in raw_qs:
+        d       = q.to_dict()
+        options = d.get("options")
+        if isinstance(options, dict) and options:
+            options = [{"key": k, "value": v}
+                       for k, v in sorted(options.items())]
+        questions.append({
+            "question_number":  str(d.get("questionNumber", "")),
+            "parent_question":  d.get("parentQuestion", ""),
+            "parent_context":   d.get("parentContext"),
+            "section":          d.get("section", "A"),
+            "question":         d.get("questionText", ""),
+            "type":             d.get("type", "open").lower(),
+            "options":          options,
+            "column_a":         d.get("columnA"),
+            "column_b":         d.get("columnB"),
+            "marks":            d.get("marks", 1),
+            "memo":             d.get("memo", ""),
+        })
+    return meta, questions
+
+
+# ═══════════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/", methods=["GET"])
+def health():
     return jsonify({
-        "status": "online",
-        "engine": "Eduket Extraction Engine Production Core"
+        "status":  "ok",
+        "service": "Eduket Extraction & Marking API",
+        "version": "3.0",
+        "endpoints": {
+            "exams":         "GET  /exams",
+            "start":         "POST /start-exam",
+            "question":      "POST /question",
+            "answer":        "POST /answer",
+            "submit":        "POST /submit",
+            "results":       "GET  /results/<exam_id>/<student_id>",
+            "autosave":      "POST /autosave",
+            "admin_status":  "GET  /admin/extraction-status/<exam_id>",
+            "admin_trigger": "GET  /admin/trigger-extract/<exam_id>",
+        }
     })
 
 
-@app.route("/auto-extract", methods=["POST"])
-def auto_extract():
+@app.route("/exams", methods=["GET"])
+def list_exams():
+    exams = []
     try:
-        payload = request.json or {}
-        exam_id = payload.get("examId")
-        teacher_id = payload.get("teacherId")
-        school_id = payload.get("schoolId", "default_school")
-        subject_name = payload.get("subjectName", "General")
-
-        if not exam_id or not teacher_id:
-            return jsonify({"error": "Missing examId or teacherId properties parameters payload fields."}), 400
-
-        doc = db.collection("teacherExamUploads").document(teacher_id).get()
-        if not doc.exists:
-            return jsonify({
-                               "error": "Teacher base identity upload map configuration elements not found registry matrix error."}), 404
-
-        meta = None
-        for upload in doc.to_dict().get("uploads", []):
-            if upload.get("examId") == exam_id or upload.get("id") == exam_id:
-                meta = upload
-                break
-
-        if not meta:
-            return jsonify({
-                               "error": "Target collection specific nested entity entry parameters missing data verification fields."}), 404
-
-        launched = _launch_pipeline(exam_id, meta, school_id, subject_name)
-        return jsonify({"ok": True, "launched": launched, "examId": exam_id})
-
+        for doc in (
+            db.collection("exams")
+              .where("status", "==", "ready")
+              .stream()
+        ):
+            d = doc.to_dict()
+            exams.append({
+                "id":           doc.id,
+                "name":         d.get("title",      doc.id),
+                "subject":      d.get("subject",    ""),
+                "grade":        d.get("grade",      ""),
+                "year":         d.get("year",       ""),
+                "curriculum":   d.get("curriculum", "CAPS"),
+                "memoMerged":   d.get("memoMerged", False),
+                "examDuration": d.get("examDuration", 0),
+            })
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        print(f"[list_exams] {e}")
+    return jsonify({"exams": exams})
 
 
 @app.route("/start-exam", methods=["POST"])
+@app.route("/start_exam",  methods=["POST"])
 def start_exam():
     try:
-        data = request.get_json() or {}
-        exam_id = (
-                data.get("exam_id") or
-                data.get("exam") or
-                data.get("examId") or
-                ""
+        data       = request.get_json() or {}
+        exam_id    = (
+            data.get("exam_id") or data.get("exam") or
+            data.get("examId")  or ""
         ).strip()
-
         student_id = data.get("student_id", "anonymous")
-        print(f"[start_exam] Verification sequence requested for exam_id='{exam_id}' by student='{student_id}'")
+
+        print(f"[start_exam] exam='{exam_id}' student='{student_id}'")
 
         if not exam_id:
-            return jsonify({"error": "Missing parameter key context field: examId"}), 400
+            return jsonify({"error": "exam_id required"}), 400
 
-        # Complete clean fallback validation return placeholder pattern structure
-        return jsonify({
-            "status": "authorized",
-            "examId": exam_id,
-            "studentId": student_id,
-            "timestamp": datetime.utcnow().isoformat()
+        meta, questions = _load_exam(exam_id)
+        if meta is None:
+            return jsonify({"error": f"Exam '{exam_id}' not found"}), 404
+        if not questions:
+            return jsonify({
+                "error": (
+                    "This exam has no questions yet — extraction may still "
+                    f"be processing (status: {meta.get('status', 'unknown')}). "
+                    "Please wait a minute and try again."
+                )
+            }), 400
+
+        sid = str(uuid.uuid4())
+        _save_session(sid, {
+            "exam_id":    exam_id,
+            "exam":       meta.get("title", exam_id),
+            "subject":    meta.get("subject", ""),
+            "student_id": student_id,
+            "questions":  questions,
+            "answers":    {},
         })
+
+        return jsonify({
+            "session_id":            sid,
+            "total_questions":       len(questions),
+            "memo_merged":           meta.get("memoMerged", False),
+            "subject":               meta.get("subject", ""),
+            "title":                 meta.get("title", ""),
+            "exam_duration_minutes": meta.get("examDuration", 0),
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/question", methods=["POST"])
+def get_question():
+    try:
+        data    = request.get_json() or {}
+        session = _get_session(data.get("session_id"))
+        if not session:
+            return jsonify({"error": "Invalid session"}), 400
+        idx = int(data.get("index", 0))
+        qs  = session.get("questions", [])
+        if idx < 0 or idx >= len(qs):
+            return jsonify({"error": "Index out of range"}), 400
+        q = {**qs[idx]}
+        q["saved_answer"] = session.get("answers", {}).get(str(idx), "")
+        return jsonify(q)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/answer", methods=["POST"])
+def save_answer():
+    try:
+        data    = request.get_json() or {}
+        sid     = data.get("session_id")
+        session = _get_session(sid)
+        if not session:
+            return jsonify({"error": "Invalid session"}), 400
+        answers                          = session.get("answers", {})
+        answers[str(data.get("index"))]  = data.get("answer", "")
+        _update_session_answers(sid, answers)
+        return jsonify({"status": "saved"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ═══════════════════════════════════════════════════════════════
-# EXAM SUBMISSION + RESULTS ENGINE
-# ═══════════════════════════════════════════════════════════════
-
-from difflib import SequenceMatcher
-
-
-def safe_float(v, default=0):
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def normalize_text(value):
-    if value is None:
-        return ""
-    return str(value).strip().lower()
-
-
-def similarity(a, b):
-    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
-
-
-def mark_answer(student_answer, memo_answer, marks):
-    """
-    Simple AI-lite marking strategy.
-    """
-
-    student_answer = normalize_text(student_answer)
-    memo_answer = normalize_text(memo_answer)
-
-    if not memo_answer:
-        return {
-            "awarded": 0,
-            "correct": False,
-            "feedback": "No memo available."
-        }
-
-    if student_answer == memo_answer:
-        return {
-            "awarded": marks,
-            "correct": True,
-            "feedback": "Correct answer."
-        }
-
-    sim = similarity(student_answer, memo_answer)
-
-    if sim >= 0.85:
-        return {
-            "awarded": marks,
-            "correct": True,
-            "feedback": "Very close to memorandum answer."
-        }
-
-    if sim >= 0.60:
-        partial = round(marks * 0.5, 1)
-        return {
-            "awarded": partial,
-            "correct": False,
-            "feedback": "Partially correct."
-        }
-
-    return {
-        "awarded": 0,
-        "correct": False,
-        "feedback": "Incorrect answer."
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# SUBMIT EXAM
-# ═══════════════════════════════════════════════════════════════
 
 @app.route("/submit", methods=["POST"])
 def submit_exam():
-
     try:
-        data = request.get_json() or {}
+        data       = request.get_json() or {}
+        sid        = data.get("session_id")
+        student_id = data.get("student_id", "anonymous")
+        session    = _get_session(sid)
 
-        exam_id = data.get("examId")
-        student_id = data.get("studentId")
-        answers = data.get("answers", {})
+        if not session:
+            return jsonify({"error": "Invalid or expired session"}), 400
 
-        if not exam_id:
-            return jsonify({
-                "error": "Missing examId"
-            }), 400
+        subject   = session.get("subject", "General")
+        questions = session.get("questions", [])
+        answers   = session.get("answers", {})
+        exam_id   = session.get("exam_id", "")
 
-        if not student_id:
-            return jsonify({
-                "error": "Missing studentId"
-            }), 400
+        total_score = 0.0
+        total_marks = 0.0
+        results     = []
 
-        # Prevent duplicate submissions
-        existing = (
-            db.collection("exam_submissions")
-            .where("examId", "==", exam_id)
-            .where("studentId", "==", student_id)
-            .limit(1)
-            .stream()
-        )
-
-        existing_docs = list(existing)
-
-        if existing_docs:
-            return jsonify({
-                "error": "Exam already submitted."
-            }), 400
-
-        # Load questions
-        questions_query = (
-            db.collection("exam_questions")
-            .where("examId", "==", exam_id)
-            .order_by("order")
-            .stream()
-        )
-
-        questions = [doc.to_dict() for doc in questions_query]
-
-        if not questions:
-            return jsonify({
-                "error": "No questions found for exam."
-            }), 404
-
-        total_marks = 0
-        earned_marks = 0
-        results = []
-
-        for q in questions:
-
-            qnum = str(q.get("questionNumber", "")).strip()
-
-            memo = q.get("memo", "")
-            marks = safe_float(q.get("marks", 1), 1)
-
+        for i, q in enumerate(questions):
+            q_num        = q.get("question_number", f"Q{i+1}")
+            q_type       = q.get("type", "open").lower()
+            marks        = float(q.get("marks") or 1)
+            memo         = q.get("memo", "")
+            student_ans  = answers.get(str(i), "").strip()
             total_marks += marks
 
-            student_answer = answers.get(qnum, "")
+            # Resolve options for MCQ display
+            options = q.get("options")
+            if isinstance(options, list) and options and isinstance(options[0], dict):
+                options = {o["key"]: o["value"] for o in options}
 
-            marked = mark_answer(
-                student_answer,
-                memo,
-                marks
-            )
+            # ── Mark the answer ───────────────────────────────────────
+            marked = mark_with_memo(student_ans, memo, marks)
 
-            earned_marks += marked["awarded"]
+            # No memo or no match — use AI
+            if marked is None:
+                marked = mark_with_ai(
+                    q.get("question", ""),
+                    student_ans,
+                    marks,
+                    subject,
+                    memo,
+                )
+
+            earned       = float(marked.get("score", 0))
+            total_score += earned
+
+            # Format correct answer for display
+            correct_display = memo if memo else "Not available"
+            if memo and q_type == "mcq" and isinstance(options, dict):
+                letter = str(memo).strip().upper()
+                correct_display = (
+                    f"{letter}. {options.get(letter, '')}"
+                    if letter in options else letter
+                )
 
             results.append({
-                "questionNumber": qnum,
-                "question": q.get("questionText", ""),
-                "studentAnswer": student_answer,
-                "memo": memo,
-                "marks": marks,
-                "awarded": marked["awarded"],
-                "correct": marked["correct"],
-                "feedback": marked["feedback"]
+                "question_number": q_num,
+                "question":        q.get("question", ""),
+                "type":            q_type,
+                "marks":           marks,
+                "earned":          earned,
+                "score":           earned,
+                "status":          marked.get("status", "incorrect"),
+                "student_answer":  student_ans or "No answer",
+                "correct_answer":  correct_display,
+                "feedback":        marked.get("feedback", ""),
+                "concept_gap":     marked.get("concept_gap", ""),
+                "model_answer":    marked.get("model_answer", ""),
             })
 
-        percentage = 0
+        percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
+        feedback   = generate_final_feedback(percentage, results, subject)
 
-        if total_marks > 0:
-            percentage = round(
-                (earned_marks / total_marks) * 100,
-                2
-            )
+        # Save attempt to Firestore
+        try:
+            db.collection("exam_attempts").add({
+                "examId":      exam_id,
+                "studentId":   student_id,
+                "subject":     subject,
+                "score":       total_score,
+                "total":       total_marks,
+                "percentage":  percentage,
+                "results":     results,
+                "feedback":    feedback,
+                "completedAt": fs_admin.SERVER_TIMESTAMP,
+            })
+        except Exception as e:
+            print(f"[submit] Could not save attempt: {e}")
 
-        # AI Feedback Summary
-        if percentage >= 80:
-            ai_feedback = "Excellent performance."
-        elif percentage >= 60:
-            ai_feedback = "Good work. Some improvements needed."
-        elif percentage >= 40:
-            ai_feedback = "Fair attempt. Revise weak sections."
-        else:
-            ai_feedback = "Needs significant improvement."
-
-        # Save submission
-        submission_data = {
-            "examId": exam_id,
-            "studentId": student_id,
-            "answers": answers,
-            "results": results,
-            "score": round(earned_marks, 2),
-            "total": round(total_marks, 2),
-            "percentage": percentage,
-            "feedback": ai_feedback,
-            "submittedAt": fs_admin.SERVER_TIMESTAMP
-        }
-
-        submission_ref = db.collection("exam_submissions").document()
-
-        submission_ref.set(submission_data)
+        _delete_session(sid)
 
         return jsonify({
-            "success": True,
-            "submissionId": submission_ref.id,
-            "score": round(earned_marks, 2),
-            "total": round(total_marks, 2),
+            "score":      total_score,
+            "total":      total_marks,
             "percentage": percentage,
-            "feedback": ai_feedback,
-            "results": results
+            "results":    results,
+            "feedback":   feedback,
+            "subject":    subject,
         })
 
     except Exception as e:
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
-# ═══════════════════════════════════════════════════════════════
-# GET RESULTS
-# ═══════════════════════════════════════════════════════════════
 
 @app.route("/results/<exam_id>/<student_id>", methods=["GET"])
 def get_results(exam_id, student_id):
-
     try:
-
-        query = (
-            db.collection("exam_submissions")
-            .where("examId", "==", exam_id)
-            .where("studentId", "==", student_id)
-            .limit(1)
-            .stream()
+        docs = list(
+            db.collection("exam_attempts")
+              .where("examId",    "==", exam_id)
+              .where("studentId", "==", student_id)
+              .order_by("completedAt", direction=fs_admin.Query.DESCENDING)
+              .limit(1)
+              .stream()
         )
-
-        docs = list(query)
-
         if not docs:
-            return jsonify({
-                "error": "Results not found."
-            }), 404
-
-        result = docs[0].to_dict()
-
-        return jsonify({
-            "success": True,
-            "result": result
-        })
-
+            return jsonify({"error": "Results not found"}), 404
+        return jsonify({"success": True, "result": docs[0].to_dict()})
     except Exception as e:
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
-# ═══════════════════════════════════════════════════════════════
-# AUTOSAVE ENDPOINT
-# PREVENTS FRONTEND FAILED FETCH ERRORS
-# ═══════════════════════════════════════════════════════════════
 
 @app.route("/autosave", methods=["POST"])
 def autosave_exam():
-
     try:
-
-        data = request.get_json() or {}
-
-        exam_id = data.get("examId")
+        data       = request.get_json() or {}
+        exam_id    = data.get("examId")
         student_id = data.get("studentId")
-        answers = data.get("answers", {})
-
+        answers    = data.get("answers", {})
         if not exam_id or not student_id:
-            return jsonify({
-                "error": "Missing required fields."
-            }), 400
-
-        doc_id = f"{exam_id}_{student_id}"
-
-        db.collection("exam_autosaves").document(doc_id).set({
-            "examId": exam_id,
+            return jsonify({"error": "Missing examId or studentId"}), 400
+        db.collection("exam_autosaves").document(
+            f"{exam_id}_{student_id}"
+        ).set({
+            "examId":    exam_id,
             "studentId": student_id,
-            "answers": answers,
-            "updatedAt": fs_admin.SERVER_TIMESTAMP
+            "answers":   answers,
+            "updatedAt": fs_admin.SERVER_TIMESTAMP,
         }, merge=True)
-
-        return jsonify({
-            "success": True
-        })
-
+        return jsonify({"success": True})
     except Exception as e:
-        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
-# ═══════════════════════════════════════════════════════════════
-# LOAD AUTOSAVED EXAM
-# ═══════════════════════════════════════════════════════════════
 
 @app.route("/autosave/<exam_id>/<student_id>", methods=["GET"])
 def load_autosave(exam_id, student_id):
-
     try:
+        doc = db.collection("exam_autosaves").document(
+            f"{exam_id}_{student_id}"
+        ).get()
+        answers = doc.to_dict().get("answers", {}) if doc.exists else {}
+        return jsonify({"success": True, "answers": answers})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        doc_id = f"{exam_id}_{student_id}"
 
-        doc = (
-            db.collection("exam_autosaves")
-            .document(doc_id)
-            .get()
-        )
-
-        if not doc.exists:
+@app.route("/admin/extraction-status/<exam_id>", methods=["GET"])
+def extraction_status(exam_id):
+    try:
+        doc = db.collection("exams").document(exam_id).get()
+        if doc.exists:
+            d       = doc.to_dict()
+            q_count = sum(
+                1 for _ in
+                db.collection("exam_questions")
+                  .where("examId", "==", exam_id)
+                  .stream()
+            )
             return jsonify({
-                "success": True,
-                "answers": {}
+                "status":             d.get("status"),
+                "title":              d.get("title"),
+                "subject":            d.get("subject"),
+                "questions_in_db":    q_count,
+                "memo_merged":        d.get("memoMerged", False),
+                "student_accessible": d.get("status") == "ready" and q_count > 0,
             })
+        return jsonify({"status": "not_found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        data = doc.to_dict()
+
+@app.route("/admin/trigger-extract/<exam_id>", methods=["GET"])
+def trigger_extract(exam_id):
+    try:
+        # Find in exams collection
+        exam_doc = db.collection("exams").document(exam_id).get()
+        meta         = None
+        school_id    = "shared"
+        subject_name = "General"
+
+        if exam_doc.exists:
+            meta         = exam_doc.to_dict()
+            school_id    = meta.get("schoolId", "shared")
+            subject_name = meta.get("subject",  "General")
+        else:
+            # Search subject subcollections
+            for doc in db.collection_group("subjects").stream():
+                for upload in (doc.to_dict() or {}).get("uploads", []):
+                    if (upload.get("examId") == exam_id or
+                            upload.get("id") == exam_id):
+                        meta         = upload
+                        school_id    = doc.reference.parent.parent.id
+                        subject_name = doc.id
+                        break
+                if meta:
+                    break
+
+        if not meta:
+            return jsonify({"error": f"Exam {exam_id} not found"}), 404
+
+        # Force reset so it re-runs
+        db.collection("exams").document(exam_id).set(
+            {"status": "pending_extraction"}, merge=True
+        )
+        _unmark_processing(exam_id)
+
+        threading.Thread(
+            target=run_extraction_pipeline,
+            args=(exam_id, meta, school_id, subject_name),
+            daemon=True,
+        ).start()
 
         return jsonify({
-            "success": True,
-            "answers": data.get("answers", {})
+            "ok":      True,
+            "message": "Extraction started",
+            "exam_id": exam_id,
+            "poll":    f"/admin/extraction-status/{exam_id}",
         })
 
     except Exception as e:
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "error": str(e)
-        }), 500
+
+@app.route("/admin/cleanup-sessions", methods=["POST"])
+def cleanup_sessions():
+    from datetime import timedelta, timezone
+    cutoff  = datetime.now(timezone.utc) - timedelta(hours=24)
+    deleted = 0
+    for doc in db.collection("exam_sessions").stream():
+        created = doc.to_dict().get("createdAt")
+        if created and created < cutoff:
+            doc.reference.delete()
+            deleted += 1
+    return jsonify({"deleted": deleted})
 
 
 if __name__ == "__main__":
-    # Standard local debug server runner execution profile pattern logic block
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+    app.run(
+        host  = "0.0.0.0",
+        port  = int(os.getenv("PORT", 5000)),
+        debug = False,
+    )

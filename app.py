@@ -773,37 +773,336 @@ def start_exam():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ═══════════════════════════════════════════════════════════════
+# EXAM SUBMISSION + RESULTS ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+from difflib import SequenceMatcher
+
+
+def safe_float(v, default=0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def normalize_text(value):
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+
+def mark_answer(student_answer, memo_answer, marks):
+    """
+    Simple AI-lite marking strategy.
+    """
+
+    student_answer = normalize_text(student_answer)
+    memo_answer = normalize_text(memo_answer)
+
+    if not memo_answer:
+        return {
+            "awarded": 0,
+            "correct": False,
+            "feedback": "No memo available."
+        }
+
+    if student_answer == memo_answer:
+        return {
+            "awarded": marks,
+            "correct": True,
+            "feedback": "Correct answer."
+        }
+
+    sim = similarity(student_answer, memo_answer)
+
+    if sim >= 0.85:
+        return {
+            "awarded": marks,
+            "correct": True,
+            "feedback": "Very close to memorandum answer."
+        }
+
+    if sim >= 0.60:
+        partial = round(marks * 0.5, 1)
+        return {
+            "awarded": partial,
+            "correct": False,
+            "feedback": "Partially correct."
+        }
+
+    return {
+        "awarded": 0,
+        "correct": False,
+        "feedback": "Incorrect answer."
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# SUBMIT EXAM
+# ═══════════════════════════════════════════════════════════════
+
 @app.route("/submit", methods=["POST"])
 def submit_exam():
+
     try:
         data = request.get_json() or {}
 
         exam_id = data.get("examId")
         student_id = data.get("studentId")
-        answers = data.get("answers", [])
+        answers = data.get("answers", {})
 
-        print(f"[Submit] Exam: {exam_id}")
-        print(f"[Submit] Student: {student_id}")
+        if not exam_id:
+            return jsonify({
+                "error": "Missing examId"
+            }), 400
 
-        # Example Firestore save
-        db.collection("exam_submissions").add({
+        if not student_id:
+            return jsonify({
+                "error": "Missing studentId"
+            }), 400
+
+        # Prevent duplicate submissions
+        existing = (
+            db.collection("exam_submissions")
+            .where("examId", "==", exam_id)
+            .where("studentId", "==", student_id)
+            .limit(1)
+            .stream()
+        )
+
+        existing_docs = list(existing)
+
+        if existing_docs:
+            return jsonify({
+                "error": "Exam already submitted."
+            }), 400
+
+        # Load questions
+        questions_query = (
+            db.collection("exam_questions")
+            .where("examId", "==", exam_id)
+            .order_by("order")
+            .stream()
+        )
+
+        questions = [doc.to_dict() for doc in questions_query]
+
+        if not questions:
+            return jsonify({
+                "error": "No questions found for exam."
+            }), 404
+
+        total_marks = 0
+        earned_marks = 0
+        results = []
+
+        for q in questions:
+
+            qnum = str(q.get("questionNumber", "")).strip()
+
+            memo = q.get("memo", "")
+            marks = safe_float(q.get("marks", 1), 1)
+
+            total_marks += marks
+
+            student_answer = answers.get(qnum, "")
+
+            marked = mark_answer(
+                student_answer,
+                memo,
+                marks
+            )
+
+            earned_marks += marked["awarded"]
+
+            results.append({
+                "questionNumber": qnum,
+                "question": q.get("questionText", ""),
+                "studentAnswer": student_answer,
+                "memo": memo,
+                "marks": marks,
+                "awarded": marked["awarded"],
+                "correct": marked["correct"],
+                "feedback": marked["feedback"]
+            })
+
+        percentage = 0
+
+        if total_marks > 0:
+            percentage = round(
+                (earned_marks / total_marks) * 100,
+                2
+            )
+
+        # AI Feedback Summary
+        if percentage >= 80:
+            ai_feedback = "Excellent performance."
+        elif percentage >= 60:
+            ai_feedback = "Good work. Some improvements needed."
+        elif percentage >= 40:
+            ai_feedback = "Fair attempt. Revise weak sections."
+        else:
+            ai_feedback = "Needs significant improvement."
+
+        # Save submission
+        submission_data = {
             "examId": exam_id,
             "studentId": student_id,
             "answers": answers,
+            "results": results,
+            "score": round(earned_marks, 2),
+            "total": round(total_marks, 2),
+            "percentage": percentage,
+            "feedback": ai_feedback,
             "submittedAt": fs_admin.SERVER_TIMESTAMP
-        })
+        }
+
+        submission_ref = db.collection("exam_submissions").document()
+
+        submission_ref.set(submission_data)
 
         return jsonify({
             "success": True,
-            "message": "Exam submitted successfully"
+            "submissionId": submission_ref.id,
+            "score": round(earned_marks, 2),
+            "total": round(total_marks, 2),
+            "percentage": percentage,
+            "feedback": ai_feedback,
+            "results": results
         })
 
     except Exception as e:
         traceback.print_exc()
+
         return jsonify({
-            "success": False,
             "error": str(e)
         }), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# GET RESULTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/results/<exam_id>/<student_id>", methods=["GET"])
+def get_results(exam_id, student_id):
+
+    try:
+
+        query = (
+            db.collection("exam_submissions")
+            .where("examId", "==", exam_id)
+            .where("studentId", "==", student_id)
+            .limit(1)
+            .stream()
+        )
+
+        docs = list(query)
+
+        if not docs:
+            return jsonify({
+                "error": "Results not found."
+            }), 404
+
+        result = docs[0].to_dict()
+
+        return jsonify({
+            "success": True,
+            "result": result
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTOSAVE ENDPOINT
+# PREVENTS FRONTEND FAILED FETCH ERRORS
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/autosave", methods=["POST"])
+def autosave_exam():
+
+    try:
+
+        data = request.get_json() or {}
+
+        exam_id = data.get("examId")
+        student_id = data.get("studentId")
+        answers = data.get("answers", {})
+
+        if not exam_id or not student_id:
+            return jsonify({
+                "error": "Missing required fields."
+            }), 400
+
+        doc_id = f"{exam_id}_{student_id}"
+
+        db.collection("exam_autosaves").document(doc_id).set({
+            "examId": exam_id,
+            "studentId": student_id,
+            "answers": answers,
+            "updatedAt": fs_admin.SERVER_TIMESTAMP
+        }, merge=True)
+
+        return jsonify({
+            "success": True
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# LOAD AUTOSAVED EXAM
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/autosave/<exam_id>/<student_id>", methods=["GET"])
+def load_autosave(exam_id, student_id):
+
+    try:
+
+        doc_id = f"{exam_id}_{student_id}"
+
+        doc = (
+            db.collection("exam_autosaves")
+            .document(doc_id)
+            .get()
+        )
+
+        if not doc.exists:
+            return jsonify({
+                "success": True,
+                "answers": {}
+            })
+
+        data = doc.to_dict()
+
+        return jsonify({
+            "success": True,
+            "answers": data.get("answers", {})
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
 
 if __name__ == "__main__":
     # Standard local debug server runner execution profile pattern logic block

@@ -30,3 +30,4 @@ pdfplumber
 groq
 python-docx
 odfpy
+mammoth

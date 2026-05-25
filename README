@@ -1,144 +1,165 @@
-# EduCAT Backend — AI Exam Study System
+```markdown
+# Eduket Backend — AI Exam Study System
 
-This is the backend for EduCAT, an AI-powered exam study platform for Grade 12 CAT students.
+This is the production backend api for **Eduket**, an AI-powered exam study and automated extraction platform tailored for Grade 12 Computer Applications Technology (CAT) students working within the CAPS curriculum framework.
 
-It is built using Flask and deployed on PythonAnywhere. The system uses an AI agent (not a basic chatbot) to help students study, write exams, and improve based on their performance.
+It is built using Python (Flask) and optimized for deployment on cloud platforms like PythonAnywhere or Render. The system employs an intelligent agent-based loop alongside a high-throughput multi-format document extraction pipeline to transform raw teacher exam uploads into immediately executable digital assessments.
 
 ---
 
 ## Overview
 
-The backend handles:
+The backend manages the entire lifecyle of digital exam administration and AI-driven student remediation:
 
-- AI tutoring via an agent-based system
-- Exam simulation and answer submission
-- Automatic marking of different question types
-- Student progress tracking and weak topic detection
-- Retrieval of theory content using RAG (FAISS)
-- Persistent student memory using SQLite
-
-The AI decides what to do based on the student’s input and history, instead of following fixed logic.
+- **Document Extraction Pipeline:** Multi-threaded processing of `.docx`, `.pdf`, `.odt`, and `.doc` teacher exam files with OCR vision fallback and automatic memorandum schema merging.
+- **AI Tutoring Agent:** Dynamic, agentic conversation handling that avoids rigid rule-based logic to actively guide students.
+- **Exam Simulation & Grading Engine:** Automated structured parsing and processing of multi-format assessments with real-time student availability metrics.
+- **Student Progress Analytics:** Automated logging of student weaknesses, historical tracking, and personalized performance insight maps.
+- **RAG Architecture:** High-performance vector embeddings via FAISS for contextual curriculum textbook retrieval.
+- **Persistent Student Memory:** Dedicated structural storage utilizing local relational configurations for fast, stateful memory recall.
 
 ---
 
 ## How the AI Agent Works
 
-The system uses a loop where the AI can decide to call tools before responding.
+The architecture relies on a cyclic execution loop where the LLM evaluates user inputs and historical context, then elects to invoke specific tools prior to rendering a final token stream:
 
-Example flow:
-1. Student sends a message
-2. AI checks memory (weak topics, history)
-3. AI decides whether to:
-   - search theory
-   - generate a hint
-   - update study plan
-4. AI returns a final response
 
-This allows dynamic and personalised behaviour for each student.
-
----
-
-## API Endpoints
-
-Base URL (production):
 ```
 
-[https://abitonp.pythonanywhere.com](https://abitonp.pythonanywhere.com)
+```
+Student Input
+     │
+     ▼
 
-````
+```
 
-Main routes:
+┌───────────────┐
+│  Load Student │ <─── Syncs history, weak topics,
+│    Context    │      and CAPS tracking profile
+└───────┬───────┘
+│
+▼
+┌───────────────┐
+│ Agent Loop    ├─► [Tool Invoke: Vector Search Curriculum]
+│ Evaluation    ├─► [Tool Invoke: Calculate Weak Metrics]
+└───────┬───────┘─► [Tool Invoke: Adjust Personalized Study Plan]
+│
+▼
+Final Output ──────► Streaming response back to Frontend
 
-- `POST /agent-chat` → chat with AI agent
-- `POST /start-exam` → start exam session
-- `POST /question` → get a question
-- `POST /answer` → save an answer
-- `POST /submit` → submit and mark exam
-- `POST /dashboard` → get student progress
-- `POST /clear-history` → reset conversation
-
----
-
-## Memory System (SQLite)
-
-The backend stores student data locally in SQLite:
-
-- students → identity
-- sessions → exam results
-- weak_questions → tracks mistakes
-- conversation_history → chat logs
-- study_plan → personalised plan
-
-This memory is used by the AI on every request.
-
----
-
-## Exam Engine
-
-Supports:
-
-- Multiple Choice (exact match)
-- True/False
-- Matching questions
-- Open-ended questions (AI marking)
-
-Each question contains its own memo (`q["memo"]`), ensuring correct marking.
-
----
-
-## RAG (Theory Search)
-
-- Uses FAISS for similarity search
-- Retrieves relevant textbook content
-- Injects context into AI responses
+```
 
 ---
 
 ## Tech Stack
 
-- Python (Flask)
-- Groq LLM (llama-3.3-70b)
-- SQLite
-- FAISS
+* **Core Engine:** Python 3.10+ / Flask Framework
+* **Orchestration & AI Models:** Groq API SDK (`llama-3.3-70b-versatile` & `llama-4-scout-17b` for Vision OCR fallback)
+* **Vector Stores:** FAISS (Facebook AI Similarity Search)
+* **Cloud Infrastructure & Integrations:** Firebase Admin SDK (Cloud Firestore & Firebase Storage)
+* **Document Processing:** PyMuPDF (`fitz`), `python-docx`, `mammoth`, `odfpy`
+* **Local Identity Storage:** SQLite3
+
+---
+
+## API Endpoints
+
+**Base URL (Production):** `https://abitonp.pythonanywhere.com`
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/` | System heartbeat, health checks, and engine metadata. |
+| `POST` | `/auto-extract` | Manual fallback route to force trigger document parsing for an exam ID. |
+| `POST` | `/start-exam` | Initializes an active student assessment session block. |
+| `POST` | `/agent-chat` | Dispatches user conversational tokens directly to the AI agent loop. |
+| `POST` | `/question` | Fetches a cleanly formatted target question schema block for a student. |
+| `POST` | `/answer` | Commits individual question submission states for state preservation. |
+| `POST` | `/submit` | Aggregates all session answers, triggers AI marking evaluations, and commits grades. |
+| `POST` | `/dashboard` | Computes complex analytical metrics, weak content vectors, and study history. |
+| `POST` | `/clear-history` | flushes the current context stack to restart a fresh tutoring chat loop. |
+
+---
+
+## Document & Extraction Architecture
+
+The processing architecture handles complex layouts, including columns, matching tables, and embedded images, through a strict verification pipeline:
+
+1. **Change Interception:** Firestore collection group listeners (`teacherExamUploads/{schoolId}/subjects/{subject}`) monitor and flag files marked as `pending_extraction`.
+2. **Structural Parse:** The pipeline reads native OpenXML components (`.docx`) or uses PyMuPDF layout streams.
+3. **Vision Fallback:** Scanned components or structural failures automatically bypass to an OCR vision model chunking sequence via Groq.
+4. **Memorandum Merge:** Documents undergo simultaneous parsing where questions are automatically mapped to their corresponding memorandum keys via string-distance and numbering normalization techniques (`_normalise_qnum`).
+5. **Batch Transaction:** The pipeline chunks data structures into sequential blocks under the 500-document limit for atomic transactions inside Cloud Firestore.
+
+---
+
+## Database Schema (Local SQLite Layer)
+
+For localized performance or lightweight state caching, the following core tables are generated automatically at startup:
+
+* **`students`** — Preserves identity tokens, classroom profiles, and school contextual settings.
+* **`sessions`** — Tracks comprehensive telemetry on completed and in-progress exams.
+* **`weak_questions`** — Catalogs failed question codes to prioritize item generation inside the remediation loops.
+* **`conversation_history`** — Persistent, rolling storage for chat histories.
+* **`study_plan`** — Highly personalized structural maps generated by the AI to pinpoint topics requiring attention.
 
 ---
 
 ## Local Setup
 
+### 1. Clone the Repository
 ```bash
-git clone https://github.com/your-repo.git
+git clone [https://github.com/abiton198.git](https://github.com/abiton198.git)
 cd your-repo
 
-pip install flask flask-cors groq python-dotenv faiss-cpu
+```
 
-echo "GROQ_API_KEY=your_key" > .env
+### 2. Install Dependencies
 
+Ensure you have system-level library configurations ready for processing binary formats, then install the Python dependencies:
+
+```bash
+pip install flask flask-cors groq python-dotenv faiss-cpu python-docx pymupdf mammoth odfpy firebase-admin requests
+
+```
+
+### 3. Environment Variables Configuration
+
+Create a `.env` file in the root working directory:
+
+```env
+PORT=8000
+GROQ_API_KEY=your_groq_production_api_key_here
+FIREBASE_STORAGE_BUCKET=your-app.appspot.com
+FIREBASE_SERVICE_ACCOUNT_JSON={"type": "service_account", "project_id": ...}
+
+```
+
+### 4. Boot the Microservice
+
+```bash
 python app.py
-````
-
-Runs on:
 
 ```
-http://localhost:8000
-```
+
+The extraction API and agent endpoint will bind to: `http://localhost:8000`
 
 ---
 
-## Deployment
+## Deployment Configuration
 
-The backend is deployed on PythonAnywhere:
+When hosting on a shared provider like **PythonAnywhere**:
 
-* Flask app configured via WSGI
-* Environment variable for API key
-* SQLite database created automatically
+* Ensure your `WSGI` configuration file points accurately to your project directory and imports the `app` instance cleanly.
+* Set `debug=False` inside production startup configurations to prevent background threads from crashing or spinning duplicate event configurations.
+* Ensure your service account JSON environment variable is populated as a single-line string or point to a local system file layout.
 
 ---
 
 ## License
 
-MIT License
+This project is licensed under the MIT License - see the codebase defaults for details.
 
 ```
 
----
-
+```

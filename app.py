@@ -59,20 +59,27 @@ def _init_firebase():
     if firebase_admin._apps:
         return
     raw = (
-        os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
-        os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
-    )
-    if raw.strip():
-        cred = credentials.Certificate(json.loads(raw))
-    else:
-        cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred, {
-        "storageBucket": os.getenv(
-            "FIREBASE_STORAGE_BUCKET",
-            "eduket.firebasestorage.app"
-        )
-    })
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
+            os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
+    ).strip()
 
+    print(f"[firebase_init] raw length: {len(raw)}, has content: {bool(raw)}")
+
+    if raw:
+        try:
+            cred_dict = json.loads(raw)
+            print(f"[firebase_init] parsed OK, project: {cred_dict.get('project_id')}")
+            cred = credentials.Certificate(cred_dict)
+        except Exception as e:
+            print(f"[firebase_init] JSON parse FAILED: {e}")
+            raise  # ← don't silently fall back, crash loudly
+    else:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON env var is missing!")  # ← crash loudly
+
+    firebase_admin.initialize_app(cred, {
+        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", "eduket.firebasestorage.app")
+    })
+    print("[firebase_init] Firebase initialized successfully")
 
 _init_firebase()
 db     = fs_admin.client()

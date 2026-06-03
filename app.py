@@ -1032,8 +1032,7 @@ def list_exams():
     return jsonify({"exams": exams})
 
 
-@app.route("/start-exam", methods=["POST"])
-@app.route("/start_exam",  methods=["POST"])
+@app.route("/start_exam", methods=["POST"])
 def start_exam():
     try:
         data       = request.get_json() or {}
@@ -1049,8 +1048,11 @@ def start_exam():
             return jsonify({"error": "exam_id required"}), 400
 
         meta, questions = _load_exam(exam_id)
+
+        # ✅ Check meta FIRST before touching questions
         if meta is None:
             return jsonify({"error": f"Exam '{exam_id}' not found"}), 404
+
         if not questions:
             return jsonify({
                 "error": (
@@ -1059,6 +1061,10 @@ def start_exam():
                     "Please wait a minute and try again."
                 )
             }), 400
+
+        # Debug log (safe to remove once confirmed working)
+        for q in questions:
+            print(f"[START DEBUG] Q{q.get('question_number')} options: {q.get('options')}")
 
         sid = str(uuid.uuid4())
         _save_session(sid, {
@@ -1072,6 +1078,7 @@ def start_exam():
 
         return jsonify({
             "session_id":            sid,
+            "questions":             questions,
             "total_questions":       len(questions),
             "memo_merged":           meta.get("memoMerged", False),
             "subject":               meta.get("subject", ""),

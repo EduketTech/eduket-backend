@@ -46,6 +46,8 @@ from odf import text as odf_text
 from odf import teletype
 import mammoth
 from groq import Groq
+from gevent import monkey
+monkey.patch_all()
 
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION

@@ -31,3 +31,4 @@ groq
 python-docx
 odfpy
 mammoth
+gevent==23.9.1

@@ -47,7 +47,7 @@ from odf import teletype
 import mammoth
 from groq import Groq
 from gevent import monkey
-
+monkey.patch_all()
 
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
@@ -56,7 +56,7 @@ from gevent import monkey
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
 
-monkey.patch_all()
+
 
 def _init_firebase():
     raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()

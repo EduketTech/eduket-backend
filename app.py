@@ -950,41 +950,60 @@ def _delete_session(sid: str):
         pass
 
 
+import concurrent.futures
+
+
 def _load_exam(exam_id: str):
     """Load exam metadata + questions from Firestore."""
-    exam_doc = db.collection("exams").document(exam_id).get()
-    if not exam_doc.exists:
-        return None, []
-    meta = {**exam_doc.to_dict(), "id": exam_doc.id}
 
-    raw_qs = list(
-        db.collection("exam_questions")
-          .where("examId", "==", exam_id)
-          .stream()
-    )
-    raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
+    def _fetch():
+        exam_doc = db.collection("exams").document(exam_id).get()
+        if not exam_doc.exists:
+            return None, []
+        meta = {**exam_doc.to_dict(), "id": exam_doc.id}
 
-    questions = []
-    for q in raw_qs:
-        d       = q.to_dict()
-        options = d.get("options")
-        if isinstance(options, dict) and options:
-            options = [{"key": k, "value": v}
-                       for k, v in sorted(options.items())]
-        questions.append({
-            "question_number":  str(d.get("questionNumber", "")),
-            "parent_question":  d.get("parentQuestion", ""),
-            "parent_context":   d.get("parentContext"),
-            "section":          d.get("section", "A"),
-            "question":         d.get("questionText", ""),
-            "type":             d.get("type", "open").lower(),
-            "options":          options,
-            "column_a":         d.get("columnA"),
-            "column_b":         d.get("columnB"),
-            "marks":            d.get("marks", 1),
-            "memo":             d.get("memo", ""),
-        })
-    return meta, questions
+        raw_qs = list(
+            db.collection("exam_questions")
+            .where("examId", "==", exam_id)
+            .stream()
+        )
+        raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
+
+        questions = []
+        for q in raw_qs:
+            d = q.to_dict()
+            options = d.get("options")
+            if isinstance(options, dict) and options:
+                options = [{"key": k, "value": v}
+                           for k, v in sorted(options.items())]
+            questions.append({
+                "question_number": str(d.get("questionNumber", "")),
+                "parent_question": d.get("parentQuestion", ""),
+                "parent_context": d.get("parentContext"),
+                "section": d.get("section", "A"),
+                "question": d.get("questionText", ""),
+                "type": d.get("type", "open").lower(),
+                "options": options,
+                "column_a": d.get("columnA"),
+                "column_b": d.get("columnB"),
+                "marks": d.get("marks", 1),
+                "memo": d.get("memo", ""),
+            })
+        return meta, questions
+
+    print(f"[_load_exam] fetching exam_id={exam_id}")
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(_fetch)
+        try:
+            result = future.result(timeout=15)
+            print(f"[_load_exam] success — {len(result[1])} questions")
+            return result
+        except concurrent.futures.TimeoutError:
+            print("[_load_exam] TIMEOUT — Firestore unreachable after 15s")
+            raise Exception("Database timeout — please try again")
+        except Exception as e:
+            print(f"[_load_exam] ERROR: {e}")
+            raise
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -47,7 +47,7 @@ from odf import teletype
 import mammoth
 from groq import Groq
 from gevent import monkey
-monkey.patch_all()
+
 
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
@@ -56,32 +56,25 @@ monkey.patch_all()
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
 
+monkey.patch_all()
 
 def _init_firebase():
-    if firebase_admin._apps:
-        return
-    raw = (
-            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or
-            os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
-    ).strip()
+    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 
-    print(f"[firebase_init] raw length: {len(raw)}, has content: {bool(raw)}")
+    if not raw:
+        raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
 
-    if raw:
-        try:
-            cred_dict = json.loads(raw)
-            print(f"[firebase_init] parsed OK, project: {cred_dict.get('project_id')}")
-            cred = credentials.Certificate(cred_dict)
-        except Exception as e:
-            print(f"[firebase_init] JSON parse FAILED: {e}")
-            raise  # ← don't silently fall back, crash loudly
+    # If it's a file path, read it
+    if os.path.exists(raw):
+        with open(raw) as f:
+            cred_dict = json.load(f)
     else:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON env var is missing!")  # ← crash loudly
+        cred_dict = json.loads(raw)  # assume raw JSON string
 
+    cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred, {
-        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", "eduket.firebasestorage.app")
+        "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET")
     })
-    print("[firebase_init] Firebase initialized successfully")
 
 _init_firebase()
 db     = fs_admin.client()

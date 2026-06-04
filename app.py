@@ -85,16 +85,19 @@ bucket = storage.bucket()
 
 app = Flask(__name__)
 
-CORS(app, resources={r"/*": {"origins": [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://localhost:5175",
-    "http://localhost:5176",
-    "http://localhost:5177",
-    "https://eduket.netlify.app",
-    re.compile(r"^https://.*\.netlify\.app$"),
-]}}, supports_credentials=True)
+CORS(app, resources={r"/*": {
+    "origins": [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "http://localhost:5176",
+        "http://localhost:5177",
+        "https://eduket.netlify.app",
+    ],
+    "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"],
+}}, supports_credentials=False)
 
 # ═══════════════════════════════════════════════════════════════
 # THREAD-SAFE PROCESSING TRACKER
@@ -1044,6 +1047,7 @@ def start_exam():
         student_id = data.get("student_id", "anonymous")
 
         print(f"[start_exam] exam='{exam_id}' student='{student_id}'")
+
 
         if not exam_id:
             return jsonify({"error": "exam_id required"}), 400

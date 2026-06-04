@@ -3,3 +3,4 @@ worker_class = "gevent"
 workers = 2
 timeout = 120
 loglevel = "debug"
+preload_app = False

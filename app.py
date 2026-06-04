@@ -46,7 +46,7 @@ from odf import text as odf_text
 from odf import teletype
 import mammoth
 from groq import Groq
-
+import signal
 
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
@@ -954,21 +954,31 @@ import concurrent.futures
 
 
 def _load_exam(exam_id: str):
-    """Load exam metadata + questions from Firestore."""
+    def _timeout_handler(signum, frame):
+        raise TimeoutError("Firestore timed out after 15s")
 
-    def _fetch():
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(15)  # 15 second timeout
+
+    try:
+        print(f"[_load_exam] fetching {exam_id}", flush=True)
         exam_doc = db.collection("exams").document(exam_id).get()
-        if not exam_doc.exists:
-            return None, []
-        meta = {**exam_doc.to_dict(), "id": exam_doc.id}
+        print(f"[_load_exam] got exam doc", flush=True)
 
+        if not exam_doc.exists:
+            signal.alarm(0)
+            return None, []
+
+        meta = {**exam_doc.to_dict(), "id": exam_doc.id}
         raw_qs = list(
             db.collection("exam_questions")
             .where("examId", "==", exam_id)
             .stream()
         )
-        raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
+        signal.alarm(0)  # cancel timeout
+        print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
 
+        raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
         questions = []
         for q in raw_qs:
             d = q.to_dict()
@@ -991,19 +1001,14 @@ def _load_exam(exam_id: str):
             })
         return meta, questions
 
-    print(f"[_load_exam] fetching exam_id={exam_id}")
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_fetch)
-        try:
-            result = future.result(timeout=15)
-            print(f"[_load_exam] success — {len(result[1])} questions")
-            return result
-        except concurrent.futures.TimeoutError:
-            print("[_load_exam] TIMEOUT — Firestore unreachable after 15s")
-            raise Exception("Database timeout — please try again")
-        except Exception as e:
-            print(f"[_load_exam] ERROR: {e}")
-            raise
+    except TimeoutError:
+        signal.alarm(0)
+        print("[_load_exam] FIRESTORE TIMEOUT", flush=True)
+        raise Exception("Database timeout — Firestore unreachable")
+    except Exception as e:
+        signal.alarm(0)
+        print(f"[_load_exam] ERROR: {e}", flush=True)
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════

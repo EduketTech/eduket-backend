@@ -966,7 +966,7 @@ def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
     try:
-        ref = db.collection("exams").document(exam_id)
+        ref = db.collection("exams").document(exam_id).collection("questions").document(f"{i:04d}")
 
         print("[_load_exam] before get", flush=True)
 

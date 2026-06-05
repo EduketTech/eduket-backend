@@ -979,12 +979,11 @@ def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
     try:
-        ref = db.collection("exams").document(exam_id).collection("questions").document(f"{i:04d}")
+        # ✅ FIX: Target the main exam document directly, removing the undefined 'i' variable
+        ref = db.collection("exams").document(exam_id)
 
         print("[_load_exam] before get", flush=True)
-
         exam_doc = ref.get()
-
         print("[_load_exam] after get", flush=True)
     except Exception as e:
         print(f"[_load_exam] Firestore get() failed: {e}", flush=True)
@@ -1002,6 +1001,7 @@ def _load_exam(exam_id: str):
         return meta, []
 
     try:
+        # Pulls questions successfully from the root-level "exam_questions" collection
         raw_qs = list(
             db.collection("exam_questions")
               .where("examId", "==", exam_id)

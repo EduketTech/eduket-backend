@@ -966,9 +966,13 @@ def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
     try:
-        exam_doc = db.collection("exams").document(exam_id).get(
-            timeout=10  # ← fail fast, don't hang gunicorn worker
-        )
+        ref = db.collection("exams").document(exam_id)
+
+        print("[_load_exam] before get", flush=True)
+
+        exam_doc = ref.get()
+
+        print("[_load_exam] after get", flush=True)
     except Exception as e:
         print(f"[_load_exam] Firestore get() failed: {e}", flush=True)
         raise Exception(f"Firestore unreachable: {e}")

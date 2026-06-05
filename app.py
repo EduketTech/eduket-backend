@@ -934,12 +934,6 @@ def _sweep_pending_on_startup():
     print(f"[Startup] Launched {launched} missed extraction(s)")
 
 
-_start_auto_extraction_listener()
-_sweep_pending_on_startup()
-
-
-# ═══════════════════════════════════════════════════════════════
-# EXAM SESSION (in-memory, backed by Firestore)
 # ═══════════════════════════════════════════════════════════════
 
 def _save_session(sid: str, data: dict):
@@ -1279,7 +1273,7 @@ def get_results(exam_id, student_id):
             db.collection("exam_attempts")
               .where("examId",    "==", exam_id)
               .where("studentId", "==", student_id)
-              .order_by("completedAt", direction=fs_admin.Query.DESCENDING)
+              .order_by("completedAt", direction="DESCENDING")
               .limit(1)
               .stream()
         )

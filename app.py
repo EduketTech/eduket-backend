@@ -93,7 +93,6 @@ def _init_firebase():
             "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET")
         })
 
-    _init_firebase()
     db = fs_admin.client()
     bucket = storage.bucket()
     print("[Firebase] ✅ Ready")
@@ -1424,6 +1423,15 @@ def handle_options():
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return response
+
+
+try:
+    _init_firebase()
+except Exception as e:
+    import traceback; traceback.print_exc()
+    raise SystemExit(1)
+
+_start_auto_extraction_listener()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))

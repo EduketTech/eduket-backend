@@ -961,58 +961,53 @@ def _delete_session(sid: str):
     except Exception:
         pass
 
-def _load_exam(exam_id: str):
-    def _fetch_exam():
-        print(f"[_load_exam] fetching {exam_id}", flush=True)
-        exam_doc = db.collection("exams").document(exam_id).get()
-        print(f"[_load_exam] got exam doc exists={exam_doc.exists}", flush=True)
-        if not exam_doc.exists:
-            return None, []
-        meta = {**exam_doc.to_dict(), "id": exam_doc.id}
-        print(f"[_load_exam] fetching questions...", flush=True)
-        raw_qs = list(
-            db.collection("exam_questions")
-              .where("examId", "==", exam_id)
-              .stream()
-        )
-        print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
-        raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
-        questions = []
-        for q in raw_qs:
-            d = q.to_dict()
-            options = d.get("options")
-            if isinstance(options, dict) and options:
-                options = [{"key": k, "value": v}
-                           for k, v in sorted(options.items())]
-            questions.append({
-                "question_number": str(d.get("questionNumber", "")),
-                "parent_question": d.get("parentQuestion", ""),
-                "parent_context":  d.get("parentContext"),
-                "section":         d.get("section", "A"),
-                "question":        d.get("questionText", ""),
-                "type":            d.get("type", "open").lower(),
-                "options":         options,
-                "column_a":        d.get("columnA"),
-                "column_b":        d.get("columnB"),
-                "marks":           d.get("marks", 1),
-                "memo":            d.get("memo", ""),
-            })
-        return meta, questions
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_fetch_exam)
-    try:
-        result = future.result(timeout=20)
-        print(f"[_load_exam] done!", flush=True)
-        return result
-    except concurrent.futures.TimeoutError:
-        print("[_load_exam] TIMEOUT after 20s", flush=True)
-        raise Exception("Database timeout — Firestore unreachable after 20s")
-    except Exception as e:
-        print(f"[_load_exam] ERROR: {e}", flush=True)
-        raise
-    finally:
-        executor.shutdown(wait=False)
+def _load_exam(exam_id: str):
+    print(f"[_load_exam] fetching {exam_id}", flush=True)
+
+    exam_doc = db.collection("exams").document(exam_id).get()
+    print(f"[_load_exam] exam exists={exam_doc.exists}", flush=True)
+
+    if not exam_doc.exists:
+        return None, []
+
+    meta = {**exam_doc.to_dict(), "id": exam_doc.id}
+
+    # Check status before fetching questions
+    if meta.get("status") != "ready":
+        print(f"[_load_exam] status={meta.get('status')} — not ready yet")
+        return meta, []
+
+    raw_qs = list(
+        db.collection("exam_questions")
+        .where("examId", "==", exam_id)
+        .stream()
+    )
+    print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
+    raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
+
+    questions = []
+    for q in raw_qs:
+        d = q.to_dict()
+        options = d.get("options")
+        if isinstance(options, dict) and options:
+            options = [{"key": k, "value": v}
+                       for k, v in sorted(options.items())]
+        questions.append({
+            "question_number": str(d.get("questionNumber", "")),
+            "parent_question": d.get("parentQuestion", ""),
+            "parent_context": d.get("parentContext"),
+            "section": d.get("section", "A"),
+            "question": d.get("questionText", ""),
+            "type": d.get("type", "open").lower(),
+            "options": options,
+            "column_a": d.get("columnA"),
+            "column_b": d.get("columnB"),
+            "marks": d.get("marks", 1),
+            "memo": d.get("memo", ""),
+        })
+
+    return meta, questions
 
 # ═══════════════════════════════════════════════════════════════
 # ROUTES

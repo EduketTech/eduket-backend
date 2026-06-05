@@ -58,27 +58,45 @@ from firebase_admin import credentials, firestore as fs_admin, storage
 
 
 
+db = None      # declare at module level so references don't NameError
+bucket = None
 def _init_firebase():
-    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    global db, bucket
 
+    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
         raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
 
-    # If it's a file path, read it
     if os.path.exists(raw):
         with open(raw) as f:
             cred_dict = json.load(f)
     else:
-        cred_dict = json.loads(raw)  # assume raw JSON string
+        cred_dict = json.loads(raw)
 
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred, {
-        "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET")
-    })
+    # ✅ Fix for Render/Heroku: unescape private key newlines if mangled
+    if "private_key" in cred_dict:
+        cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
 
-_init_firebase()
-db     = fs_admin.client()
-bucket = storage.bucket()
+    # Validate before attempting connection
+    required = ["type", "project_id", "private_key", "client_email"]
+    missing = [k for k in required if not cred_dict.get(k)]
+    if missing:
+        raise ValueError(f"Credential dict missing: {missing}")
+
+    print(f"[Firebase] project_id: {cred_dict['project_id']}")
+    print(f"[Firebase] client_email: {cred_dict['client_email']}")
+    print(f"[Firebase] private_key newlines: {cred_dict['private_key'].count(chr(10))}")
+
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred, {
+            "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET")
+        })
+
+    _init_firebase()
+    db = fs_admin.client()
+    bucket = storage.bucket()
+    print("[Firebase] ✅ Ready")
 
 # ═══════════════════════════════════════════════════════════════
 # APP + CORS

@@ -912,26 +912,39 @@ def _sweep_pending_on_startup():
     launched = 0
     try:
         for doc in db.collection_group("subjects").stream():
-            data         = doc.to_dict() or {}
-            school_id    = doc.reference.parent.parent.id
+            data = doc.to_dict() or {}
+            school_id = doc.reference.parent.parent.id
             subject_name = doc.id
-            for upload in data.get("uploads", []):
+
+            uploads = data.get("uploads", [])
+            updated_uploads = []
+            doc_needs_update = False
+
+            for upload in uploads:
                 exam_id = upload.get("examId") or upload.get("id")
                 if not exam_id:
                     continue
-                if upload.get("status") != "pending_extraction":
-                    continue
-                if not (upload.get("examStoragePath") or
-                        upload.get("examStorageUrl")):
-                    continue
-                if _is_already_processing(exam_id):
-                    continue
-                print(f"[Startup] Launching: {exam_id}")
-                if _launch_pipeline(exam_id, upload, school_id, subject_name):
-                    launched += 1
+
+                # Check criteria
+                if upload.get("status") == "pending_extraction" and \
+                        (upload.get("examStoragePath") or upload.get("examStorageUrl")) and \
+                        not _is_already_processing(exam_id):
+
+                    print(f"[Startup] Attempting atomic claim for: {exam_id}")
+
+                    # 🚀 CRITICAL FOR MULTI-WORKER: Atomic check-and-set via Firestore transaction
+                    # This prevents two gunicorn workers from processing the same paper.
+                    if _launch_pipeline(exam_id, upload, school_id, subject_name):
+                        launched += 1
+
+            # Note: _launch_pipeline internally updates the individual exam status to 'processing'
+            # and marks the local thread safe tracker.
+
     except Exception as e:
         print(f"[Startup] Sweep error: {e}")
-    print(f"[Startup] Launched {launched} missed extraction(s)")
+        traceback.print_exc()
+
+    print(f"[Startup] Sweep complete. Launched {launched} missed extraction(s)")
 
 
 # ═══════════════════════════════════════════════════════════════

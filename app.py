@@ -965,24 +965,35 @@ def _delete_session(sid: str):
 def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
-    exam_doc = db.collection("exams").document(exam_id).get()
-    print(f"[_load_exam] exam exists={exam_doc.exists}", flush=True)
+    try:
+        exam_doc = db.collection("exams").document(exam_id).get(
+            timeout=10  # ← fail fast, don't hang gunicorn worker
+        )
+    except Exception as e:
+        print(f"[_load_exam] Firestore get() failed: {e}", flush=True)
+        raise Exception(f"Firestore unreachable: {e}")
+
+    print(f"[_load_exam] exists={exam_doc.exists}", flush=True)
 
     if not exam_doc.exists:
         return None, []
 
     meta = {**exam_doc.to_dict(), "id": exam_doc.id}
 
-    # Check status before fetching questions
     if meta.get("status") != "ready":
-        print(f"[_load_exam] status={meta.get('status')} — not ready yet")
+        print(f"[_load_exam] not ready: status={meta.get('status')}")
         return meta, []
 
-    raw_qs = list(
-        db.collection("exam_questions")
-        .where("examId", "==", exam_id)
-        .stream()
-    )
+    try:
+        raw_qs = list(
+            db.collection("exam_questions")
+              .where("examId", "==", exam_id)
+              .stream(timeout=10)
+        )
+    except Exception as e:
+        print(f"[_load_exam] questions fetch failed: {e}", flush=True)
+        raise Exception(f"Questions fetch failed: {e}")
+
     print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
     raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
 
@@ -996,15 +1007,15 @@ def _load_exam(exam_id: str):
         questions.append({
             "question_number": str(d.get("questionNumber", "")),
             "parent_question": d.get("parentQuestion", ""),
-            "parent_context": d.get("parentContext"),
-            "section": d.get("section", "A"),
-            "question": d.get("questionText", ""),
-            "type": d.get("type", "open").lower(),
-            "options": options,
-            "column_a": d.get("columnA"),
-            "column_b": d.get("columnB"),
-            "marks": d.get("marks", 1),
-            "memo": d.get("memo", ""),
+            "parent_context":  d.get("parentContext"),
+            "section":         d.get("section", "A"),
+            "question":        d.get("questionText", ""),
+            "type":            d.get("type", "open").lower(),
+            "options":         options,
+            "column_a":        d.get("columnA"),
+            "column_b":        d.get("columnB"),
+            "marks":           d.get("marks", 1),
+            "memo":            d.get("memo", ""),
         })
 
     return meta, questions

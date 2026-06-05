@@ -1425,13 +1425,16 @@ def handle_options():
         return response
 
 
+# ── Startup sequence ──────────────────────────────────────────
 try:
     _init_firebase()
 except Exception as e:
-    import traceback; traceback.print_exc()
+    traceback.print_exc()
     raise SystemExit(1)
 
+_sweep_pending_on_startup()
 _start_auto_extraction_listener()
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))

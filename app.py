@@ -49,15 +49,29 @@ from groq import Groq
 # import signal
 import concurrent.futures
 
-
-# ═══════════════════════════════════════════════════════════════
-# FIREBASE INITIALIZATION
-# ═══════════════════════════════════════════════════════════════
-
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
 
 
+
+FIRESTORE_TIMEOUT = 15  # seconds
+
+# ─── Firestore timeout wrapper ────────────────────────────────────────────────
+def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
+    """
+    Runs any Firestore call in an isolated thread.
+    Prevents gRPC from deadlocking gunicorn's gthread worker pool.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise Exception(f"Firestore timeout after {timeout}s — check gRPC/credentials")
+
+# ═══════════════════════════════════════════════════════════════
+# FIREBASE INITIALIZATION
+# ═══════════════════════════════════════════════════════════════
 
 db = None      # declare at module level so references don't NameError
 bucket = None
@@ -975,22 +989,6 @@ def _delete_session(sid: str):
         db.collection("exam_sessions").document(sid).delete()
     except Exception:
         pass
-
-
-FIRESTORE_TIMEOUT = 15  # seconds
-
-# ─── Firestore timeout wrapper ────────────────────────────────────────────────
-def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
-    """
-    Runs any Firestore call in an isolated thread.
-    Prevents gRPC from deadlocking gunicorn's gthread worker pool.
-    """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise Exception(f"Firestore timeout after {timeout}s — check gRPC/credentials")
 
 
 # ─── Load exam + questions ────────────────────────────────────────────────────

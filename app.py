@@ -15,6 +15,8 @@ FEATURES
 """
 
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
+
 load_dotenv()
 
 import os
@@ -962,6 +964,9 @@ def _sweep_pending_on_startup():
 
 
 # ═══════════════════════════════════════════════════════════════
+# SAVE MEMORY Session
+# =========================================================
+
 def _save_session(sid: str, payload: dict):
     print(f"[_save_session] saving {sid}", flush=True)
     db.collection("exam_sessions").document(sid).set(payload)
@@ -1187,39 +1192,38 @@ def save_answer():
 def submit_exam():
     try:
         data       = request.get_json() or {}
-        sid        = data.get("session_id")
+        exam_id    = data.get("exam_id", "").strip()
         student_id = data.get("student_id", "anonymous")
-        session    = _get_session(sid)
+        answers    = data.get("answers", {})
 
-        if not session:
-            return jsonify({"error": "Invalid or expired session"}), 400
+        print(f"[submit] exam={exam_id} student={student_id} answers={len(answers)}", flush=True)
 
-        subject   = session.get("subject", "General")
-        questions = session.get("questions", [])
-        answers   = session.get("answers", {})
-        exam_id   = session.get("exam_id", "")
+        if not exam_id:
+            return jsonify({"error": "exam_id required"}), 400
 
+        # Load exam fresh — no session needed
+        meta, questions = _load_exam(exam_id)
+        if not questions:
+            return jsonify({"error": "Exam not found or has no questions"}), 404
+
+        subject     = meta.get("subject", "General")
         total_score = 0.0
         total_marks = 0.0
         results     = []
 
         for i, q in enumerate(questions):
-            q_num        = q.get("question_number", f"Q{i+1}")
-            q_type       = q.get("type", "open").lower()
-            marks        = float(q.get("marks") or 1)
-            memo         = q.get("memo", "")
-            student_ans  = answers.get(str(i), "").strip()
+            q_num       = q.get("question_number", f"Q{i+1}")
+            q_type      = q.get("type", "open").lower()
+            marks       = float(q.get("marks") or 1)
+            memo        = q.get("memo", "")
+            student_ans = str(answers.get(str(i), "")).strip()
             total_marks += marks
 
-            # Resolve options for MCQ display
             options = q.get("options")
             if isinstance(options, list) and options and isinstance(options[0], dict):
                 options = {o["key"]: o["value"] for o in options}
 
-            # ── Mark the answer ───────────────────────────────────────
             marked = mark_with_memo(student_ans, memo, marks)
-
-            # No memo or no match — use AI
             if marked is None:
                 marked = mark_with_ai(
                     q.get("question", ""),
@@ -1232,7 +1236,6 @@ def submit_exam():
             earned       = float(marked.get("score", 0))
             total_score += earned
 
-            # Format correct answer for display
             correct_display = memo if memo else "Not available"
             if memo and q_type == "mcq" and isinstance(options, dict):
                 letter = str(memo).strip().upper()
@@ -1259,23 +1262,7 @@ def submit_exam():
         percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
         feedback   = generate_final_feedback(percentage, results, subject)
 
-        # Save attempt to Firestore
-        try:
-            db.collection("exam_attempts").add({
-                "examId":      exam_id,
-                "studentId":   student_id,
-                "subject":     subject,
-                "score":       total_score,
-                "total":       total_marks,
-                "percentage":  percentage,
-                "results":     results,
-                "feedback":    feedback,
-                "completedAt": fs_admin.SERVER_TIMESTAMP,
-            })
-        except Exception as e:
-            print(f"[submit] Could not save attempt: {e}")
-
-        _delete_session(sid)
+        print(f"[submit] ✅ {total_score}/{total_marks} = {percentage}%", flush=True)
 
         return jsonify({
             "score":      total_score,

@@ -49,6 +49,7 @@ from groq import Groq
 # import signal
 import concurrent.futures
 
+
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
@@ -975,22 +976,34 @@ def _delete_session(sid: str):
         pass
 
 
+
+FIRESTORE_TIMEOUT = 15  # seconds
+
+def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
+    """Run a Firestore call in a fresh thread with a hard timeout."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise Exception(f"Firestore timeout after {timeout}s")
+
+
 def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
-    try:
-        # ✅ FIX: Target the main exam document directly, removing the undefined 'i' variable
-        ref = db.collection("exams").document(exam_id)
+    # ── 1. Fetch exam document ──────────────────────────────────────────────
+    ref = db.collection("exams").document(exam_id)
 
-        print("[_load_exam] before get", flush=True)
-        exam_doc = ref.get()
-        print("[_load_exam] after get", flush=True)
+    print("[_load_exam] before get", flush=True)
+    try:
+        exam_doc = _run_with_timeout(lambda: ref.get())
     except Exception as e:
         print(f"[_load_exam] Firestore get() failed: {e}", flush=True)
         raise Exception(f"Firestore unreachable: {e}")
+    print("[_load_exam] after get", flush=True)
 
     print(f"[_load_exam] exists={exam_doc.exists}", flush=True)
-
     if not exam_doc.exists:
         return None, []
 
@@ -1000,18 +1013,22 @@ def _load_exam(exam_id: str):
         print(f"[_load_exam] not ready: status={meta.get('status')}")
         return meta, []
 
+    # ── 2. Fetch questions ──────────────────────────────────────────────────
+    print("[_load_exam] before questions fetch", flush=True)
     try:
-        # Pulls questions successfully from the root-level "exam_questions" collection
-        raw_qs = list(
-            db.collection("exam_questions")
-              .where("examId", "==", exam_id)
-              .stream(timeout=10)
+        raw_qs = _run_with_timeout(
+            lambda: list(
+                db.collection("exam_questions")
+                  .where("examId", "==", exam_id)
+                  .stream()          # ← drop timeout= arg; outer wrapper handles it
+            )
         )
     except Exception as e:
         print(f"[_load_exam] questions fetch failed: {e}", flush=True)
         raise Exception(f"Questions fetch failed: {e}")
-
     print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
+
+    # ── 3. Build question list (pure Python, no Firestore) ──────────────────
     raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
 
     questions = []

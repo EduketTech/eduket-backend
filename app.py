@@ -965,9 +965,7 @@ def _sweep_pending_on_startup():
 # ═══════════════════════════════════════════════════════════════
 def _save_session(sid: str, payload: dict):
     print(f"[_save_session] saving {sid}", flush=True)
-    _run_with_timeout(
-        lambda: db.collection("exam_sessions").document(sid).set(payload)
-    )
+    db.collection("exam_sessions").document(sid).set(payload)
     print(f"[_save_session] saved", flush=True)
 
 

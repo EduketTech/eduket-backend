@@ -1,7 +1,5 @@
+workers = 1
+worker_class = "sync"
+threads = 1
 bind = "0.0.0.0:10000"
-worker_class = "gthread"
-workers = 2
-threads = 4
 timeout = 120
-loglevel = "debug"
-preload_app = False

@@ -53,22 +53,22 @@ import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
 
 
-
-FIRESTORE_TIMEOUT = 15  # seconds
-
-# ─── Firestore timeout wrapper ────────────────────────────────────────────────
-def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
-    """
-    Runs any Firestore call in an isolated thread.
-    Prevents gRPC from deadlocking gunicorn's gthread worker pool.
-    """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise Exception(f"Firestore timeout after {timeout}s — check gRPC/credentials")
-
+#
+# FIRESTORE_TIMEOUT = 15  # seconds
+#
+# # ─── Firestore timeout wrapper ────────────────────────────────────────────────
+# def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
+#     """
+#     Runs any Firestore call in an isolated thread.
+#     Prevents gRPC from deadlocking gunicorn's gthread worker pool.
+#     """
+#     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+#         future = ex.submit(fn)
+#         try:
+#             return future.result(timeout=timeout)
+#         except concurrent.futures.TimeoutError:
+#             raise Exception(f"Firestore timeout after {timeout}s — check gRPC/credentials")
+#
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
@@ -996,13 +996,8 @@ def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
     ref = db.collection("exams").document(exam_id)
-
     print("[_load_exam] before get", flush=True)
-    try:
-        exam_doc = _run_with_timeout(lambda: ref.get())
-    except Exception as e:
-        print(f"[_load_exam] ❌ get() failed: {e}", flush=True)
-        raise Exception(f"Firestore unreachable: {e}")
+    exam_doc = ref.get()
     print(f"[_load_exam] after get — exists={exam_doc.exists}", flush=True)
 
     if not exam_doc.exists:
@@ -1015,17 +1010,11 @@ def _load_exam(exam_id: str):
         return meta, []
 
     print("[_load_exam] fetching questions", flush=True)
-    try:
-        raw_qs = _run_with_timeout(
-            lambda: list(
-                db.collection("exam_questions")
-                  .where("examId", "==", exam_id)
-                  .stream()
-            )
-        )
-    except Exception as e:
-        print(f"[_load_exam] ❌ questions failed: {e}", flush=True)
-        raise Exception(f"Questions fetch failed: {e}")
+    raw_qs = list(
+        db.collection("exam_questions")
+          .where("examId", "==", exam_id)
+          .stream()
+    )
     print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
 
     raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))

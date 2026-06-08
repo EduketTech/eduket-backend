@@ -949,11 +949,12 @@ def _sweep_pending_on_startup():
 
 
 # ═══════════════════════════════════════════════════════════════
-
-def _save_session(sid: str, data: dict):
-    db.collection("exam_sessions").document(sid).set(
-        {**data, "createdAt": fs_admin.SERVER_TIMESTAMP}
+def _save_session(sid: str, payload: dict):
+    print(f"[_save_session] saving {sid}", flush=True)
+    _run_with_timeout(
+        lambda: db.collection("exam_sessions").document(sid).set(payload)
     )
+    print(f"[_save_session] saved", flush=True)
 
 
 def _get_session(sid: str) -> dict | None:
@@ -996,8 +997,8 @@ def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
 def _load_exam(exam_id: str):
     print(f"[_load_exam] fetching {exam_id}", flush=True)
 
-    # 1. Fetch exam document
     ref = db.collection("exams").document(exam_id)
+
     print("[_load_exam] before get", flush=True)
     try:
         exam_doc = _run_with_timeout(lambda: ref.get())
@@ -1015,22 +1016,20 @@ def _load_exam(exam_id: str):
         print(f"[_load_exam] not ready: status={meta.get('status')}", flush=True)
         return meta, []
 
-    # 2. Fetch questions
     print("[_load_exam] fetching questions", flush=True)
     try:
         raw_qs = _run_with_timeout(
             lambda: list(
                 db.collection("exam_questions")
                   .where("examId", "==", exam_id)
-                  .stream()          # ← no timeout= kwarg; handled by wrapper
+                  .stream()
             )
         )
     except Exception as e:
-        print(f"[_load_exam] ❌ questions fetch failed: {e}", flush=True)
+        print(f"[_load_exam] ❌ questions failed: {e}", flush=True)
         raise Exception(f"Questions fetch failed: {e}")
     print(f"[_load_exam] got {len(raw_qs)} questions", flush=True)
 
-    # 3. Build question list (pure Python — no Firestore calls here)
     raw_qs.sort(key=lambda d: d.to_dict().get("order", 0))
 
     questions = []

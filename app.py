@@ -646,7 +646,6 @@ Return ONLY valid JSON:
 
 def generate_final_feedback(percentage: float, results: list,
                              subject: str) -> str:
-    """Generate personalised exam feedback summary."""
     wrong   = [r for r in results if r.get("status") in ("incorrect", "missing")]
     partial = [r for r in results if r.get("status") == "partial"]
     gaps    = list({
@@ -669,12 +668,12 @@ def generate_final_feedback(percentage: float, results: list,
     if wrong:
         lines.append(
             f"Questions needing attention: "
-            f"{', '.join(r['questionNumber'] for r in wrong[:8])}."
+            f"{', '.join(str(r.get('question_number', '?')) for r in wrong[:8])}."
         )
     if partial:
         lines.append(
             f"Partially correct: "
-            f"{', '.join(r['questionNumber'] for r in partial[:5])} — "
+            f"{', '.join(str(r.get('question_number', '?')) for r in partial[:5])} — "
             f"expand your answers."
         )
     lines.append(f"Key concept gaps: {gap_summary}.")

@@ -1296,16 +1296,20 @@ def get_results(exam_id, student_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/autosave", methods=["POST"])
+@app.route("/autosave", methods=["POST", "OPTIONS"])
 def autosave_exam():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
     try:
         data       = request.get_json() or {}
-        exam_id    = data.get("examId")
-        student_id = data.get("studentId")
+        # Accept both naming conventions
+        exam_id    = data.get("exam_id") or data.get("examId", "")
+        student_id = data.get("student_id") or data.get("studentId", "")
         answers    = data.get("answers", {})
+
         if not exam_id or not student_id:
-            return jsonify({"error": "Missing examId or studentId"}), 400
+            return jsonify({"error": "Missing exam_id or student_id"}), 400
+
         db.collection("exam_autosaves").document(
             f"{exam_id}_{student_id}"
         ).set({
@@ -1314,8 +1318,10 @@ def autosave_exam():
             "answers":   answers,
             "updatedAt": fs_admin.SERVER_TIMESTAMP,
         }, merge=True)
+
         return jsonify({"success": True})
     except Exception as e:
+        print(f"[autosave] error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 

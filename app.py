@@ -1439,23 +1439,20 @@ def dashboard():
 
         print(f"[dashboard] student_id={student_id}", flush=True)
 
-        # ── 1. Weak topics — aggregate wrong answers from exam_attempts ──
+        # ── 1. Weak topics from exam_attempts ────────────────────────────
         try:
-            attempts = _run_with_timeout(
-                lambda: list(
-                    db.collection("exam_attempts")
-                      .where("studentId", "==", student_id)
-                      .stream()
-                )
+            attempts = list(
+                db.collection("exam_attempts")
+                  .where("studentId", "==", student_id)
+                  .stream()
             )
         except Exception as e:
             print(f"[dashboard] exam_attempts fetch failed: {e}", flush=True)
             attempts = []
 
-        # Build weak topic map from markedResults inside each attempt
-        weak_map = {}   # question_number → { wrong_count, question_text, q_type }
-        for doc in attempts:
-            d = doc.to_dict()
+        weak_map = {}
+        for attempt in attempts:
+            d = attempt.to_dict()
             for r in d.get("markedResults", []):
                 if r.get("status") == "correct":
                     continue
@@ -1472,13 +1469,12 @@ def dashboard():
                 weak_map[qnum]["wrong_count"] += 1
 
         weak = sorted(weak_map.values(), key=lambda x: x["wrong_count"], reverse=True)[:20]
+        print(f"[dashboard] weak topics={len(weak)}", flush=True)
 
-        # ── 2. Study plan — from student_profiles or study_plans collection ─
+        # ── 2. Study plan ─────────────────────────────────────────────────
         study_plan = None
         try:
-            plan_doc = _run_with_timeout(
-                lambda: db.collection("study_plans").document(student_id).get()
-            )
+            plan_doc = db.collection("study_plans").document(student_id).get()
             if plan_doc.exists:
                 pd = plan_doc.to_dict()
                 study_plan = {
@@ -1488,17 +1484,15 @@ def dashboard():
         except Exception as e:
             print(f"[dashboard] study_plan fetch failed: {e}", flush=True)
 
-        # ── 3. Session history — from agent_sessions collection ──────────
+        # ── 3. Session history ────────────────────────────────────────────
         session_history = []
         try:
-            sessions = _run_with_timeout(
-                lambda: list(
-                    db.collection("agent_sessions")
-                      .where("studentId", "==", student_id)
-                      .order_by("startedAt", direction=fs_admin.Query.DESCENDING)
-                      .limit(10)
-                      .stream()
-                )
+            sessions = list(
+                db.collection("agent_sessions")
+                  .where("studentId", "==", student_id)
+                  .order_by("startedAt", direction=fs_admin.Query.DESCENDING)
+                  .limit(10)
+                  .stream()
             )
             session_history = [
                 {
@@ -1510,10 +1504,9 @@ def dashboard():
                 for s in sessions
             ]
         except Exception as e:
-            # Collection may not exist yet — safe to return empty
             print(f"[dashboard] sessions fetch failed (ok if unused): {e}", flush=True)
 
-        print(f"[dashboard] weak={len(weak)} study_plan={'yes' if study_plan else 'no'} sessions={len(session_history)}", flush=True)
+        print(f"[dashboard] ✅ weak={len(weak)} plan={'yes' if study_plan else 'no'} sessions={len(session_history)}", flush=True)
 
         return jsonify({
             "student_id":      student_id,
@@ -1525,7 +1518,6 @@ def dashboard():
     except Exception as e:
         print(f"[dashboard] ❌ {e}", flush=True)
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 def cleanup_sessions():

@@ -477,7 +477,9 @@ def _similarity(a: str, b: str) -> float:
 def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
     """
     Mark against memo with partial credit.
-    Returns dict with score, status, feedback.
+    - Handles MCQ and True/False with exact logic
+    - For open/short answers: uses similarity then falls through to AI
+      for contextual marking that ignores spelling errors
     """
     s_norm = _normalise_text(student_answer)
     m_norm = _normalise_text(memo_answer)
@@ -493,7 +495,7 @@ def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
     if not m_norm:
         return None  # No memo — signal AI fallback
 
-    # Exact match
+    # ── Exact match after normalisation ──────────────────────────────────────
     if s_norm == m_norm:
         return {
             "score":       marks,
@@ -502,29 +504,7 @@ def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
             "concept_gap": "",
         }
 
-    sim = _similarity(s_norm, m_norm)
-
-    # Very close (>=85%) — full marks
-    if sim >= 0.85:
-        return {
-            "score":       marks,
-            "status":      "correct",
-            "feedback":    "Correct (closely matches memo).",
-            "concept_gap": "",
-        }
-
-    # Partial (60-84%) — half marks
-    if sim >= 0.60:
-        partial = round(marks * 0.5, 1)
-        return {
-            "score":       partial,
-            "status":      "partial",
-            "feedback":    f"Partially correct ({int(sim*100)}% match). "
-                           f"Memo: {memo_answer}",
-            "concept_gap": "Incomplete or imprecise answer.",
-        }
-
-    # MCQ: single letter check
+    # ── MCQ: single letter — strict exact match only ──────────────────────────
     if len(m_norm) == 1 and m_norm.isalpha():
         if s_norm.startswith(m_norm):
             return {
@@ -540,7 +520,7 @@ def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
             "concept_gap": "Wrong option selected.",
         }
 
-    # True/False check
+    # ── True/False — strict check ─────────────────────────────────────────────
     if m_norm in ("true", "false"):
         if s_norm.startswith(m_norm):
             return {
@@ -556,86 +536,102 @@ def mark_with_memo(student_answer: str, memo_answer: str, marks: float) -> dict:
             "concept_gap": "True/False answer incorrect.",
         }
 
-    # Keyword check — award partial if key words present
-    memo_words    = set(re.findall(r"\b\w{4,}\b", m_norm))
-    student_words = set(re.findall(r"\b\w{4,}\b", s_norm))
-    if memo_words:
-        keyword_match = len(memo_words & student_words) / len(memo_words)
-        if keyword_match >= 0.70:
-            return {
-                "score":       round(marks * keyword_match, 1),
-                "status":      "partial",
-                "feedback":    f"Contains key concepts but not complete. "
-                               f"Memo: {memo_answer}",
-                "concept_gap": "Missing some key points.",
-            }
-        if keyword_match >= 0.40:
-            return {
-                "score":       round(marks * 0.25, 1),
-                "status":      "partial",
-                "feedback":    f"Some relevant content but mostly incorrect. "
-                               f"Memo: {memo_answer}",
-                "concept_gap": "Significant gaps in understanding.",
-            }
+    # ── Similarity check for open/short answers ───────────────────────────────
+    sim = _similarity(s_norm, m_norm)
 
-    return {
-        "score":       0,
-        "status":      "incorrect",
-        "feedback":    f"Incorrect. Expected: {memo_answer}",
-        "concept_gap": "Core concept not demonstrated.",
-    }
+    # Very close match (>=75%) — full marks, spelling errors forgiven
+    if sim >= 0.75:
+        return {
+            "score":       marks,
+            "status":      "correct",
+            "feedback":    "Correct.",
+            "concept_gap": "",
+        }
+
+    # Moderate match (>=55%) — hand to AI for contextual check
+    # instead of blindly awarding partial marks based on word overlap
+    if sim >= 0.55:
+        return None  # AI will assess contextual meaning
+
+    # Low similarity — also hand to AI
+    # Keyword matching penalises paraphrasing and spelling errors
+    # so AI subject knowledge is more reliable here
+    return None  # AI fallback for full contextual marking
 
 
 def mark_with_ai(question: str, student_answer: str, marks: float,
                  subject: str, memo: str = "") -> dict:
     """
-    AI marking fallback used when no memo is available.
-    Uses Groq to assess answer quality against subject knowledge.
-    Supports partial marks allocation.
+    AI marking using contextual subject understanding.
+    - Ignores spelling errors, focuses on meaning
+    - Awards marks based on conceptual correctness
+    - Uses South African CAPS/NSC curriculum knowledge
     """
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    prompt = f"""You are an expert South African CAPS/NSC exam marker for {subject}.
+    prompt = f"""You are a senior South African CAPS/NSC examiner for {subject}.
 
-Mark the student answer fairly and strictly. Award partial marks where deserved.
+Your job is to mark a student's answer fairly based on CONCEPTUAL UNDERSTANDING, not perfect wording.
+
+CRITICAL MARKING RULES:
+1. IGNORE all spelling mistakes — if the intended meaning is clear, award marks
+2. IGNORE grammatical errors — focus on whether the student understands the concept
+3. Award marks for CORRECT MEANING even if different words are used
+4. A student who writes "compewter" instead of "computer" should NOT lose marks
+5. A student who writes "data is raw facts" instead of "data is unprocessed facts" SHOULD get marks — same concept
+6. Use your deep {subject} curriculum knowledge to identify if the student demonstrates understanding
+7. Be GENEROUS with partial marks — if the student shows partial understanding, award partial marks
 
 QUESTION: {question}
+
 MARKS AVAILABLE: {marks}
-MEMO/EXPECTED ANSWER: {memo if memo else "Not provided — use your subject expertise"}
+
+MEMO/EXPECTED ANSWER: {memo if memo else "Use your " + subject + " curriculum expertise to determine correctness"}
+
 STUDENT ANSWER: {student_answer if student_answer.strip() else "No answer provided"}
 
-Instructions:
-- Award full marks for complete correct answers
-- Award partial marks (e.g. {round(marks*0.5,1)} for {marks} marks) for partially correct answers
-- Award 0 for incorrect or missing answers
-- Be specific in feedback — mention what was right and what was missing
-- Concept gap: what key idea did the student miss?
+MARKING APPROACH:
+- First, identify the KEY CONCEPTS required by this question (ignore how they are spelled)
+- Then, check if the student's answer demonstrates those key concepts
+- Award full marks if all key concepts are present (even with spelling errors)
+- Award partial marks if some key concepts are present
+- Award 0 only if the answer is completely wrong or missing
 
-Return ONLY valid JSON:
+MARK ALLOCATION GUIDE for {marks} marks:
+- Full ({marks}): All required concepts present, meaning is correct
+- Partial ({round(marks * 0.5, 1)}): Some concepts present, partial understanding shown  
+- Minimal ({round(marks * 0.25, 1)}): Vague relevance but lacks key concepts
+- Zero (0): Completely incorrect, irrelevant, or no answer
+
+Return ONLY this exact JSON (no explanation, no markdown):
 {{
   "score": <number between 0 and {marks}>,
   "status": "<correct|partial|incorrect|missing>",
-  "feedback": "<specific examiner feedback>",
-  "concept_gap": "<what was missing or misunderstood>",
-  "model_answer": "<ideal answer>"
+  "feedback": "<specific feedback mentioning what concepts were correct and what was missing>",
+  "concept_gap": "<the specific concept the student missed or misunderstood, empty string if correct>",
+  "model_answer": "<a clear ideal answer a top student would write>"
 }}"""
 
     try:
-        resp  = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=600,
+            temperature=0.1,   # slight creativity for contextual understanding
+            max_tokens=800,
         )
         raw   = resp.choices[0].message.content.strip()
+
+        # Strip markdown fences if model wraps in ```json
+        raw   = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             result = json.loads(match.group())
-            # Clamp score to valid range
             result["score"] = max(0, min(float(result.get("score", 0)), marks))
             return result
+
     except Exception as e:
-        print(f"[AI Mark] Failed: {e}")
+        print(f"[AI Mark] Failed: {e}", flush=True)
 
     return {
         "score":        0,
@@ -1334,6 +1330,39 @@ def load_autosave(exam_id, student_id):
         answers = doc.to_dict().get("answers", {}) if doc.exists else {}
         return jsonify({"success": True, "answers": answers})
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/remark", methods=["POST", "OPTIONS"])
+def remark():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    try:
+        data    = request.get_json() or {}
+        rows    = data.get("results", [])
+        subject = data.get("subject", "General")
+
+        updated = []
+        for i, r in enumerate(rows):
+            student_ans = r.get("student_answer", "").strip()
+            memo        = r.get("correct_answer", "")
+            marks       = float(r.get("marks", 1))
+            question    = r.get("question", "")
+
+            marked = mark_with_memo(student_ans, memo, marks)
+            if marked is None:
+                marked = mark_with_ai(question, student_ans, marks, subject, memo)
+
+            updated.append({
+                "idx":      i,
+                "earned":   marked.get("score", 0),
+                "status":   marked.get("status", "incorrect"),
+                "feedback": marked.get("feedback", ""),
+            })
+
+        return jsonify({"results": updated})
+
+    except Exception as e:
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 

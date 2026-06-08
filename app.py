@@ -1439,6 +1439,108 @@ def trigger_extract(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/dashboard", methods=["POST", "OPTIONS"])
+def dashboard():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    try:
+        data = request.get_json(silent=True) or {}
+        student_id = data.get("student_id", "").strip()
+
+        if not student_id:
+            return jsonify({"error": "student_id required"}), 400
+
+        print(f"[dashboard] student_id={student_id}", flush=True)
+
+        # ── 1. Weak topics — aggregate wrong answers from exam_attempts ──
+        try:
+            attempts = _run_with_timeout(
+                lambda: list(
+                    db.collection("exam_attempts")
+                      .where("studentId", "==", student_id)
+                      .stream()
+                )
+            )
+        except Exception as e:
+            print(f"[dashboard] exam_attempts fetch failed: {e}", flush=True)
+            attempts = []
+
+        # Build weak topic map from markedResults inside each attempt
+        weak_map = {}   # question_number → { wrong_count, question_text, q_type }
+        for doc in attempts:
+            d = doc.to_dict()
+            for r in d.get("markedResults", []):
+                if r.get("status") == "correct":
+                    continue
+                qnum = str(r.get("question_number", ""))
+                if not qnum:
+                    continue
+                if qnum not in weak_map:
+                    weak_map[qnum] = {
+                        "question_number": qnum,
+                        "question_text":   r.get("question", ""),
+                        "q_type":          r.get("type", "open"),
+                        "wrong_count":     0,
+                    }
+                weak_map[qnum]["wrong_count"] += 1
+
+        weak = sorted(weak_map.values(), key=lambda x: x["wrong_count"], reverse=True)[:20]
+
+        # ── 2. Study plan — from student_profiles or study_plans collection ─
+        study_plan = None
+        try:
+            plan_doc = _run_with_timeout(
+                lambda: db.collection("study_plans").document(student_id).get()
+            )
+            if plan_doc.exists:
+                pd = plan_doc.to_dict()
+                study_plan = {
+                    "plan":       pd.get("plan", ""),
+                    "updated_at": str(pd.get("updatedAt", "")),
+                }
+        except Exception as e:
+            print(f"[dashboard] study_plan fetch failed: {e}", flush=True)
+
+        # ── 3. Session history — from agent_sessions collection ──────────
+        session_history = []
+        try:
+            sessions = _run_with_timeout(
+                lambda: list(
+                    db.collection("agent_sessions")
+                      .where("studentId", "==", student_id)
+                      .order_by("startedAt", direction=fs_admin.Query.DESCENDING)
+                      .limit(10)
+                      .stream()
+                )
+            )
+            session_history = [
+                {
+                    "session_id":    s.id,
+                    "started_at":    str(s.to_dict().get("startedAt", "")),
+                    "ended_at":      str(s.to_dict().get("endedAt", "")),
+                    "message_count": s.to_dict().get("messageCount", 0),
+                }
+                for s in sessions
+            ]
+        except Exception as e:
+            # Collection may not exist yet — safe to return empty
+            print(f"[dashboard] sessions fetch failed (ok if unused): {e}", flush=True)
+
+        print(f"[dashboard] weak={len(weak)} study_plan={'yes' if study_plan else 'no'} sessions={len(session_history)}", flush=True)
+
+        return jsonify({
+            "student_id":      student_id,
+            "weak":            weak,
+            "study_plan":      study_plan,
+            "session_history": session_history,
+        })
+
+    except Exception as e:
+        print(f"[dashboard] ❌ {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 def cleanup_sessions():
     from datetime import timedelta, timezone

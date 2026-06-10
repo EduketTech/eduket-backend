@@ -15,7 +15,6 @@ FEATURES
 """
 
 from dotenv import load_dotenv
-from sqlalchemy.orm import Session
 
 load_dotenv()
 
@@ -48,29 +47,11 @@ from odf import text as odf_text
 from odf import teletype
 import mammoth
 from groq import Groq
-# import signal
-import concurrent.futures
 
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
 
 
-#
-# FIRESTORE_TIMEOUT = 15  # seconds
-#
-# # ─── Firestore timeout wrapper ────────────────────────────────────────────────
-# def _run_with_timeout(fn, timeout=FIRESTORE_TIMEOUT):
-#     """
-#     Runs any Firestore call in an isolated thread.
-#     Prevents gRPC from deadlocking gunicorn's gthread worker pool.
-#     """
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-#         future = ex.submit(fn)
-#         try:
-#             return future.result(timeout=timeout)
-#         except concurrent.futures.TimeoutError:
-#             raise Exception(f"Firestore timeout after {timeout}s — check gRPC/credentials")
-#
 # ═══════════════════════════════════════════════════════════════
 # FIREBASE INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
@@ -677,6 +658,159 @@ def generate_final_feedback(percentage: float, results: list,
     lines.append(f"Key concept gaps: {gap_summary}.")
     return " ".join(lines)
 
+# AI GENERAL STUDENT EXAM FEEDBACK
+def generate_exam_analysis(
+    subject,
+    percentage,
+    total_score,
+    total_marks,
+    results
+):
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    payload = []
+
+    for r in results:
+        payload.append({
+            "question": r.get("question", ""),
+            "student_answer": r.get("student_answer", ""),
+            "correct_answer": r.get("correct_answer", ""),
+            "status": r.get("status", ""),
+            "marks": r.get("marks", 0),
+            "earned": r.get("earned", 0),
+            "feedback": r.get("feedback", ""),
+        })
+
+    prompt = f"""
+You are an expert teacher, curriculum specialist and learning analyst.
+
+Analyse the student's performance in {subject}.
+
+Do NOT analyse by question number.
+
+Instead identify conceptual strengths and weaknesses.
+
+Infer concepts even if topics are not explicitly given.
+
+Determine whether mistakes are isolated or recurring.
+
+Determine whether the learner struggles with:
+
+Remembering
+
+Understanding
+
+Applying
+
+Analysing
+
+Evaluating
+
+Creating
+
+Identify misconceptions.
+
+Identify strongest knowledge areas.
+
+Identify weakest knowledge areas.
+
+Produce a personalised study plan.
+
+Return ONLY valid JSON.
+
+Student scored:
+
+{total_score}/{total_marks}
+
+({percentage}%)
+
+Exam:
+
+{json.dumps(payload, indent=2)}
+
+Return:
+
+{{
+"overallSummary":"",
+"studentProfile":"",
+"strengths":[],
+"weaknesses":[],
+"misconceptions":[],
+"learningStyle":"",
+"cognitiveAnalysis":{{
+
+"remember":0,
+
+"understand":0,
+
+"apply":0,
+
+"analyse":0,
+
+"evaluate":0,
+
+"create":0
+
+}},
+
+"studyPlan":[],
+
+"teacherSummary":"",
+
+"parentSummary":""
+
+}}
+"""
+    try:
+
+        resp = client.chat.completions.create(
+
+            model="llama-3.3-70b-versatile",
+
+            messages=[
+
+                {
+
+                    "role":"user",
+
+                    "content":prompt
+
+                }
+
+            ],
+
+            temperature=0.2,
+
+            max_tokens=2500
+
+        )
+
+        raw = resp.choices[0].message.content.strip()
+
+        raw = re.sub(
+            r"^```json\s*|^```\s*|```$",
+            "",
+            raw,
+            flags=re.MULTILINE
+        ).strip()
+
+        match = re.search(
+            r"\{.*\}",
+            raw,
+            re.DOTALL
+        )
+
+        if match:
+
+            return json.loads(match.group())
+
+    except Exception as e:
+
+        print(e)
+
+    return {}
+
 
 # ═══════════════════════════════════════════════════════════════
 # EXTRACTION PIPELINE
@@ -1253,20 +1387,53 @@ def submit_exam():
                 "feedback":        marked.get("feedback", ""),
                 "concept_gap":     marked.get("concept_gap", ""),
                 "model_answer":    marked.get("model_answer", ""),
+                "questionAnalysis": [
+                        {
+                            "questionText": "Write a while loop that counts from 1 to 10.",
+                            "testedConcept": "Iteration and loop control",
+                            "studentUnderstanding": "Partial",
+                            "misconception": "Loop termination condition is incorrect.",
+                            "explanation": "The learner understands loop syntax but not the stopping condition, which can lead to infinite loops or incorrect execution.",
+                            "improvementAdvice": "Trace loop execution step by step and practise predicting output before running code."
+                        }
+                    ]
+
             })
 
         percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
         feedback   = generate_final_feedback(percentage, results, subject)
+        analysis = generate_exam_analysis(
+
+            subject,
+
+            percentage,
+
+            total_score,
+
+            total_marks,
+
+            results
+
+        )
 
         print(f"[submit] ✅ {total_score}/{total_marks} = {percentage}%", flush=True)
 
         return jsonify({
-            "score":      total_score,
-            "total":      total_marks,
+
+            "score": total_score,
+
+            "total": total_marks,
+
             "percentage": percentage,
-            "results":    results,
-            "feedback":   feedback,
-            "subject":    subject,
+
+            "results": results,
+
+            "feedback": feedback,
+
+            "analysis": analysis,
+
+            "subject": subject
+
         })
 
     except Exception as e:
@@ -1549,6 +1716,227 @@ def cleanup_sessions():
             doc.reference.delete()
             deleted += 1
     return jsonify({"deleted": deleted})
+
+
+# AGENT CHAT-BOX WITH STUDENT HISTORY ACCESS
+@app.route("/agent-chat", methods=["POST"])
+def agent_chat():
+
+    try:
+
+        data = request.get_json(force=True)
+
+        student_id = data.get("student_id", "")
+
+        student_message = data.get("message", "").strip()
+
+        learning_profile = data.get("learningProfile", {})
+
+        latest_attempt = data.get("latestAttempt", {})
+
+        history = data.get("history", [])
+
+        if not student_message:
+            return jsonify({
+                "error": "Message cannot be empty."
+            }), 400
+
+        client = Groq(
+            api_key=os.getenv("GROQ_API_KEY")
+        )
+
+        system_prompt = """
+You are NextGen Skills AI Academic Coach.
+
+You are an expert teacher, curriculum specialist,
+learning psychologist and personal tutor.
+
+You do NOT behave like a generic chatbot.
+
+You always personalise your responses using the
+student's academic profile.
+
+Your responsibilities include:
+
+• Explaining concepts clearly.
+
+• Identifying misconceptions.
+
+• Teaching underlying principles.
+
+• Generating revision plans.
+
+• Generating practice questions.
+
+• Analysing exam performance.
+
+• Encouraging critical thinking.
+
+• Helping students improve.
+
+Never simply provide answers.
+
+Always explain WHY.
+
+Always explain HOW.
+
+Always relate your answer to the student's
+identified strengths and weaknesses.
+
+If weaknesses exist,
+prioritise helping the learner improve those areas.
+
+If misconceptions exist,
+correct them with simple explanations.
+
+If asked for revision advice,
+create an ordered study plan.
+
+If asked to explain a failed question,
+explain:
+
+1. What concept was tested.
+
+2. Why the student's answer was incorrect.
+
+3. The correct reasoning.
+
+4. How to recognise similar questions.
+
+5. A worked example.
+
+Always motivate the learner.
+
+Always encourage understanding rather than memorisation.
+
+Keep explanations age appropriate.
+
+Do not mention that you are an AI model.
+
+Do not invent student data that is not provided.
+
+End every response with one practical next step.
+"""
+
+        user_context = f"""
+
+STUDENT ID
+
+{student_id}
+
+
+LEARNING PROFILE
+
+{json.dumps(learning_profile, indent=2)}
+
+
+LATEST EXAM
+
+{json.dumps(latest_attempt, indent=2)}
+
+
+QUESTION
+
+{student_message}
+
+"""
+
+        messages = [
+
+            {
+                "role": "system",
+                "content": system_prompt
+            }
+
+        ]
+
+        if isinstance(history, list):
+
+            for item in history[-10:]:
+
+                if (
+                    isinstance(item, dict)
+                    and item.get("role") in ["user", "assistant"]
+                    and item.get("content")
+                ):
+
+                    messages.append({
+
+                        "role": item["role"],
+
+                        "content": item["content"]
+
+                    })
+
+        messages.append({
+
+            "role": "user",
+
+            "content": user_context
+
+        })
+
+        completion = client.chat.completions.create(
+
+            model="llama-3.3-70b-versatile",
+
+            messages=messages,
+
+            temperature=0.3,
+
+            max_tokens=1800
+
+        )
+
+        reply = completion.choices[0].message.content.strip()
+
+        suggestions = [
+
+            "Explain my weakest concept",
+
+            "Create a personalised study timetable",
+
+            "Generate 10 practice questions",
+
+            "Test my understanding",
+
+            "Explain my last exam mistakes",
+
+            "How can I improve to distinction level?",
+
+            "What should I revise today?",
+
+            "Create a revision quiz"
+
+        ]
+
+        return jsonify({
+
+            "success": True,
+
+            "coach": "NextGen AI Academic Coach",
+
+            "response": reply,
+
+            "suggestions": suggestions,
+
+            "student_id": student_id
+
+        })
+
+    except Exception as e:
+
+        print("AGENT CHAT ERROR:", str(e))
+
+        return jsonify({
+
+            "success": False,
+
+            "error": str(e),
+
+            "response": "I couldn't process your request right now. Please try again."
+
+        }), 500
 
 @app.before_request
 def handle_options():

@@ -1819,27 +1819,29 @@ End every response with one practical next step.
 """
 
         user_context = f"""
+        STUDENT ID: {student_id}
 
-STUDENT ID
+        LEARNING PROFILE:
+        - Total Exams Completed: {learning_profile.get('totalExams', 'Unknown')}
+        - Overall Average: {learning_profile.get('overallAverage', 'Unknown')}%
+        - Best Score: {learning_profile.get('bestScore', 'Unknown')}%
+        - Subjects: {', '.join(learning_profile.get('subjects', [])) or 'Unknown'}
 
-{student_id}
+        WEAK AREAS (questions answered incorrectly most often):
+        {json.dumps(learning_profile.get('weakAreas', []), indent=2)}
 
+        RECENT EXAM RESULTS:
+        {json.dumps(learning_profile.get('recentResults', []), indent=2)}
 
-LEARNING PROFILE
+        LATEST EXAM DETAIL:
+        {json.dumps(latest_attempt, indent=2)}
 
-{json.dumps(learning_profile, indent=2)}
+        STUDENT QUESTION:
+        {student_message}
 
-
-LATEST EXAM
-
-{json.dumps(latest_attempt, indent=2)}
-
-
-QUESTION
-
-{student_message}
-
-"""
+        IMPORTANT: You have full exam data above. Use it. Reference specific questions,
+        specific scores, specific weak areas by name. Do NOT say you have no data.
+        """
 
         messages = [
 

@@ -1721,221 +1721,220 @@ def cleanup_sessions():
 # AGENT CHAT-BOX WITH STUDENT HISTORY ACCESS
 @app.route("/agent-chat", methods=["POST"])
 def agent_chat():
-
     try:
-
         data = request.get_json(force=True)
-
-        student_id = data.get("student_id", "")
-
+        student_id      = data.get("student_id", "")
         student_message = data.get("message", "").strip()
-
         learning_profile = data.get("learningProfile", {})
-
-        latest_attempt = data.get("latestAttempt", {})
-
-        history = data.get("history", [])
+        latest_attempt  = data.get("latestAttempt", {})
+        history         = data.get("history", [])
 
         if not student_message:
-            return jsonify({
-                "error": "Message cannot be empty."
-            }), 400
+            return jsonify({"error": "Message cannot be empty."}), 400
 
-        client = Groq(
-            api_key=os.getenv("GROQ_API_KEY")
-        )
+        # ── Build context variables BEFORE f-strings ──────────────────────────
+        try:
+            latest_questions = json.dumps([
+                {
+                    "q":      r.get("question_number"),
+                    "status": r.get("status"),
+                    "topic":  r.get("question", "")[:60],
+                }
+                for r in latest_attempt.get("markedResults", [])[:10]
+            ])
+        except Exception:
+            latest_questions = "[]"
 
+        try:
+            weak_areas_list = [
+                str(w.get("question") or w.get("key") or w.get("text") or "")
+                for w in learning_profile.get("weakAreas", [])[:5]
+                if isinstance(w, dict)
+            ]
+        except Exception:
+            weak_areas_list = []
+
+        try:
+            recent_results_list = [
+                f"{r.get('examTitle', '?')} — {r.get('percentage', '?')}%"
+                for r in learning_profile.get("recentResults", [])[:3]
+                if isinstance(r, dict)
+            ]
+        except Exception:
+            recent_results_list = []
+
+        try:
+            weak_areas_full = json.dumps([
+                {
+                    "question":   w.get("question") or w.get("key", ""),
+                    "timesWrong": w.get("timesWrong") or w.get("count", 0),
+                    "type":       w.get("type", ""),
+                    "text":       w.get("text", "")[:80],
+                }
+                for w in learning_profile.get("weakAreas", [])[:8]
+                if isinstance(w, dict)
+            ])
+        except Exception:
+            weak_areas_full = "[]"
+
+        try:
+            subjects = ", ".join(learning_profile.get("subjects", ["Unknown"]))
+        except Exception:
+            subjects = "Unknown"
+
+        # ── System prompt ──────────────────────────────────────────────────────
         system_prompt = f"""
-        You are NextGen Skills AI Academic Coach — a brilliant, patient South African 
-        CAPS/NSC curriculum tutor who teaches through natural conversation.
+You are NextGen Skills AI Academic Coach — a brilliant, patient South African
+CAPS/NSC curriculum tutor who teaches through natural conversation.
 
-        ═══════════════════════════════════════════════════════
-        CRITICAL CONVERSATION RULES — NEVER BREAK THESE:
-        ═══════════════════════════════════════════════════════
-        1. NEVER give everything at once. One small chunk at a time.
-        2. After EVERY response, ask ONE simple question to check understanding
-           or ask if the student wants to continue.
-        3. Wait for the student to respond before moving on.
-        4. Keep each response SHORT — maximum 4-6 sentences or one concept.
-        5. If teaching a topic, break it into steps. Teach step 1, then WAIT.
-        6. Only move to step 2 when student says yes, ok, continue, proceed, next, 
-           I understand, got it, or any positive response.
-        7. If student says no, stop, or I don't understand — simplify or re-explain 
-           that same step differently. Do NOT move forward.
-        8. If student answers a practice question — mark it immediately, give brief 
-           feedback, then ask if they want to try the next one.
-        9. NEVER use long bullet lists. Use at most 2-3 short points per message.
-        10. NEVER repeat what you said before unless asked.
+═══════════════════════════════════════════════════════
+CRITICAL CONVERSATION RULES — NEVER BREAK THESE:
+═══════════════════════════════════════════════════════
+1. NEVER give everything at once. One small chunk at a time.
+2. After EVERY response, ask ONE simple question to check understanding
+   or ask if the student wants to continue.
+3. Wait for the student to respond before moving on.
+4. Keep each response SHORT — maximum 4-6 sentences or one concept.
+5. If teaching a topic, break it into steps. Teach step 1, then WAIT.
+6. Only move to step 2 when student says yes, ok, continue, proceed, next,
+   I understand, got it, or any positive response.
+7. If student says no, stop, or I don't understand — simplify or re-explain
+   that same step differently. Do NOT move forward.
+8. If student answers a practice question — mark it immediately, give brief
+   feedback, then ask if they want to try the next one.
+9. NEVER use long bullet lists. Use at most 2-3 short points per message.
+10. NEVER repeat what you said before unless asked.
 
-        ═══════════════════════════════════════════════════════
-        RESPONSE LENGTH GUIDE:
-        ═══════════════════════════════════════════════════════
-        - Greeting or checking in: 1-2 sentences
-        - Explaining a concept: 3-5 sentences MAX, then pause and ask
-        - Giving an example: show ONE example, then ask if it makes sense
-        - Practice question: ONE question at a time, wait for answer
-        - Feedback on answer: 2-3 sentences, then ask if ready to continue
+═══════════════════════════════════════════════════════
+RESPONSE LENGTH GUIDE:
+═══════════════════════════════════════════════════════
+- Greeting or checking in: 1-2 sentences
+- Explaining a concept: 3-5 sentences MAX, then pause and ask
+- Giving an example: show ONE example, then ask if it makes sense
+- Practice question: ONE question at a time, wait for answer
+- Feedback on answer: 2-3 sentences, then ask if ready to continue
 
-        ═══════════════════════════════════════════════════════
-        CONVERSATION FLOW EXAMPLES:
-        ═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════
+CONVERSATION FLOW EXAMPLES:
+═══════════════════════════════════════════════════════
 
-        Example 1 — Teaching:
-        Student: "Help me study functions"
-        You: "Sure! Let's start with the basics. A function in a spreadsheet is a 
-        built-in formula that does a specific job for you — like adding numbers or 
-        finding the highest value. The most common one is =SUM(). 
-        Do you want to see how =SUM() works with an example? 😊"
+Example 1 — Teaching:
+Student: "Help me study functions"
+You: "Sure! Let's start with the basics. A function in a spreadsheet is a
+built-in formula that does a specific job for you — like adding numbers or
+finding the highest value. The most common one is =SUM().
+Do you want to see how =SUM() works with an example? 😊"
 
-        Student: "yes"
-        You: "Great! Imagine you have marks in cells B2 to B6. 
-        To add them all up, you type: =SUM(B2:B6)
-        That's it — the spreadsheet adds all those numbers automatically.
-        Does that make sense, or should I explain it differently?"
+Student: "yes"
+You: "Great! Imagine you have marks in cells B2 to B6.
+To add them all up, you type: =SUM(B2:B6)
+That's it — the spreadsheet adds all those numbers automatically.
+Does that make sense, or should I explain it differently?"
 
-        Student: "I get it"
-        You: "Nice! Let's test that. What formula would you use to add 
-        cells A1 to A10? Give it a try 👇"
+Student: "I get it"
+You: "Nice! Let's test that. What formula would you use to add
+cells A1 to A10? Give it a try 👇"
 
-        Example 2 — Student doesn't understand:
-        Student: "I don't get it"
-        You: "No problem at all! Let me try a different way.
-        Think of =SUM() like a calculator that adds things for you.
-        Instead of typing 5+6+7+8, you just say 'add everything in this column'.
-        Better? Or should I try another way?"
+Example 2 — Student doesn't understand:
+Student: "I don't get it"
+You: "No problem at all! Let me try a different way.
+Think of =SUM() like a calculator that adds things for you.
+Instead of typing 5+6+7+8, you just say 'add everything in this column'.
+Better? Or should I try another way?"
 
-        ═══════════════════════════════════════════════════════
-        TWO MODES — switch automatically:
-        ═══════════════════════════════════════════════════════
-        MODE 1 — RESULTS & COACHING: When student asks about their scores or progress.
-        Use ONLY their actual exam data provided below. Keep it brief and personal.
+═══════════════════════════════════════════════════════
+TWO MODES — switch automatically:
+═══════════════════════════════════════════════════════
+MODE 1 — RESULTS & COACHING: When student asks about their scores or progress.
+Use ONLY their actual exam data provided. Keep it brief and personal.
 
-        MODE 2 — SUBJECT TUTOR: When student wants to learn a topic.
-        Use your full CAPS curriculum knowledge. Teach step by step.
-        Always cross-check their weak areas and mention if this topic appeared in their exam.
+MODE 2 — SUBJECT TUTOR: When student wants to learn a topic.
+Use your full CAPS curriculum knowledge. Teach step by step.
+Cross-check their weak areas and mention if this topic appeared in their exam.
 
-        ═══════════════════════════════════════════════════════
-        STUDENT PROFILE:
-        ═══════════════════════════════════════════════════════
-        Student: {student_id}
-        Subject(s): {', '.join(learning_profile.get('subjects', ['Unknown']))}
-        Average Score: {learning_profile.get('overallAverage', 'Unknown')}%
-        Weak Areas: {json.dumps(learning_profile.get('weakAreas', []))}
+═══════════════════════════════════════════════════════
+STUDENT PROFILE:
+═══════════════════════════════════════════════════════
+Student: {student_id}
+Subject(s): {subjects}
+Average Score: {learning_profile.get('overallAverage', 'Unknown')}%
+Weak Areas: {weak_areas_full}
 
-        ═══════════════════════════════════════════════════════
-        PERSONALITY:
-        ═══════════════════════════════════════════════════════
-        - Warm, encouraging, and patient
-        - Use the student's name occasionally
-        - Use simple emojis sparingly (😊 ✅ 👇 💡) to make it friendly
-        - Celebrate small wins: "Well done!", "That's correct!", "You're getting it!"
-        - Never make the student feel bad for not knowing something
-        - Never say you are an AI
-        """
+═══════════════════════════════════════════════════════
+PERSONALITY:
+═══════════════════════════════════════════════════════
+- Warm, encouraging, and patient
+- Use the student's name occasionally
+- Use simple emojis sparingly (😊 ✅ 👇 💡) to make it friendly
+- Celebrate small wins: "Well done!", "That's correct!", "You're getting it!"
+- Never make the student feel bad for not knowing something
+- Never say you are an AI
+"""
 
+        # ── User context ───────────────────────────────────────────────────────
         user_context = f"""
-        STUDENT MESSAGE: {student_message}
+STUDENT MESSAGE: {student_message}
 
-        STUDENT DATA FOR CONTEXT:
-        - Latest exam: {latest_attempt.get('examTitle', 'N/A')} | {latest_attempt.get('subject', 'N/A')} | {latest_attempt.get('percentage', '?')}%
-        - Weak areas: {[w.get('question') for w in learning_profile.get('weakAreas', [])[:5]]}
-        - Recent results: {[(r.get('examTitle', '?'), str(r.get('percentage', '?')) + '%') for r in learning_profile.get('recentResults', [])[:3]]}
-        - Latest exam questions: {json.dumps([
-            {{'q': r.get('question_number'), 'status': r.get('status'), 'topic': r.get('question', '')[:60]}}
-            for r in latest_attempt.get('markedResults', [])[:10]
-        ])}
-        """
+STUDENT DATA:
+- Latest exam: {latest_attempt.get('examTitle', 'N/A')} | {latest_attempt.get('subject', 'N/A')} | {latest_attempt.get('percentage', '?')}%
+- Weak areas: {weak_areas_list}
+- Recent results: {recent_results_list}
+- Latest exam questions: {latest_questions}
+"""
 
-        messages = [
-
-            {
-                "role": "system",
-                "content": system_prompt
-            }
-
-        ]
+        # ── Build messages with history ────────────────────────────────────────
+        messages = [{"role": "system", "content": system_prompt}]
 
         if isinstance(history, list):
-
             for item in history[-10:]:
-
                 if (
                     isinstance(item, dict)
-                    and item.get("role") in ["user", "assistant"]
+                    and item.get("role") in ("user", "assistant")
                     and item.get("content")
                 ):
-
                     messages.append({
-
-                        "role": item["role"],
-
-                        "content": item["content"]
-
+                        "role":    item["role"],
+                        "content": item["content"],
                     })
 
-        messages.append({
+        messages.append({"role": "user", "content": user_context})
 
-            "role": "user",
-
-            "content": user_context
-
-        })
+        # ── Call Groq ──────────────────────────────────────────────────────────
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
-            temperature=0.3,
+            temperature=0.4,
             max_tokens=600,
         )
 
         reply = completion.choices[0].message.content.strip()
 
-        suggestions = [
-
-            "Explain my weakest concept",
-
-            "Create a personalised study timetable",
-
-            "Generate 10 practice questions",
-
-            "Test my understanding",
-
-            "Explain my last exam mistakes",
-
-            "How can I improve to distinction level?",
-
-            "What should I revise today?",
-
-            "Create a revision quiz"
-
-        ]
-
         return jsonify({
-
-            "success": True,
-
-            "coach": "NextGen AI Academic Coach",
-
-            "response": reply,
-
-            "suggestions": suggestions,
-
-            "student_id": student_id
-
+            "success":    True,
+            "coach":      "NextGen AI Academic Coach",
+            "response":   reply,
+            "student_id": student_id,
+            "suggestions": [
+                "Explain my weakest concept",
+                "Create a personalised study timetable",
+                "Generate 10 practice questions",
+                "Test my understanding",
+                "Explain my last exam mistakes",
+                "How can I improve to distinction level?",
+                "What should I revise today?",
+                "Create a revision quiz",
+            ],
         })
 
     except Exception as e:
-
+        traceback.print_exc()
         print("AGENT CHAT ERROR:", str(e))
-
         return jsonify({
-
-            "success": False,
-
-            "error": str(e),
-
-            "response": "I couldn't process your request right now. Please try again."
-
+            "success":  False,
+            "error":    str(e),
+            "response": "I couldn't process your request right now. Please try again.",
         }), 500
 
 @app.before_request

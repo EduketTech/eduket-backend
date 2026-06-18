@@ -47,6 +47,7 @@ from odf import text as odf_text
 from odf import teletype
 import mammoth
 from groq import Groq
+from datetime import datetime, timezone
 
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage
@@ -94,6 +95,37 @@ def _init_firebase():
     db = fs_admin.client()
     bucket = storage.bucket()
     print("[Firebase] ✅ Ready")
+
+    def verify_request_token(request):
+        """
+        Verifies the Firebase ID token from the Authorization header.
+        Returns (uid, error_response) — uid is None if verification fails,
+        in which case error_response is a (jsonify, status_code) tuple to return immediately.
+        """
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return None, (jsonify({"error": "Missing or malformed Authorization header"}), 401)
+
+        id_token = auth_header.split("Bearer ", 1)[1].strip()
+        try:
+            decoded = fb_auth.verify_id_token(id_token)
+            return decoded["uid"], None
+        except Exception as e:
+            print(f"[verify_request_token] {e}")
+            return None, (jsonify({"error": "Invalid or expired token"}), 401)
+
+    # ═══════════════════════════════════════════════════════════════
+    # TIER LIMITS — mirrors src/utils/tierConfig.js (TIERS array)
+    # ═══════════════════════════════════════════════════════════════
+    TIER_EXAM_LIMITS = {
+        "free": 5,
+        "silver": 30,
+        "gold": 120,
+        "platinum": 500,
+    }
+
+    def get_exam_limit(tier_id):
+        return TIER_EXAM_LIMITS.get(tier_id, TIER_EXAM_LIMITS["free"])
 
 # ═══════════════════════════════════════════════════════════════
 # APP + CORS
@@ -1198,6 +1230,128 @@ def health():
         }
     })
 
+
+@app.route("/exams/upload", methods=["POST", "OPTIONS"])
+def upload_exam():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        uid, err = verify_request_token(request)
+        if err:
+            return err
+
+        data = request.get_json() or {}
+
+        # ── Look up the caller's schoolId from their own user doc ──────────
+        # (never trust a schoolId sent in the body — derive it server-side)
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            return jsonify({"error": "User profile not found"}), 404
+
+        user_data = user_doc.to_dict()
+        school_id = user_data.get("schoolId")
+        if not school_id:
+            return jsonify({"error": "No school associated with this account"}), 400
+
+        # ── Look up the school's tier ───────────────────────────────────────
+        school_doc = db.collection("schools").document(school_id).get()
+        if not school_doc.exists:
+            return jsonify({"error": "School not found"}), 404
+
+        tier_id = school_doc.to_dict().get("tier", "free")
+        exam_limit = get_exam_limit(tier_id)
+
+        # ── Count this school's exam uploads so far this calendar month ───
+        now = datetime.now(timezone.utc)
+        start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        start_of_month_iso = start_of_month.isoformat()
+
+        exams_query = (
+            db.collection("exams")
+            .where("schoolId", "==", school_id)
+            .where("uploadedAt", ">=", start_of_month_iso)
+        )
+        current_count = len(list(exams_query.stream()))
+
+        if current_count >= exam_limit:
+            return jsonify({
+                "error": "limit_reached",
+                "message": (
+                    f"Your school has reached its monthly limit of {exam_limit} exam uploads "
+                    f"on the {tier_id.capitalize()} plan. You can wait until next month, or ask "
+                    "your principal to upgrade your school's plan for a higher limit."
+                ),
+                "tier": tier_id,
+                "limit": exam_limit,
+                "used": current_count,
+            }), 403
+
+        # ── Build the exam record (mirrors driveManager.js saveExamMetadata) ─
+        exam_id = data.get("examId") or f"{uid}_{int(now.timestamp() * 1000)}"
+        subject = data.get("subject", "General")
+
+        # Duplicate check against the subject subdocument
+        subject_ref = db.collection("teacherExamUploads").document(school_id).collection("subjects").document(subject)
+        subject_snap = subject_ref.get()
+        existing_uploads = subject_snap.to_dict().get("uploads", []) if subject_snap.exists else []
+
+        for u in existing_uploads:
+            if u.get("examStoragePath") == data.get("examStoragePath") or u.get("memoStoragePath") == data.get("memoStoragePath"):
+                return jsonify({"examId": u.get("examId"), "duplicate": True})
+
+        record = {
+            "examId": exam_id,
+            "uploadedBy": uid,
+            "teacherName": data.get("teacherName", "Teacher"),
+            "schoolId": school_id,
+            "schoolName": data.get("schoolName", school_id),
+            "schoolFolder": data.get("schoolFolder", school_id),
+            "title": data.get("title", ""),
+            "year": data.get("year", ""),
+            "subject": subject,
+            "curriculum": data.get("curriculum", "CAPS"),
+            "grade": data.get("grade", ""),
+            "examDuration": data.get("examDuration", 0),
+            "examFileType": data.get("examFileType", ""),
+            "memoFileType": data.get("memoFileType", ""),
+            "examFileName": data.get("examFileName", ""),
+            "memoFileName": data.get("memoFileName", ""),
+            "examStorageUrl": data.get("examStorageUrl", ""),
+            "memoStorageUrl": data.get("memoStorageUrl", ""),
+            "examStoragePath": data.get("examStoragePath", ""),
+            "memoStoragePath": data.get("memoStoragePath", ""),
+            "status": "pending_extraction",
+            "questionsExtracted": False,
+            "memoMerged": False,
+            "uploadedAt": now.isoformat(),
+            "extractedAt": None,
+        }
+
+        # 1. Top-level exams collection — backend pipeline reads this
+        db.collection("exams").document(exam_id).set(record)
+
+        # 2. School-level doc under teacherExamUploads
+        db.collection("teacherExamUploads").document(school_id).set({
+            "schoolId": school_id,
+            "schoolName": record["schoolName"],
+            "schoolFolder": record["schoolFolder"],
+            "updatedAt": now.isoformat(),
+        }, merge=True)
+
+        # 3. Subject subdocument with uploads array
+        subject_ref.set({
+            "subject": subject,
+            "schoolId": school_id,
+            "uploads": [{**record, "id": exam_id}] + existing_uploads,
+            "updatedAt": now.isoformat(),
+        }, merge=True)
+
+        return jsonify({"examId": exam_id, "duplicate": False})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/exams", methods=["GET"])
 def list_exams():

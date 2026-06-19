@@ -50,7 +50,7 @@ from groq import Groq
 from datetime import datetime, timezone
 
 import firebase_admin
-from firebase_admin import credentials, firestore as fs_admin, storage
+from firebase_admin import credentials, firestore as fs_admin, storage, auth as fb_auth
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -96,7 +96,7 @@ def _init_firebase():
     bucket = storage.bucket()
     print("[Firebase] ✅ Ready")
 
-    def verify_request_token(request):
+def verify_request_token(request):
         """
         Verifies the Firebase ID token from the Authorization header.
         Returns (uid, error_response) — uid is None if verification fails,
@@ -114,18 +114,19 @@ def _init_firebase():
             print(f"[verify_request_token] {e}")
             return None, (jsonify({"error": "Invalid or expired token"}), 401)
 
+
     # ═══════════════════════════════════════════════════════════════
     # TIER LIMITS — mirrors src/utils/tierConfig.js (TIERS array)
     # ═══════════════════════════════════════════════════════════════
-    TIER_EXAM_LIMITS = {
+TIER_EXAM_LIMITS = {
         "free": 5,
         "silver": 30,
         "gold": 120,
         "platinum": 500,
     }
 
-    def get_exam_limit(tier_id):
-        return TIER_EXAM_LIMITS.get(tier_id, TIER_EXAM_LIMITS["free"])
+def get_exam_limit(tier_id):
+    return TIER_EXAM_LIMITS.get(tier_id, TIER_EXAM_LIMITS["free"])
 
 # ═══════════════════════════════════════════════════════════════
 # APP + CORS
@@ -1348,6 +1349,56 @@ def upload_exam():
         }, merge=True)
 
         return jsonify({"examId": exam_id, "duplicate": False})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+#     Verify Account Usage based on Tier
+@app.route("/exams/usage", methods=["GET", "OPTIONS"])
+def exam_usage():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        uid, err = verify_request_token(request)
+        if err:
+            return err
+
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            return jsonify({"error": "User profile not found"}), 404
+
+        school_id = user_doc.to_dict().get("schoolId")
+        if not school_id:
+            return jsonify({"error": "No school associated with this account"}), 400
+
+        school_doc = db.collection("schools").document(school_id).get()
+        if not school_doc.exists:
+            return jsonify({"error": "School not found"}), 404
+
+        tier_id = school_doc.to_dict().get("tier", "free")
+        exam_limit = get_exam_limit(tier_id)
+
+        now = datetime.now(timezone.utc)
+        start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        start_of_month_iso = start_of_month.isoformat()
+
+        exams_query = (
+            db.collection("exams")
+            .where("schoolId", "==", school_id)
+            .where("uploadedAt", ">=", start_of_month_iso)
+        )
+        used = len(list(exams_query.stream()))
+        remaining = max(0, exam_limit - used)
+
+        return jsonify({
+            "tier": tier_id,
+            "limit": exam_limit,
+            "used": used,
+            "remaining": remaining,
+            "atLimit": used >= exam_limit,
+        })
 
     except Exception as e:
         traceback.print_exc()

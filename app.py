@@ -2143,13 +2143,14 @@ STUDENT DATA:
             "response": "I couldn't process your request right now. Please try again.",
         }), 500
 
+
 @app.before_request
 def handle_options():
     if request.method == "OPTIONS":
         response = app.make_default_options_response()
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
 
 

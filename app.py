@@ -123,6 +123,7 @@ TIER_EXAM_LIMITS = {
         "silver": 30,
         "gold": 120,
         "platinum": 500,
+        "diamond": 1000,
     }
 
 def get_exam_limit(tier_id):
@@ -148,6 +149,16 @@ CORS(app, resources={r"/*": {
     "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     "allow_headers": ["Content-Type", "Authorization"],
 }}, supports_credentials=False)
+
+# ═══════════════════════════════════════════════════════════════
+# BILLING / SUBSCRIPTION PRICING ROUTES
+# ═══════════════════════════════════════════════════════════════
+# Registers /api/billing/quote, /api/billing/quotes, and
+# /api/billing/initiate from billing_routes.py. The r"/*" CORS config
+# above already covers these - no separate CORS setup needed for the
+# blueprint.
+from billing_routes import billing_bp
+app.register_blueprint(billing_bp)
 
 # ═══════════════════════════════════════════════════════════════
 # THREAD-SAFE PROCESSING TRACKER

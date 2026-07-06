@@ -229,8 +229,10 @@ def billing_initiate():
         "tierId": tier_id,
         "fromTier": current_tier,
         "billingCycle": quote["billing_cycle"],
-        "expectedAmount": quote["charge_amount"],
-        "expectedCurrency": quote["charge_currency"],
+        "expectedAmount": quote["amount_zar_equivalent"],  # ← ZAR, matches PayFast ITN
+        "expectedCurrency": "ZAR",
+        "displayAmount": quote["charge_amount"],  # ← local currency, for receipts
+        "displayCurrency": quote["charge_currency"],
         "status": "pending",
         "createdAt": firestore.SERVER_TIMESTAMP,
     })
@@ -242,8 +244,10 @@ def billing_initiate():
         "merchant_key": PAYFAST_MERCHANT_KEY,
         "return_url": f"{FRONTEND_BASE_URL}/payment-success",
         "cancel_url": f"{FRONTEND_BASE_URL}/payment-cancelled",
+        # "notify_url": f"{os.environ.get('BACKEND_BASE_URL', '')}/api/payfast/itn",
         "m_payment_id": payment_id,
-        "amount": f"{quote['charge_amount']:.2f}",
+        "amount": f"{quote['amount_zar_equivalent']:.2f}",  # ← ZAR always
+        # No currency field — PayFast has no such parameter on redirect forms
         "item_name": f"{tier_id.capitalize()} Plan",
         "item_description": f"{tier_id.capitalize()} Subscription ({quote['billing_cycle']})",
         "custom_str1": school_id,

@@ -81,6 +81,16 @@ _CHUNK_SIZE      = 10_000
 _CHUNK_OVERLAP   = 800
 
 
+# Clark-notation URI for r:embed — never varies regardless of prefix used
+_R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+# ODT namespaces (clark form)
+_ODT_TEXT_P     = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}p"
+_ODT_TEXT_H     = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}h"
+_ODT_DRAW_IMAGE = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}image"
+_ODT_XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  SUBJECT CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -101,6 +111,59 @@ _SUBJECT_MAP = {
     "history":       {"history"},
     "arts":          {"visual arts", "dramatic arts", "music", "dance"},
 }
+
+
+
+def _find_rids_in_element(elem) -> list:
+    """
+    Reliably find all r:embed relationship IDs in an lxml element subtree.
+    Uses clark notation so namespace prefix variations never matter.
+    Replaces the fragile r'r:embed="(rId\\d+)"' regex on serialized XML.
+    """
+    return [
+        node.get(_R_EMBED)
+        for node in elem.iter()
+        if node.get(_R_EMBED)
+    ]
+
+
+def _odt_walk_content(content_xml_bytes: bytes, image_descs: dict) -> list:
+    """
+    Walk ODT content.xml and return text lines with [DIAGRAM: ...]
+    placeholders inserted at the paragraph they actually belong to,
+    not appended at the end of the document.
+    """
+    lines = []
+    try:
+        root = ET.fromstring(content_xml_bytes)
+
+        def _para_parts(elem):
+            text = "".join(elem.itertext()).strip()
+            diagrams = []
+            for node in elem.iter():
+                if node.tag == _ODT_DRAW_IMAGE:
+                    href = node.get(_ODT_XLINK_HREF, "")
+                    # Normalize: "./Pictures/img.png" → "Pictures/img.png"
+                    for prefix in ("./", "../", "/"):
+                        if href.startswith(prefix):
+                            href = href[len(prefix):]
+                    if href and not href.startswith("Pictures/"):
+                        href = f"Pictures/{href}"
+                    if href in image_descs:
+                        diagrams.append(image_descs[href])
+            return text, diagrams
+
+        for elem in root.iter():
+            if elem.tag in (_ODT_TEXT_P, _ODT_TEXT_H):
+                text, diagrams = _para_parts(elem)
+                # Diagrams come first — they usually precede the question text
+                for desc in diagrams:
+                    lines.append(f"[DIAGRAM: {desc}]")
+                if text:
+                    lines.append(text)
+    except Exception as exc:
+        logger.error("[ODT walk] %s", exc)
+    return lines
 
 def _subject_category(subject: str) -> str:
     s = subject.lower().strip()
@@ -279,7 +342,10 @@ def _docx_extract_images(docx_bytes: bytes) -> dict:
                         img_bytes = z.read(target)
                         if len(img_bytes) < _IMAGE_MIN_BYTES:
                             continue          # skip decorative bullets
-                        ext = Path(target).suffix.lstrip(".") or "png"
+
+                        ext = Path(target).suffix.lstrip(".").lower() or "png"
+                        if ext in ("wmf", "emf"):
+                            continue  # vector formats, skip vision
                         images[rid] = (img_bytes, ext)
                     except KeyError:
                         pass
@@ -290,14 +356,7 @@ def _docx_extract_images(docx_bytes: bytes) -> dict:
     return images
 
 
-def extract_text_from_docx(file_bytes: bytes,
-                            subject: str = "General") -> str:
-    """
-    Full DOCX extractor:
-    - OMML equations → [EQ: ...]
-    - Embedded images → [DIAGRAM: <Groq vision description>]
-    - Tables preserved with structure appropriate for the subject
-    """
+def extract_text_from_docx(file_bytes: bytes, subject: str = "General") -> str:
     from docx.oxml.table import CT_Tbl
     from docx.oxml.text.paragraph import CT_P
 
@@ -306,44 +365,51 @@ def extract_text_from_docx(file_bytes: bytes,
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         cat    = _subject_category(subject)
 
-        # Pre-describe all embedded images
         raw_images = _docx_extract_images(file_bytes)
-        image_descs: dict[str, str] = {}
+        image_descs = {}
         if raw_images:
-            logger.info("[DOCX] Describing %d image(s) with Groq vision …",
-                        len(raw_images))
+            logger.info("[DOCX] Describing %d image(s) …", len(raw_images))
         for rid, (img_bytes, ext) in raw_images.items():
             image_descs[rid] = _vision_describe(img_bytes, ext, subject, client)
-            logger.info("[DOCX] %s → %s …", rid, image_descs[rid][:60])
 
-        lines: list[str] = []
+        lines = []
 
         def _add_para(para: Paragraph):
-            # Text + math
             text = _para_text_with_math(para)
             if text:
                 lines.append(text)
-            # Inline images in this paragraph (r:embed references)
-            para_xml = para._element.xml
-            for m in re.finditer(r'r:embed="(rId\d+)"', para_xml):
-                rid = m.group(1)
+            # ── FIX 1: use clark-notation attribute lookup, not XML string regex ──
+            for rid in _find_rids_in_element(para._element):
                 if rid in image_descs:
                     lines.append(f"[DIAGRAM: {image_descs[rid]}]")
 
         def _add_table(table: Table):
-            if cat == "accounting":
-                # Preserve full CSV structure for financial statements
-                for i, row in enumerate(table.rows):
-                    cells = [c.text.strip() for c in row.cells]
-                    if any(cells):
+            for i, row in enumerate(table.rows):
+                # ── FIX 3: deduplicate merged cells by underlying _tc identity ──
+                seen_tc: set = set()
+                unique_cells = []
+                for c in row.cells:
+                    tc_id = id(c._tc)
+                    if tc_id not in seen_tc:
+                        seen_tc.add(tc_id)
+                        unique_cells.append(c)
+
+                cell_texts = [c.text.strip() for c in unique_cells]
+
+                if cat == "accounting":
+                    if any(cell_texts):
                         prefix = "HEADER:" if i == 0 else "ROW:"
-                        lines.append(f"{prefix} " + " | ".join(cells))
-            else:
-                for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells]
-                    row_txt = " | ".join(c for c in cells if c)
+                        lines.append(f"{prefix} " + " | ".join(cell_texts))
+                else:
+                    row_txt = " | ".join(t for t in cell_texts if t)
                     if row_txt:
                         lines.append(row_txt)
+
+                # ── FIX 2: extract images from table cells ──────────────────────
+                for c in unique_cells:
+                    for rid in _find_rids_in_element(c._tc):
+                        if rid in image_descs:
+                            lines.append(f"[DIAGRAM: {image_descs[rid]}]")
 
         for child in doc.element.body.iterchildren():
             if isinstance(child, CT_P):
@@ -352,8 +418,7 @@ def extract_text_from_docx(file_bytes: bytes,
                 _add_table(Table(child, doc))
 
         result = "\n".join(lines)
-        logger.info("[DOCX] %d chars, %d images described",
-                    len(result), len(image_descs))
+        logger.info("[DOCX] %d chars, %d images", len(result), len(image_descs))
         return result
 
     except Exception as exc:
@@ -389,36 +454,41 @@ def _docx_basic(file_bytes: bytes) -> str:
 # 5.  ODT EXTRACTION  (text + images)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_text_from_odt(file_bytes: bytes,
-                          subject: str = "General") -> str:
-    """
-    ODT extractor with image support.
-    ODT is a ZIP — images live under Pictures/.
-    """
+def extract_text_from_odt(file_bytes: bytes, subject: str = "General") -> str:
     try:
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-        # Extract images from the ZIP container
-        image_descs: list[str] = []
-        try:
-            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-                for name in z.namelist():
-                    if not name.startswith("Pictures/") or name.endswith("/"):
+        # Extract and describe all images from the ZIP
+        image_descs: dict = {}
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            for name in z.namelist():
+                if not name.startswith("Pictures/") or name.endswith("/"):
+                    continue
+                try:
+                    img_bytes = z.read(name)
+                    if len(img_bytes) < _IMAGE_MIN_BYTES:
                         continue
-                    try:
-                        img_bytes = z.read(name)
-                        if len(img_bytes) < _IMAGE_MIN_BYTES:
-                            continue
-                        ext  = Path(name).suffix.lstrip(".") or "png"
-                        desc = _vision_describe(img_bytes, ext, subject, client)
-                        image_descs.append(desc)
-                        logger.info("[ODT] %s → %s …", name, desc[:60])
-                    except Exception as exc:
-                        logger.warning("[ODT] image %s failed: %s", name, exc)
-        except Exception as exc:
-            logger.warning("[ODT] ZIP image extraction failed: %s", exc)
+                    ext  = Path(name).suffix.lstrip(".") or "png"
+                    desc = _vision_describe(img_bytes, ext, subject, client)
+                    image_descs[name] = desc
+                    logger.info("[ODT] %s → %s …", name, desc[:60])
+                except Exception as exc:
+                    logger.warning("[ODT] image %s failed: %s", name, exc)
 
-        # Extract paragraph text
+            # ── FIX 4: parse content.xml for inline image positions ──────────
+            try:
+                content_xml = z.read("content.xml")
+                lines = _odt_walk_content(content_xml, image_descs)
+                if lines:
+                    result = "\n".join(lines)
+                    logger.info("[ODT] %d chars, %d images inline",
+                                len(result), len(image_descs))
+                    return result
+            except Exception as exc:
+                logger.warning("[ODT] content.xml walk failed: %s — "
+                               "falling back to odfpy", exc)
+
+        # Fallback: odfpy plain text (images already described, append at end)
         with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
@@ -429,30 +499,18 @@ def extract_text_from_odt(file_bytes: bytes,
                 if teletype.extractText(p).strip()
             ]
 
-        # Append diagram descriptions (ODT doesn't expose insertion position)
         if image_descs:
-            lines.append("\n─── FIGURES / DIAGRAMS IN THIS DOCUMENT ───")
-            for i, desc in enumerate(image_descs, 1):
+            lines.append("\n─── FIGURES / DIAGRAMS ───")
+            for i, desc in enumerate(image_descs.values(), 1):
                 lines.append(f"[DIAGRAM {i}: {desc}]")
 
         result = "\n".join(lines)
-        logger.info("[ODT] %d chars, %d images", len(result), len(image_descs))
+        logger.info("[ODT] fallback: %d chars", len(result))
         return result
 
     except Exception as exc:
-        logger.error("[ODT] Enhanced failed: %s", exc)
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp.flush()
-                odt_doc = load_odt(tmp.name)
-                return "\n".join(
-                    teletype.extractText(p)
-                    for p in odt_doc.getElementsByType(odf_text.P)
-                )
-        except Exception as exc2:
-            logger.error("[ODT] Fallback also failed: %s", exc2)
-            return ""
+        logger.error("[ODT] All methods failed: %s", exc)
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,67 +1,64 @@
 """
-extraction_engine.py
-────────────────────────────────────────────────────────────────────────────────
-Multi-modal exam extraction engine for Eduket OS.
+extraction_engine.py — v4 (render-first, images stored in Firebase)
+─────────────────────────────────────────────────────────────────────
+Every DOCX/ODT is converted to PDF by LibreOffice, rendered page-by-page
+at 200 DPI, and each page image is uploaded to Firebase Storage.
 
-Drop-in replacement for the extraction helpers in app.py. Import this file
-and remove the equivalent functions from app.py (see INTEGRATION NOTE at
-the bottom of this file).
+Groq vision then reads each page and produces:
+  - Structured question JSON
+  - questionImageUrl  → page PNG URL (set when question has a visual element)
+  - questionLatex     → LaTeX string for maths equations (render with MathJax)
+  - questionTable     → markdown-format table for Accounting (render as HTML table)
 
-WHAT THIS FIXES vs app.py
-──────────────────────────
-1. DOCX IMAGES  — DOCX files are ZIP containers. Images live at
-   word/media/. This module extracts every embedded image, sends each one
-   to Groq vision (llama-4-scout), and inserts a [DIAGRAM: <description>]
-   placeholder at the correct paragraph position so the question parser
-   "sees" diagram context.
+This means students see the ACTUAL diagram/graph/circuit/table, not a
+prose description, because the stored PNG is served directly in the exam UI.
 
-2. OMML MATH    — Word stores equations as <m:oMath> XML elements. The
-   para.text shortcut returns "" for equation blocks, silently dropping all
-   formulas. This module walks the XML directly and converts OMML to ASCII
-   math notation ([EQ: ...]) before handing off to the parser.
+─── SETUP ────────────────────────────────────────────────────────────────────
+Render build command (Settings → Build Command):
+  apt-get install -y libreoffice --no-install-recommends && pip install -r requirements.txt
 
-3. PDF IMAGES   — Rather than only falling back to full-page OCR when native
-   text fails, this module does a hybrid pass: native PyMuPDF text + per-image
-   Groq vision description on every page regardless of text density.
+─── app.py changes needed ────────────────────────────────────────────────────
+1. Import:
+     from extraction_engine import extract_questions_from_file, extract_text_from_file, parse_questions_universal
 
-4. SUBJECT-AWARE PARSING — The Groq question-parsing prompt is dynamically
-   extended with subject-specific instructions:
-   • Accounting: ledger/T-account/financial statement structure
-   • Mathematics / Sciences: equation and formula preservation
-   • Languages: comprehension passage as parent_context
-   • Business/Economics: case study as parent_context
-   • CAT/IT: code snippet preservation
-   All other subjects fall through to sensible CAPS/NSC defaults.
+2. In run_extraction_pipeline, replace:
+     exam_text = extract_text_from_file(exam_bytes, exam_fn)
+     ...
+     questions = parse_questions_universal(exam_text, subject, grade)
+   with:
+     questions = extract_questions_from_file(
+         exam_bytes, exam_fn, subject, grade,
+         exam_id=exam_id,
+         school_folder=meta.get("schoolFolder", school_id)
+     )
 
-INTEGRATION
-───────────
-In app.py, replace:
-    from [inline functions] import extract_text_from_docx, ...
-with:
-    from extraction_engine import (
-        extract_text_from_file,
-        parse_questions_universal,
-    )
+3. In the batch.set() for exam_questions, add:
+     "questionImageUrl":  q.get("questionImageUrl"),
+     "hasVisual":         q.get("has_visual", False),
+     "questionLatex":     q.get("question_latex"),
+     "questionTable":     q.get("question_table"),
 
-Also update the two calls in run_extraction_pipeline that omit subject:
-    extract_text_from_file(exam_bytes, exam_fn)          # old
-    extract_text_from_file(exam_bytes, exam_fn, subject) # new
-    extract_text_from_file(memo_bytes, memo_fn)          # old
-    extract_text_from_file(memo_bytes, memo_fn, subject) # new
+─── Frontend changes needed (ExamDisplay / question renderer) ────────────────
+For each question, render in order:
+  1. If questionLatex:  <MathJax>{questionLatex}</MathJax>
+  2. If questionTable:  parse markdown table → <table>
+  3. If questionImageUrl: <img src={questionImageUrl} />
+  4. Question text (may also contain [DIAGRAM: ...] for accessibility)
 """
 
 import io
 import os
 import re
 import json
+import uuid
 import base64
-import zipfile
-import tempfile
+import shutil
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
-import fitz          # PyMuPDF
+import fitz
 import mammoth
 from docx import Document
 from docx.table import Table
@@ -73,26 +70,14 @@ from groq import Groq
 
 logger = logging.getLogger(__name__)
 
-# ─── Groq models ──────────────────────────────────────────────────────────────
-_VISION_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
-_PARSER_MODEL  = "llama-3.3-70b-versatile"
-_IMAGE_MIN_BYTES = 2_000          # skip images smaller than this (bullets/borders)
-_CHUNK_SIZE      = 10_000
-_CHUNK_OVERLAP   = 800
-
-
-# Clark-notation URI for r:embed — never varies regardless of prefix used
-_R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
-# ODT namespaces (clark form)
-_ODT_TEXT_P     = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}p"
-_ODT_TEXT_H     = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}h"
-_ODT_DRAW_IMAGE = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}image"
-_ODT_XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
-
+_VISION_MODEL        = "meta-llama/llama-4-scout-17b-16e-instruct"
+_PARSER_MODEL        = "llama-3.3-70b-versatile"
+_PAGE_DPI            = 200          # 200 DPI = clear A4 page, good for diagrams
+_MAX_TOKENS_PER_PAGE = 4096
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  SUBJECT CLASSIFICATION
+# 1. SUBJECT CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SUBJECT_MAP = {
@@ -109,644 +94,310 @@ _SUBJECT_MAP = {
     "cat_it":        {"computer applications technology", "cat",
                       "information technology", "it"},
     "history":       {"history"},
-    "arts":          {"visual arts", "dramatic arts", "music", "dance"},
 }
 
-
-
-def _find_rids_in_element(elem) -> list:
-    """
-    Reliably find all r:embed relationship IDs in an lxml element subtree.
-    Uses clark notation so namespace prefix variations never matter.
-    Replaces the fragile r'r:embed="(rId\\d+)"' regex on serialized XML.
-    """
-    return [
-        node.get(_R_EMBED)
-        for node in elem.iter()
-        if node.get(_R_EMBED)
-    ]
-
-
-def _odt_walk_content(content_xml_bytes: bytes, image_descs: dict) -> list:
-    """
-    Walk ODT content.xml and return text lines with [DIAGRAM: ...]
-    placeholders inserted at the paragraph they actually belong to,
-    not appended at the end of the document.
-    """
-    lines = []
-    try:
-        root = ET.fromstring(content_xml_bytes)
-
-        def _para_parts(elem):
-            text = "".join(elem.itertext()).strip()
-            diagrams = []
-            for node in elem.iter():
-                if node.tag == _ODT_DRAW_IMAGE:
-                    href = node.get(_ODT_XLINK_HREF, "")
-                    # Normalize: "./Pictures/img.png" → "Pictures/img.png"
-                    for prefix in ("./", "../", "/"):
-                        if href.startswith(prefix):
-                            href = href[len(prefix):]
-                    if href and not href.startswith("Pictures/"):
-                        href = f"Pictures/{href}"
-                    if href in image_descs:
-                        diagrams.append(image_descs[href])
-            return text, diagrams
-
-        for elem in root.iter():
-            if elem.tag in (_ODT_TEXT_P, _ODT_TEXT_H):
-                text, diagrams = _para_parts(elem)
-                # Diagrams come first — they usually precede the question text
-                for desc in diagrams:
-                    lines.append(f"[DIAGRAM: {desc}]")
-                if text:
-                    lines.append(text)
-    except Exception as exc:
-        logger.error("[ODT walk] %s", exc)
-    return lines
-
-def _subject_category(subject: str) -> str:
+def _cat(subject: str) -> str:
     s = subject.lower().strip()
-    for cat, keywords in _SUBJECT_MAP.items():
-        if any(k in s for k in keywords):
+    for cat, kw in _SUBJECT_MAP.items():
+        if any(k in s for k in kw):
             return cat
     return "general"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  GROQ VISION HELPER
+# 2. FIREBASE STORAGE — page image upload
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _vision_describe(image_bytes: bytes, ext: str, subject: str,
-                     client: Groq) -> str:
+def _upload_page_image(school_folder: str, exam_id: str,
+                        page_num: int, png_bytes: bytes) -> str | None:
     """
-    Sends a single image to Groq vision and returns a concise
-    educational description suitable for insertion into exam text.
+    Upload a rendered page PNG to Firebase Storage.
+    Returns a download URL with token, or None on failure.
+    Path: exam_pages/{schoolFolder}/{examId}/page_{nnn}.png
     """
     try:
-        media = {
-            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
-            "tiff": "image/tiff", "tif": "image/tiff",
-        }.get(ext.lower(), "image/png")
-
-        b64 = base64.b64encode(image_bytes).decode()
-        resp = client.chat.completions.create(
-            model=_VISION_MODEL,
-            messages=[{"role": "user", "content": [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:{media};base64,{b64}"}},
-                {"type": "text", "text": (
-                    f"This is a figure from a South African {subject} exam paper. "
-                    "Describe it precisely for a student who cannot see it. Include: "
-                    "all labels, axes with units, scale, measurements, and component names. "
-                    "If a graph: state x-axis, y-axis, curve shape, key points. "
-                    "If a circuit diagram: list all components and connections. "
-                    "If a geometric figure: all side lengths, angles, labels. "
-                    "If a biological diagram: all labelled structures. "
-                    "If a map: region names, legend, key features. "
-                    "If a table: describe columns, rows, key values. "
-                    "If pure equations or formulas: transcribe them in ASCII math exactly. "
-                    "Max 120 words. No preamble."
-                )},
-            ]}],
-            max_tokens=350,
+        from firebase_admin import storage as fb_storage
+        bucket = fb_storage.bucket()
+        token  = str(uuid.uuid4())
+        path   = f"exam_pages/{school_folder}/{exam_id}/page_{page_num:03d}.png"
+        blob   = bucket.blob(path)
+        blob.metadata = {"firebaseStorageDownloadTokens": token}
+        blob.upload_from_string(png_bytes, content_type="image/png")
+        blob.patch()
+        bucket_name  = bucket.name
+        encoded_path = path.replace("/", "%2F")
+        url = (
+            f"https://firebasestorage.googleapis.com/v0/b/{bucket_name}"
+            f"/o/{encoded_path}?alt=media&token={token}"
         )
-        return resp.choices[0].message.content.strip()
+        logger.info("[Storage] Uploaded page %d → %s", page_num, path)
+        return url
     except Exception as exc:
-        logger.warning("[Vision] Failed: %s", exc)
-        return "figure or diagram (vision description unavailable)"
+        logger.error("[Storage] Upload failed p%d: %s", page_num, exc)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3.  OMML → ASCII MATH  (DOCX equations)
+# 3. LIBREOFFICE — DOCX/ODT → PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
-_OMML = "http://schemas.openxmlformats.org/officeDocument/2006/math"
-_W    = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+def _lo_available() -> bool:
+    return bool(shutil.which("libreoffice") or shutil.which("soffice"))
 
 
-def _omml_node_to_ascii(elem) -> str:
+def _lo_cmd() -> str:
+    return shutil.which("libreoffice") or shutil.which("soffice") or "libreoffice"
+
+
+def _convert_to_pdf(file_bytes: bytes, filename: str) -> bytes | None:
     """
-    Lightweight recursive OMML → ASCII conversion.
-    Goal: produce something an LLM can reason about,
-    not perfect LaTeX.
+    Convert DOCX/ODT → PDF using LibreOffice headless.
+    LibreOffice renders fonts, OMML equations, embedded images, and table
+    formatting exactly as Word/Calc would display them — this is the only
+    reliable way to preserve complex document structure.
+    Returns PDF bytes or None if LibreOffice unavailable.
     """
-    local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+    if not _lo_available():
+        logger.warning("[LibreOffice] Not installed — falling back to text path")
+        return None
 
-    def children_text():
-        return "".join(_omml_node_to_ascii(c) for c in elem)
-
-    def child_text(local_name):
-        for c in elem:
-            if c.tag.split("}")[-1] == local_name:
-                return _omml_node_to_ascii(c)
-        return ""
-
-    if local == "t":               # text run
-        return elem.text or ""
-    if local == "f":               # fraction
-        return f"({child_text('num')}/{child_text('den')})"
-    if local == "sSup":            # superscript  x^n
-        return f"{child_text('e')}^({child_text('sup')})"
-    if local == "sSub":            # subscript    x_n
-        return f"{child_text('e')}_{{{child_text('sub')}}}"
-    if local == "sSubSup":         # sub+superscript
-        return f"{child_text('e')}_{{{child_text('sub')}}}^({child_text('sup')})"
-    if local == "rad":             # radical / nth-root
-        deg = child_text("deg").strip()
-        return f"sqrt({child_text('e')})" if not deg else f"root_{deg}({child_text('e')})"
-    if local == "nary":            # summation / integral / product
-        # Try to extract the operator character
-        chr_elem = elem.find(f".//{{{_OMML}}}chr")
-        op = (chr_elem.get(f"{{{_OMML}}}val", "∫")
-              if chr_elem is not None else "∫")
-        sub = child_text("sub")
-        sup = child_text("sup")
-        body = child_text("e")
-        return f"{op}_{{{sub}}}^({sup}) {body}"
-    if local == "d":               # delimiter ()[]{}
-        return f"({children_text()})"
-    if local == "m":               # matrix
-        rows = [child_text("mr") for c in elem
-                if c.tag.split("}")[-1] == "mr"]
-        return "[[" + "], [".join(rows) + "]]"
-    if local == "func":            # function  sin, cos, lim …
-        name = child_text("fName")
-        arg  = child_text("e")
-        return f"{name}({arg})"
-    if local in ("r", "num", "den", "e", "sup", "sub", "deg",
-                 "fName", "base", "lim", "mr", "oMathPara"):
-        return children_text()
-    if local == "oMath":
-        return children_text()
-    # Default: recurse
-    return children_text()
-
-
-def _para_text_with_math(para) -> str:
-    """
-    Extract text from a python-docx Paragraph including OMML equations.
-    Returns a string with equations rendered as [EQ: ...].
-    """
-    parts = []
-    for child in para._element:
-        tag_local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-        ns_uri    = child.tag.split("}")[0].lstrip("{") if "}" in child.tag else ""
-
-        if tag_local == "oMath" and ns_uri == _OMML:
-            math_text = _omml_node_to_ascii(child).strip()
-            if math_text:
-                parts.append(f"[EQ: {math_text}]")
-
-        elif tag_local == "r":      # regular run
-            for node in child:
-                if node.tag.split("}")[-1] == "t" and node.text:
-                    parts.append(node.text)
-
-        elif tag_local == "hyperlink":
-            for run in child:
-                if run.tag.split("}")[-1] == "r":
-                    for node in run:
-                        if node.tag.split("}")[-1] == "t" and node.text:
-                            parts.append(node.text)
-
-    return "".join(parts).strip()
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = os.path.join(tmp, filename)
+        with open(inp, "wb") as f:
+            f.write(file_bytes)
+        try:
+            subprocess.run(
+                [_lo_cmd(), "--headless", "--convert-to", "pdf",
+                 "--outdir", tmp, inp],
+                check=True, timeout=120, capture_output=True,
+            )
+            pdf = os.path.join(tmp, Path(filename).stem + ".pdf")
+            if os.path.exists(pdf):
+                data = open(pdf, "rb").read()
+                logger.info("[LibreOffice] %s → PDF (%d bytes)", filename, len(data))
+                return data
+            logger.error("[LibreOffice] PDF not produced for %s", filename)
+        except subprocess.TimeoutExpired:
+            logger.error("[LibreOffice] Timeout: %s", filename)
+        except subprocess.CalledProcessError as e:
+            logger.error("[LibreOffice] %s", e.stderr.decode(errors="replace"))
+        except Exception as e:
+            logger.error("[LibreOffice] %s", e)
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  DOCX EXTRACTION  (text + math + images)
+# 4. PAGE RENDERING — PDF → PNG
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _docx_extract_images(docx_bytes: bytes) -> dict:
+def _render_pages(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
     """
-    Returns {rId: (image_bytes, extension)} for all images in the DOCX body.
-    DOCX is a ZIP — images live at word/media/<name>.
+    Render each PDF page as a PNG at _PAGE_DPI.
+    Returns [(page_num_1based, png_bytes), ...].
     """
-    images = {}
-    try:
-        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
-            # Parse relationship file to map rId → image path
-            try:
-                rels_xml  = z.read("word/_rels/document.xml.rels")
-                rels_root = ET.fromstring(rels_xml)
-                ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
-                for rel in rels_root.findall("r:Relationship", ns):
-                    if "image" not in rel.get("Type", "").lower():
-                        continue
-                    rid    = rel.get("Id", "")
-                    target = rel.get("Target", "")
-                    if not target.startswith("word/"):
-                        target = f"word/{target}"
-                    try:
-                        img_bytes = z.read(target)
-                        if len(img_bytes) < _IMAGE_MIN_BYTES:
-                            continue          # skip decorative bullets
-
-                        ext = Path(target).suffix.lstrip(".").lower() or "png"
-                        if ext in ("wmf", "emf"):
-                            continue  # vector formats, skip vision
-                        images[rid] = (img_bytes, ext)
-                    except KeyError:
-                        pass
-            except Exception as exc:
-                logger.warning("[DOCX images] Rels parse failed: %s", exc)
-    except Exception as exc:
-        logger.warning("[DOCX images] ZIP failed: %s", exc)
-    return images
-
-
-def extract_text_from_docx(file_bytes: bytes, subject: str = "General") -> str:
-    from docx.oxml.table import CT_Tbl
-    from docx.oxml.text.paragraph import CT_P
-
-    try:
-        doc    = Document(io.BytesIO(file_bytes))
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        cat    = _subject_category(subject)
-
-        raw_images = _docx_extract_images(file_bytes)
-        image_descs = {}
-        if raw_images:
-            logger.info("[DOCX] Describing %d image(s) …", len(raw_images))
-        for rid, (img_bytes, ext) in raw_images.items():
-            image_descs[rid] = _vision_describe(img_bytes, ext, subject, client)
-
-        lines = []
-
-        def _add_para(para: Paragraph):
-            text = _para_text_with_math(para)
-            if text:
-                lines.append(text)
-            # ── FIX 1: use clark-notation attribute lookup, not XML string regex ──
-            for rid in _find_rids_in_element(para._element):
-                if rid in image_descs:
-                    lines.append(f"[DIAGRAM: {image_descs[rid]}]")
-
-        def _add_table(table: Table):
-            for i, row in enumerate(table.rows):
-                # ── FIX 3: deduplicate merged cells by underlying _tc identity ──
-                seen_tc: set = set()
-                unique_cells = []
-                for c in row.cells:
-                    tc_id = id(c._tc)
-                    if tc_id not in seen_tc:
-                        seen_tc.add(tc_id)
-                        unique_cells.append(c)
-
-                cell_texts = [c.text.strip() for c in unique_cells]
-
-                if cat == "accounting":
-                    if any(cell_texts):
-                        prefix = "HEADER:" if i == 0 else "ROW:"
-                        lines.append(f"{prefix} " + " | ".join(cell_texts))
-                else:
-                    row_txt = " | ".join(t for t in cell_texts if t)
-                    if row_txt:
-                        lines.append(row_txt)
-
-                # ── FIX 2: extract images from table cells ──────────────────────
-                for c in unique_cells:
-                    for rid in _find_rids_in_element(c._tc):
-                        if rid in image_descs:
-                            lines.append(f"[DIAGRAM: {image_descs[rid]}]")
-
-        for child in doc.element.body.iterchildren():
-            if isinstance(child, CT_P):
-                _add_para(Paragraph(child, doc))
-            elif isinstance(child, CT_Tbl):
-                _add_table(Table(child, doc))
-
-        result = "\n".join(lines)
-        logger.info("[DOCX] %d chars, %d images", len(result), len(image_descs))
-        return result
-
-    except Exception as exc:
-        logger.error("[DOCX] Enhanced extraction failed: %s", exc)
-        return _docx_basic(file_bytes)
-
-
-def _docx_basic(file_bytes: bytes) -> str:
-    """Fallback plain-text DOCX extractor (mirrors original app.py)."""
-    from docx.oxml.table import CT_Tbl
-    from docx.oxml.text.paragraph import CT_P
-    try:
-        doc   = Document(io.BytesIO(file_bytes))
-        lines = []
-        for child in doc.element.body.iterchildren():
-            if isinstance(child, CT_P):
-                t = Paragraph(child, doc).text.strip()
-                if t:
-                    lines.append(t)
-            elif isinstance(child, CT_Tbl):
-                for row in Table(child, doc).rows:
-                    cells = [c.text.strip() for c in row.cells]
-                    r = " | ".join(c for c in cells if c)
-                    if r:
-                        lines.append(r)
-        return "\n".join(lines)
-    except Exception as exc:
-        logger.error("[DOCX basic] %s", exc)
-        return ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5.  ODT EXTRACTION  (text + images)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_text_from_odt(file_bytes: bytes, subject: str = "General") -> str:
-    try:
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-        # Extract and describe all images from the ZIP
-        image_descs: dict = {}
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-            for name in z.namelist():
-                if not name.startswith("Pictures/") or name.endswith("/"):
-                    continue
-                try:
-                    img_bytes = z.read(name)
-                    if len(img_bytes) < _IMAGE_MIN_BYTES:
-                        continue
-                    ext  = Path(name).suffix.lstrip(".") or "png"
-                    desc = _vision_describe(img_bytes, ext, subject, client)
-                    image_descs[name] = desc
-                    logger.info("[ODT] %s → %s …", name, desc[:60])
-                except Exception as exc:
-                    logger.warning("[ODT] image %s failed: %s", name, exc)
-
-            # ── FIX 4: parse content.xml for inline image positions ──────────
-            try:
-                content_xml = z.read("content.xml")
-                lines = _odt_walk_content(content_xml, image_descs)
-                if lines:
-                    result = "\n".join(lines)
-                    logger.info("[ODT] %d chars, %d images inline",
-                                len(result), len(image_descs))
-                    return result
-            except Exception as exc:
-                logger.warning("[ODT] content.xml walk failed: %s — "
-                               "falling back to odfpy", exc)
-
-        # Fallback: odfpy plain text (images already described, append at end)
-        with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp.flush()
-            odt_doc    = load_odt(tmp.name)
-            paragraphs = odt_doc.getElementsByType(odf_text.P)
-            lines      = [
-                teletype.extractText(p) for p in paragraphs
-                if teletype.extractText(p).strip()
-            ]
-
-        if image_descs:
-            lines.append("\n─── FIGURES / DIAGRAMS ───")
-            for i, desc in enumerate(image_descs.values(), 1):
-                lines.append(f"[DIAGRAM {i}: {desc}]")
-
-        result = "\n".join(lines)
-        logger.info("[ODT] fallback: %d chars", len(result))
-        return result
-
-    except Exception as exc:
-        logger.error("[ODT] All methods failed: %s", exc)
-        return ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6.  PDF EXTRACTION  (hybrid: native text + per-image vision)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_text_from_pdf(file_bytes: bytes,
-                          subject: str = "General") -> str:
-    """
-    Hybrid PDF extractor:
-    Stage 1 — PyMuPDF native text per page.
-    Stage 2 — Groq vision for every embedded image on that page,
-               regardless of whether the page also has native text.
-    Stage 3 — Pure Groq vision OCR for scanned / image-only PDFs.
-    """
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    try:
-        doc             = fitz.open(stream=file_bytes, filetype="pdf")
-        total_text      = ""
-        page_blocks: list[str] = []
-
-        for i, page in enumerate(doc):
-            page_text  = page.get_text().strip()
-            total_text += page_text
-            page_lines = []
-            if page_text:
-                page_lines.append(page_text)
-
-            # Describe every embedded image on this page
-            for img_idx, img_info in enumerate(page.get_images(full=True)):
-                try:
-                    xref = img_info[0]
-                    pix  = fitz.Pixmap(doc, xref)
-                    if pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    img_bytes = pix.tobytes("png")
-                    if len(img_bytes) < _IMAGE_MIN_BYTES:
-                        continue
-                    desc = _vision_describe(img_bytes, "png", subject, client)
-                    page_lines.append(f"[DIAGRAM: {desc}]")
-                    logger.info("[PDF] p%d img%d → %s …",
-                                i + 1, img_idx + 1, desc[:60])
-                except Exception as exc:
-                    logger.warning("[PDF] p%d img%d failed: %s",
-                                   i + 1, img_idx + 1, exc)
-
-            page_blocks.append("\n".join(page_lines))
-
-        doc.close()
-
-        if total_text.strip():
-            result = "\n\n".join(page_blocks)
-            logger.info("[PDF] Hybrid: %d chars", len(result))
-            return result
-
-        # No native text — full OCR
-        logger.info("[PDF] No native text — full vision OCR")
-        return _pdf_vision_ocr(file_bytes, subject, client)
-
-    except Exception as exc:
-        logger.error("[PDF] Enhanced failed: %s", exc)
-        return _pdf_vision_ocr(
-            file_bytes, subject, Groq(api_key=os.getenv("GROQ_API_KEY"))
-        )
-
-
-def _pdf_vision_ocr(pdf_bytes: bytes, subject: str, client: Groq) -> str:
-    """Full-page Groq vision OCR for scanned PDFs."""
-    all_text = ""
+    pages = []
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        mat = fitz.Matrix(_PAGE_DPI / 72, _PAGE_DPI / 72)
         for i, page in enumerate(doc):
             try:
-                pix  = page.get_pixmap(dpi=200)
-                img  = base64.b64encode(pix.tobytes("png")).decode()
-                resp = client.chat.completions.create(
-                    model=_VISION_MODEL,
-                    messages=[{"role": "user", "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{img}"}},
-                        {"type": "text", "text": (
-                            f"South African CAPS/NSC {subject} exam page. "
-                            "Extract ALL text exactly. Preserve question numbers, "
-                            "marks in brackets like (2), MCQ options A B C D. "
-                            "For any diagram/graph/figure write [DIAGRAM: <description>]. "
-                            "For any equation write [EQ: <ASCII math>]. "
-                            "Plain text only, no markdown."
-                        )},
-                    ]}],
-                    max_tokens=2500,
-                )
-                page_text = resp.choices[0].message.content.strip()
-                all_text += page_text + "\n\n"
-                logger.info("[OCR] Page %d done", i + 1)
-            except Exception as exc:
-                logger.error("[OCR] Page %d failed: %s", i + 1, exc)
+                pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                png  = pix.tobytes("png")
+                pages.append((i + 1, png))
+                logger.info("[Render] Page %d: %d bytes", i + 1, len(png))
+            except Exception as e:
+                logger.error("[Render] Page %d: %s", i + 1, e)
         doc.close()
-    except Exception as exc:
-        logger.error("[OCR] Fatal: %s", exc)
-    return all_text
+    except Exception as e:
+        logger.error("[Render] %s", e)
+    return pages
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  UNIFIED FILE ROUTER
+# 5. VISION EXTRACTION — one page → question JSON
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_text_from_file(file_bytes: bytes,
-                           filename: str,
-                           subject: str = "General") -> str:
-    """
-    Route to the correct extractor by file extension.
-    Subject is passed through to enable subject-aware extraction
-    (image descriptions, table formatting, math extraction).
-    """
-    lower = filename.lower()
-    if lower.endswith(".docx"):
-        return extract_text_from_docx(file_bytes, subject)
-    if lower.endswith(".odt"):
-        return extract_text_from_odt(file_bytes, subject)
-    if lower.endswith(".pdf"):
-        return extract_text_from_pdf(file_bytes, subject)
-    if lower.endswith(".doc"):
-        try:
-            return mammoth.extract_raw_text(io.BytesIO(file_bytes)).value
-        except Exception as exc:
-            logger.error("[DOC] mammoth failed: %s", exc)
-    logger.warning("[extract_text_from_file] Unrecognised extension: %s",
-                   filename)
-    return ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 8.  SUBJECT-AWARE PARSING HINTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-_PARSING_HINTS: dict[str, str] = {
+_SUBJECT_PROMPTS = {
     "accounting": """
-ACCOUNTING-SPECIFIC RULES:
-- Financial statements (Income Statement, Balance Sheet, Cash Flow, Notes)
-  are ONE question even if they span many lines. Capture the entire table
-  structure inside the "question" field using HEADER:/ROW: lines.
-- T-accounts / Ledger accounts: capture both debit AND credit sides.
-- Trial balance: capture every account name and its debit/credit amount.
-- Journal entries: include date, account name, debit, credit columns.
-- Reconciliation statements: preserve every line item.
-- Mark allocation per section often appears as (x) at end of statement.
-- Sub-questions like "1.1 Prepare the Income Statement (20)" should each be
-  a separate item with parent_question = "QUESTION 1".
-- type="accounting_statement" for financial statement preparation questions.
+ACCOUNTING EXAM RULES — follow precisely:
+• Financial statements (Income Statement, Balance Sheet, Cash Flow, Notes) are ONE question.
+  Reproduce the complete table in the "question_table" field using GitHub markdown:
+  | Account | Debit | Credit |
+  |---------|-------|--------|
+  | Sales   |       | 50000  |
+  Preserve EVERY row, column header, and numerical value exactly.
+• T-accounts: include both debit AND credit columns in question_table.
+• Trial balance: every account name and its balance in question_table.
+• Journal entries: date, account, debit, credit in question_table.
+• type="accounting_statement" for statement preparation questions.
+• has_visual=true for any question showing a financial table or diagram.
 """,
     "mathematics": """
-MATHEMATICS-SPECIFIC RULES:
-- Preserve ALL equations and formulas using [EQ: ...] notation already in
-  the text — do NOT strip or simplify them.
-- Geometric diagrams described as [DIAGRAM: ...] must appear in the question
-  field of the question that references them.
-- Multi-part questions (1.1.1, 1.1.2) must maintain full hierarchy with
-  parent_question and parent_context fields populated.
-- type="proof" for "Show that…" / "Prove that…" questions.
-- type="calculation" for numerical answer questions.
-- Data tables in data handling questions must be preserved in full.
-- Marks usually appear at end of line as (3) — parse carefully.
+MATHEMATICS EXAM RULES — follow precisely:
+• For every equation, formula, or mathematical expression: transcribe it in LaTeX
+  inside the question_latex field. Example: "Calculate x if \\\\frac{x^2+1}{2} = 5"
+  becomes question_latex: "$\\\\frac{x^2+1}{2} = 5$"
+• Use display math $$...$$ for standalone equations, inline $...$ for inline.
+• Geometric figures, graphs, number lines: set has_visual=true so the page image is shown.
+• type="proof" for Show that / Prove that questions.
+• type="calculation" for numerical answer questions.
+• Preserve ALL marks notation, e.g. "(3)" at end of question text.
 """,
     "sciences": """
-PHYSICAL SCIENCES-SPECIFIC RULES:
-- Preserve all SI units exactly (m·s⁻², N, J, Pa, mol·dm⁻³, etc.).
-- [DIAGRAM: ...] placeholders for circuit diagrams, force diagrams, graphs,
-  wave diagrams must be included in the question field they belong to.
-- Equations such as [EQ: v² = u² + 2as] must be preserved in full.
-- Scenario/context paragraphs (the "given information" block before sub-
-  questions) are the parent_context for all sub-questions under them.
-- type="practical" for investigation / experiment design questions.
-- type="calculation" for numerical questions requiring formula application.
+PHYSICAL SCIENCES RULES:
+• Circuit diagrams, force diagrams, velocity-time graphs, wave diagrams:
+  set has_visual=true so students see the actual diagram from the page image.
+  Also describe the diagram in the question text: [DIAGRAM: resistor R1=10Ω...].
+• Preserve ALL SI units exactly: m·s⁻², N, J, Pa, mol·dm⁻³, kPa, etc.
+• Mathematical equations: use question_latex for formulas like $v^2 = u^2 + 2as$.
+• Scenario / "given information" block before sub-questions → parent_context.
+• type="practical" for investigation/experiment questions.
+• type="calculation" for formula-application questions.
 """,
     "life_sciences": """
-LIFE SCIENCES-SPECIFIC RULES:
-- [DIAGRAM: ...] placeholders (cells, organs, food webs) must be included in
-  the question field that asks about them.
-- "Label the parts" / "Identify structure X" questions: the diagram
-  description is the parent_context.
-- Data table / graph interpretation: preserve all column headers and values.
-- type="practical" for investigation / experiment questions.
+LIFE SCIENCES RULES:
+• Biological diagrams (cells, organs, food webs, plant cross-sections):
+  set has_visual=true, also write [DIAGRAM: labelled diagram of...] in question text.
+• Data tables: reproduce as markdown in question_table.
+• "Label parts A, B, C" → diagram description is parent_context, has_visual=true.
+• type="practical" for investigation questions.
 """,
     "geography": """
-GEOGRAPHY-SPECIFIC RULES:
-- [DIAGRAM: ...] placeholders for maps, climate graphs, cross-sections must
-  appear in the question field of the question referencing them.
-- Case study / stimulus text (newspaper extract, data set) is the
-  parent_context for all sub-questions beneath it.
-- Preserve all statistical values, percentages, and place names exactly.
+GEOGRAPHY RULES:
+• Maps, climate graphs, cross-sections, topographic extracts:
+  set has_visual=true so students see the actual image from the page.
+  Also describe: [MAP: showing Gauteng region with N1 highway...].
+• Stimulus text / case study is parent_context for all sub-questions below it.
+• Preserve all statistics, co-ordinates, and place names exactly.
+• Data tables → question_table in markdown format.
 """,
     "business": """
-BUSINESS STUDIES / ECONOMICS-SPECIFIC RULES:
-- Case study or scenario text is the parent_context for every sub-question
-  that references it — do NOT repeat it in each question field.
-- type="essay" for discussion / critically analyse / evaluate questions
-  (usually 20–40 marks).
-- type="short_answer" for definition / identify / list questions (2–4 marks).
-- Quotations from the scenario that sub-questions reference must appear in
-  parent_context.
+BUSINESS STUDIES / ECONOMICS RULES:
+• Case study or scenario text → parent_context (don't repeat per sub-question).
+• type="essay" for discuss/critically analyse/evaluate questions (20–40 marks).
+• type="short_answer" for define/identify/list questions (2–4 marks).
+• Financial data tables → question_table in markdown format.
 """,
     "language": """
-LANGUAGE (ENGLISH / AFRIKAANS / IsiZulu / etc.) RULES:
-- Reading comprehension passage is the parent_context for ALL questions
-  that follow it — set parent_context to the full passage text (or a clear
-  reference like "See Reading Passage A above").
-- type="mcq" for vocabulary / grammar multiple-choice questions.
-- type="essay" for creative writing / formal essay / summary tasks.
-- type="short_answer" for contextual comprehension questions.
-- Quoted lines from poetry / prose that a question asks about must appear
-  in the question field itself.
+LANGUAGE (ENGLISH / AFRIKAANS / etc.) RULES:
+• Reading/comprehension passage → parent_context for ALL sub-questions below it.
+• Poetry / quoted text that a question asks about → include in question field directly.
+• type="mcq" for vocabulary/grammar multiple-choice.
+• type="essay" for creative writing / formal essay / summary.
+• type="short_answer" for contextual questions.
 """,
     "cat_it": """
-CAT / INFORMATION TECHNOLOGY RULES:
-- Code snippets MUST be preserved exactly, including indentation and spacing.
-  Wrap in triple backticks inside the question field: ```pascal ... ```.
-- Scenario text (the problem description before sub-questions) is the
-  parent_context.
-- Spreadsheet cell references like B2:B10 or $A$1 must be preserved exactly.
-- type="practical" for spreadsheet / word processing / database tasks.
-- type="calculation" for algorithm / pseudocode / trace table questions.
+CAT / IT RULES:
+• Code snippets must be preserved EXACTLY including indentation.
+  Wrap in triple backticks with language: ```python\\n    x = 5\\n```.
+• Scenario text → parent_context.
+• Spreadsheet cell references like B2:B10 or $A$1 preserved exactly.
+• type="practical" for spreadsheet/database/word processing tasks.
+• type="calculation" for algorithm/pseudocode/trace table questions.
 """,
     "history": """
-HISTORY-SPECIFIC RULES:
-- Source / extract text (Document A, B, C) is the parent_context for any
-  question that refers to it.
-- type="essay" for extended writing / "to what extent" questions.
-- type="short_answer" for source analysis questions (2–4 marks).
-- Preserve all dates, names, and quoted text exactly.
+HISTORY RULES:
+• Source text (Document A, Cartoon B) → parent_context for questions referring to it.
+• type="essay" for "to what extent" / "discuss" extended writing questions.
+• Preserve all dates, names, and quoted text exactly.
+• has_visual=true for questions that reference a cartoon, photograph, or map.
 """,
     "general": "",
 }
 
 
+def _extract_page_questions(page_b64: str, page_url: str | None,
+                             subject: str, grade: str,
+                             page_num: int, client: Groq) -> list[dict]:
+    """
+    Extract questions from one rendered page image via Groq vision.
+    Returns a list of question dicts with full schema including image URLs.
+    """
+    cat        = _cat(subject)
+    subj_rules = _SUBJECT_PROMPTS.get(cat, "")
+    is_acct    = cat == "accounting"
+    is_maths   = cat == "mathematics"
+
+    prompt = f"""You are a professional South African exam paper parser reading page {page_num} of a {subject} Grade {grade} exam.
+
+Extract EVERY question on this page into a JSON array. Be thorough — include all sub-questions.
+
+OUTPUT SCHEMA (include all fields for every question):
+{{
+  "question_number":  "1.1"           // exactly as printed
+  "parent_question":  "QUESTION 1"    // section heading
+  "parent_context":   null            // scenario/passage shared by sub-questions, or null
+  "section":          "A"             // visible section letter, default "A"
+  "question":         "..."           // FULL question text
+  "type":             "short_answer"  // mcq|true_false|calculation|essay|short_answer|matching|practical|accounting_statement|open
+  "marks":            2               // integer from (2) or [2], default 1
+  "options":          null            // MCQ only: {{"A":"...","B":"...","C":"...","D":"..."}}
+  "column_a":         null            // matching left column list
+  "column_b":         null            // matching right column list
+  "memo":             null            // always null for question papers
+  "has_visual":       false           // TRUE if this question includes a diagram/graph/figure/image/map/circuit/table
+  "question_latex":   null            // LaTeX string for maths equations, e.g. "$x^2 + 1 = 0$"
+  "question_table":   null            // GitHub markdown table for accounting/data tables
+}}
+
+GENERAL RULES:
+- For ANY diagram, graph, figure, map, circuit, or image visible on this page near a question:
+  • Set has_visual=true on that question
+  • Also describe it in the question text: [DIAGRAM: all labels, axes, values, component names]
+  • The stored page image will be shown to students automatically when has_visual=true
+- Preserve ALL marks notation "(3)" at the end of question text
+- MCQ: A/B/C/D options must be COMPLETE answer text, not just letters
+
+{subj_rules}
+
+IMPORTANT FOR MATHEMATICS:
+- Every equation MUST appear in question_latex using proper LaTeX syntax
+- Fractions: \\frac{{num}}{{den}}   Powers: x^{{2}}   Roots: \\sqrt{{x}}
+- Greek: \\alpha \\beta \\theta      Trig: \\sin \\cos \\tan
+- Both question text AND question_latex should contain the equation
+
+IMPORTANT FOR ACCOUNTING:
+- Every financial table MUST appear in question_table as a full markdown table
+- Include EVERY row including totals, subtotals, and blank/formatting rows
+- Column headers must match what is shown on the page exactly
+
+Return ONLY a valid JSON array. No markdown fences. No explanation.
+Return [] for cover pages, instruction pages, or formula sheets with no questions."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=_VISION_MODEL,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{page_b64}"}},
+                {"type": "text", "text": prompt},
+            ]}],
+            max_tokens=_MAX_TOKENS_PER_PAGE,
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
+        m   = re.search(r"\[.*\]", raw, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group())
+            if isinstance(parsed, list):
+                # Attach the page image URL to every question that has a visual
+                if page_url:
+                    for q in parsed:
+                        if q.get("has_visual"):
+                            q["questionImageUrl"] = page_url
+                logger.info("[Vision] Page %d → %d questions", page_num, len(parsed))
+                return parsed
+    except json.JSONDecodeError as e:
+        logger.error("[Vision] Page %d JSON error: %s", page_num, e)
+    except Exception as e:
+        logger.error("[Vision] Page %d: %s", page_num, e)
+    return []
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# 9.  QUESTION PARSER
+# 6. MERGE + DEDUPLICATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _normalise_qnum(qn: str) -> str:
@@ -756,100 +407,216 @@ def _normalise_qnum(qn: str) -> str:
     return s
 
 
-def parse_questions_universal(exam_text: str,
-                               subject: str,
-                               grade: str) -> list:
-    """
-    Subject-aware question parser. Chunks the exam text and calls Groq
-    for each chunk, then deduplicates by question number.
+def _merge(page_results: list[list[dict]]) -> list[dict]:
+    """Merge question lists from all pages, deduplicating by question number."""
+    seen:  dict[str, int] = {}
+    final: list[dict]     = []
+    for page_qs in page_results:
+        for q in page_qs:
+            key = _normalise_qnum(q.get("question_number", "")) or q.get("question", "")[:60]
+            if key and key in seen:
+                # Keep later (more complete) version
+                final[seen[key]] = q
+            else:
+                if key:
+                    seen[key] = len(final)
+                final.append(q)
+    logger.info("[Merge] %d unique questions", len(final))
+    return final
 
-    Compared to the original app.py version, this adds:
-    - Subject-specific parsing hints in the prompt
-    - Instructions to preserve [DIAGRAM: ...] and [EQ: ...] in question fields
-    - Instructions to populate parent_context for scenario-based subjects
-    """
-    client   = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    cat      = _subject_category(subject)
-    hints    = _PARSING_HINTS.get(cat, "")
-    all_qs:  list[dict] = []
-    seen:    set[str]   = set()
 
-    chunks: list[str] = []
-    start = 0
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. PRIMARY PUBLIC API — QUESTION EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_questions_from_file(file_bytes: bytes, filename: str,
+                                 subject: str, grade: str,
+                                 exam_id: str = "",
+                                 school_folder: str = "shared") -> list[dict]:
+    """
+    PRIMARY entry point for question paper extraction.
+
+    Pipeline:
+      DOCX/ODT → LibreOffice → PDF → PyMuPDF renders pages at 200 DPI
+      → pages uploaded to Firebase Storage
+      → Groq vision per page → questions with questionImageUrl, questionLatex, questionTable
+      → merged and deduplicated question list
+
+    Falls back to text extraction + LLM parse if LibreOffice is unavailable.
+    """
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    lower  = filename.lower()
+
+    # ── Convert to PDF ──────────────────────────────────────────────────────
+    if lower.endswith(".pdf"):
+        pdf_bytes = file_bytes
+        logger.info("[Extract] PDF received directly: %s", filename)
+    else:
+        logger.info("[Extract] Converting %s → PDF (LibreOffice)", filename)
+        pdf_bytes = _convert_to_pdf(file_bytes, filename)
+
+    if pdf_bytes:
+        # ── Render pages ───────────────────────────────────────────────────
+        raw_pages = _render_pages(pdf_bytes)
+        if not raw_pages:
+            logger.error("[Extract] No pages rendered from %s", filename)
+        else:
+            # ── Upload page images + extract questions ─────────────────────
+            page_results: list[list[dict]] = []
+            for page_num, png_bytes in raw_pages:
+                # Upload page PNG to Firebase Storage
+                page_url = (
+                    _upload_page_image(school_folder, exam_id, page_num, png_bytes)
+                    if exam_id else None
+                )
+                # Vision extract
+                page_b64 = base64.b64encode(png_bytes).decode()
+                questions = _extract_page_questions(
+                    page_b64, page_url, subject, grade, page_num, client
+                )
+                page_results.append(questions)
+
+            questions = _merge(page_results)
+            if questions:
+                logger.info("[Extract] ✓ %d questions with images via render-first",
+                            len(questions))
+                return questions
+            logger.warning("[Extract] Vision returned 0 questions — trying fallback")
+
+    # ── Fallback: text extraction + LLM parse ──────────────────────────────
+    logger.info("[Extract] Fallback: text + LLM parse (%s)", filename)
+    text = extract_text_from_file(file_bytes, filename, subject)
+    if text.strip():
+        return parse_questions_universal(text, subject, grade)
+
+    logger.error("[Extract] All methods failed for %s", filename)
+    return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. TEXT EXTRACTION (for memos only — no vision needed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _docx_text(file_bytes: bytes) -> str:
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    try:
+        doc, lines = Document(io.BytesIO(file_bytes)), []
+        for child in doc.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                t = Paragraph(child, doc).text.strip()
+                if t: lines.append(t)
+            elif isinstance(child, CT_Tbl):
+                for row in Table(child, doc).rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    r = " | ".join(c for c in cells if c)
+                    if r: lines.append(r)
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("[DOCX text] %s", e); return ""
+
+
+def _odt_text(file_bytes: bytes) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
+            tmp.write(file_bytes); tmp.flush()
+            odt_doc = load_odt(tmp.name)
+            return "\n".join(
+                teletype.extractText(p)
+                for p in odt_doc.getElementsByType(odf_text.P)
+                if teletype.extractText(p).strip()
+            )
+    except Exception as e:
+        logger.error("[ODT text] %s", e); return ""
+
+
+def _pdf_text(file_bytes: bytes, subject: str) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    try:
+        doc  = fitz.open(stream=file_bytes, filetype="pdf")
+        text = "".join(page.get_text() + "\n" for page in doc)
+        doc.close()
+        if len(text.strip()) > 100:
+            return text
+        # Scanned PDF — OCR
+        doc, all_text = fitz.open(stream=file_bytes, filetype="pdf"), ""
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            img = base64.b64encode(pix.tobytes("png")).decode()
+            try:
+                r = client.chat.completions.create(
+                    model=_VISION_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
+                        {"type": "text", "text": f"{subject} exam memo. Extract ALL text. Plain text only."},
+                    ]}],
+                    max_tokens=2500,
+                )
+                all_text += r.choices[0].message.content.strip() + "\n\n"
+            except Exception as e:
+                logger.error("[PDF OCR] p%d: %s", i + 1, e)
+        doc.close()
+        return all_text
+    except Exception as e:
+        logger.error("[PDF text] %s", e); return ""
+
+
+def extract_text_from_file(file_bytes: bytes, filename: str,
+                           subject: str = "General") -> str:
+    """Text-only extraction for memos. No vision, no images."""
+    lower = filename.lower()
+    if lower.endswith(".docx"): return _docx_text(file_bytes)
+    if lower.endswith(".odt"):  return _odt_text(file_bytes)
+    if lower.endswith(".pdf"):  return _pdf_text(file_bytes, subject)
+    if lower.endswith(".doc"):
+        try: return mammoth.extract_raw_text(io.BytesIO(file_bytes)).value
+        except Exception as e: logger.error("[DOC] %s", e)
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. TEXT FALLBACK PARSER (when LibreOffice unavailable)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_questions_universal(exam_text: str, subject: str, grade: str) -> list[dict]:
+    """LLM parser for plain text. Fallback only."""
+    client, cat = Groq(api_key=os.getenv("GROQ_API_KEY")), _cat(subject)
+    all_qs, seen = [], set()
+    CHUNK, OVERLAP = 10_000, 800
+
+    chunks, start = [], 0
     while start < len(exam_text):
-        chunks.append(exam_text[start:start + _CHUNK_SIZE])
-        start += _CHUNK_SIZE - _CHUNK_OVERLAP
+        chunks.append(exam_text[start:start + CHUNK])
+        start += CHUNK - OVERLAP
 
     for idx, chunk in enumerate(chunks):
-        logger.info("[Parser] Chunk %d/%d — %s", idx + 1, len(chunks), subject)
-
-        prompt = f"""You are an expert at parsing South African CAPS/NSC/IEB exam papers for {subject} Grade {grade}.
-
-Extract EVERY question from the text below into a JSON array.
-
-GENERAL RULES:
-- MCQ: split options into A/B/C/D dict, type="mcq"
-- True/False: type="true_false"
-- Matching: type="matching", column_a=[], column_b=[]
-- Calculation: type="calculation"
-- Essay / discuss / analyse: type="essay"
-- Short answer / define / identify: type="short_answer"
-- Default: type="open"
-- Marks: integer from brackets like (2) or [2], default 1
-- question_number: exactly as printed, e.g. "1.1", "2.3.1", "QUESTION 3"
-- parent_question: the top-level question heading, e.g. "QUESTION 1"
-- parent_context: scenario / passage / source text shared by multiple sub-questions (null if none)
-- If a [DIAGRAM: ...] placeholder appears near a question, include it INSIDE the "question" field
-- If an [EQ: ...] placeholder appears near a question, include it INSIDE the "question" field
-- Preserve table structures by including them verbatim in the "question" field
-
-SUBJECT-SPECIFIC RULES:
-{hints}
-
-Return ONLY a valid JSON array. No markdown, no explanation.
-
-Each item:
-{{
-  "question_number": "1.1",
-  "parent_question": "QUESTION 1",
-  "parent_context": null,
-  "section": "A",
-  "question": "Full question text including any [DIAGRAM: ...] or [EQ: ...] content",
-  "type": "short_answer",
-  "marks": 2,
-  "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
-  "column_a": null,
-  "column_b": null,
-  "memo": null
-}}
-
-Subject: {subject} | Grade: {grade}
-
-EXAM TEXT:
+        prompt = f"""Parse this {subject} Grade {grade} exam text into a JSON array.
+MCQ→type="mcq"+options. true_false. calculation. essay. short_answer. Default: open.
+Marks from (2)/[2]. Include question_number, parent_question, parent_context, section.
+Return ONLY valid JSON array. Each item:
+{{"question_number":"1.1","parent_question":"QUESTION 1","parent_context":null,
+"section":"A","question":"...","type":"open","marks":1,"options":null,
+"column_a":null,"column_b":null,"memo":null,"has_visual":false,
+"question_latex":null,"question_table":null}}
+TEXT:
 {chunk}"""
-
         try:
             resp = client.chat.completions.create(
                 model=_PARSER_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=8000,
+                temperature=0, max_tokens=8000,
             )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-            raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
+            raw = re.sub(r"^```(?:json)?\s*", "",
+                         resp.choices[0].message.content.strip(), flags=re.MULTILINE)
+            raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
             m   = re.search(r"\[.*\]", raw, re.DOTALL)
             if m:
-                parsed = json.loads(m.group())
-                if isinstance(parsed, list):
-                    for q in parsed:
-                        qn  = _normalise_qnum(q.get("question_number", ""))
-                        key = qn or q.get("question", "")[:60]
-                        if key not in seen:
-                            seen.add(key)
-                            all_qs.append(q)
-        except Exception as exc:
-            logger.error("[Parser] Chunk %d failed: %s", idx + 1, exc)
+                for q in json.loads(m.group()):
+                    key = _normalise_qnum(q.get("question_number","")) or q.get("question","")[:60]
+                    if key not in seen:
+                        seen.add(key); all_qs.append(q)
+        except Exception as e:
+            logger.error("[Parser] Chunk %d: %s", idx + 1, e)
 
-    logger.info("[Parser] %d questions extracted for %s", len(all_qs), subject)
+    logger.info("[Parser] %d questions (text fallback)", len(all_qs))
     return all_qs

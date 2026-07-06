@@ -41,7 +41,7 @@ from flask_cors import CORS
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from extraction_engine import extract_text_from_file, parse_questions_universal
+from extraction_engine import extract_text_from_file, parse_questions_universal, extract_questions_from_file
 
 from odf.opendocument import load as load_odt
 from odf import text as odf_text
@@ -717,14 +717,16 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
             )
 
         # 2. Extract text
-        exam_text = extract_text_from_file(exam_bytes, exam_fn, subject)
-        if not exam_text.strip():
-            raise ValueError("No text could be extracted from the exam file.")
-        print(f"[Pipeline] Exam text: {len(exam_text)} chars")
-
         # 3. Parse questions
-        questions = parse_questions_universal(exam_text, subject, grade)
+
+        questions = extract_questions_from_file(
+            exam_bytes, exam_fn, subject, grade,
+            exam_id=exam_id,
+            school_folder=meta.get("schoolFolder", school_id)
+        )
         print(f"[Pipeline] Questions parsed: {len(questions)}")
+        if not questions:
+            raise ValueError("No questions could be extracted. Check the file is a valid exam paper.")
 
         # 4. Download + parse memo
         memo_map   = {}
@@ -806,20 +808,26 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
                 f"{exam_id}_{i:04d}"
             )
             batch.set(ref, {
-                "examId":         exam_id,
+                "examId": exam_id,
                 "questionNumber": str(q.get("question_number") or i + 1),
                 "parentQuestion": q.get("parent_question", ""),
-                "parentContext":  q.get("parent_context"),
-                "section":        q.get("section", "A"),
-                "questionText":   qtext,
-                "type":           q.get("type", "open"),
-                "marks":          marks,
-                "options":        options,
-                "columnA":        q.get("column_a"),
-                "columnB":        q.get("column_b"),
-                "memo":           str(q.get("memo") or ""),
-                "order":          i,
+                "parentContext": q.get("parent_context"),
+                "section": q.get("section", "A"),
+                "questionText": qtext,
+                "type": q.get("type", "open"),
+                "marks": marks,
+                "options": options,
+                "columnA": q.get("column_a"),
+                "columnB": q.get("column_b"),
+                "memo": str(q.get("memo") or ""),
+                "order": i,
+                # ── NEW fields for images, math, and tables ──────────────────
+                "questionImageUrl": q.get("questionImageUrl"),  # page PNG URL for diagrams
+                "hasVisual": bool(q.get("has_visual")),  # true = show image
+                "questionLatex": q.get("question_latex"),  # maths equations (MathJax)
+                "questionTable": q.get("question_table"),  # accounting tables (markdown)
             })
+
             written += 1
             if written % 400 == 0:
                 batch.commit()

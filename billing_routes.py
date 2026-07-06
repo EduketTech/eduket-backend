@@ -244,7 +244,6 @@ def billing_initiate():
         "cancel_url": f"{FRONTEND_BASE_URL}/payment-cancelled",
         "m_payment_id": payment_id,
         "amount": f"{quote['charge_amount']:.2f}",
-        PAYFAST_CURRENCY_FIELD: quote["charge_currency"],
         "item_name": f"{tier_id.capitalize()} Plan",
         "item_description": f"{tier_id.capitalize()} Subscription ({quote['billing_cycle']})",
         "custom_str1": school_id,

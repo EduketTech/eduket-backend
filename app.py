@@ -41,6 +41,7 @@ from flask_cors import CORS
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+from extraction_engine import extract_text_from_file, parse_questions_universal
 
 from odf.opendocument import load as load_odt
 from odf import text as odf_text
@@ -235,197 +236,6 @@ def _iter_block_items(parent):
             yield Paragraph(child, parent)
         elif isinstance(child, CT_Tbl):
             yield Table(child, parent)
-
-
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    try:
-        doc   = Document(io.BytesIO(file_bytes))
-        lines = []
-        for block in _iter_block_items(doc):
-            if isinstance(block, Paragraph):
-                t = block.text.strip()
-                if t:
-                    lines.append(t)
-            elif isinstance(block, Table):
-                for row in block.rows:
-                    cells = [c.text.strip() for c in row.cells]
-                    row_text = " | ".join(c for c in cells if c)
-                    if row_text:
-                        lines.append(row_text)
-        text = "\n".join(lines)
-        print(f"[DOCX] Extracted {len(text)} chars")
-        return text
-    except Exception as e:
-        print(f"[DOCX] Failed: {e}")
-        return ""
-
-
-def extract_text_from_odt(file_bytes: bytes) -> str:
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp.flush()
-            odt_doc    = load_odt(tmp.name)
-            paragraphs = odt_doc.getElementsByType(odf_text.P)
-            content    = "\n".join(
-                teletype.extractText(p) for p in paragraphs
-            )
-        print(f"[ODT] Extracted {len(content)} chars")
-        return content
-    except Exception as e:
-        print(f"[ODT] Failed: {e}")
-        return ""
-
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    # Stage 1: native text
-    try:
-        doc  = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "".join(page.get_text() + "\n" for page in doc)
-        doc.close()
-        if len(text.strip()) > 200:
-            print(f"[PDF] Native: {len(text)} chars")
-            return text
-    except Exception as e:
-        print(f"[PDF] Native failed: {e}")
-
-    # Stage 2: Groq vision OCR
-    print("[PDF] Falling back to Groq vision OCR")
-    return _groq_vision_ocr(file_bytes)
-
-
-def _groq_vision_ocr(pdf_bytes: bytes) -> str:
-    client   = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    all_text = ""
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for i, page in enumerate(doc):
-            try:
-                pix  = page.get_pixmap()
-                img  = base64.b64encode(pix.tobytes("png")).decode()
-                resp = client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[{"role": "user", "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{img}"}},
-                        {"type": "text",
-                         "text": (
-                             "South African NSC/CAPS exam page. "
-                             "Extract ALL text exactly. Preserve question numbers, "
-                             "marks in brackets, MCQ options A B C D. Plain text only."
-                         )},
-                    ]}],
-                    max_tokens=2000,
-                )
-                all_text += resp.choices[0].message.content.strip() + "\n"
-                print(f"[OCR] Page {i+1} done")
-            except Exception as e:
-                print(f"[OCR] Page {i+1} failed: {e}")
-        doc.close()
-    except Exception as e:
-        print(f"[OCR] Fatal: {e}")
-    return all_text
-
-
-def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-    """Returns plain text regardless of file format."""
-    lower = filename.lower()
-    if lower.endswith(".docx"):
-        return extract_text_from_docx(file_bytes)
-    if lower.endswith(".odt"):
-        return extract_text_from_odt(file_bytes)
-    if lower.endswith(".pdf"):
-        return extract_text_from_pdf(file_bytes)
-    if lower.endswith(".doc"):
-        try:
-            result = mammoth.extract_raw_text(io.BytesIO(file_bytes))
-            return result.value
-        except Exception as e:
-            print(f"[DOC] mammoth failed: {e}")
-    return ""
-
-
-# ═══════════════════════════════════════════════════════════════
-# QUESTION PARSER
-# ═══════════════════════════════════════════════════════════════
-
-def parse_questions_universal(exam_text: str, subject: str, grade: str) -> list:
-    client      = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    CHUNK       = 10000
-    OVERLAP     = 800
-    all_qs      = []
-    seen        = set()
-
-    chunks = []
-    start  = 0
-    while start < len(exam_text):
-        chunks.append(exam_text[start:start + CHUNK])
-        start += CHUNK - OVERLAP
-
-    for idx, chunk in enumerate(chunks):
-        print(f"[Parser] Chunk {idx+1}/{len(chunks)}")
-        prompt = f"""You are an expert at parsing South African CAPS/NSC/IEB exam papers.
-
-Extract EVERY question from the text below into a JSON array.
-
-Rules:
-- MCQ: split options into A/B/C/D dict, type="mcq"
-- True/False: type="true_false"
-- Matching: type="matching", column_a=[], column_b=[]
-- Calculation: type="calculation"
-- Essay: type="essay"
-- Short answer: type="short_answer"
-- Default: type="open"
-- Marks: integer from brackets like (2), default 1
-- Include section, question_number, parent_question, parent_context
-
-Return ONLY a valid JSON array, no markdown, no explanation.
-
-Each item:
-{{
-  "question_number": "1.1",
-  "parent_question": "QUESTION 1",
-  "parent_context": null,
-  "section": "A",
-  "question": "Full question text",
-  "type": "mcq",
-  "marks": 2,
-  "options": {{"A":"...","B":"...","C":"...","D":"..."}},
-  "column_a": null,
-  "column_b": null,
-  "memo": null
-}}
-
-Subject: {subject} | Grade: {grade}
-
-EXAM TEXT:
-{chunk}"""
-
-        try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=8000,
-            )
-            raw   = resp.choices[0].message.content.strip()
-            raw   = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-            raw   = re.sub(r"\s*```\s*$",       "", raw, flags=re.MULTILINE)
-            match = re.search(r"\[.*\]", raw, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                if isinstance(parsed, list):
-                    for q in parsed:
-                        qn = _normalise_qnum(q.get("question_number", ""))
-                        key = qn or q.get("question", "")[:60]
-                        if key not in seen:
-                            seen.add(key)
-                            all_qs.append(q)
-        except Exception as e:
-            print(f"[Parser] Chunk {idx+1} failed: {e}")
-
-    print(f"[Parser] Total questions: {len(all_qs)}")
-    return all_qs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -907,7 +717,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
             )
 
         # 2. Extract text
-        exam_text = extract_text_from_file(exam_bytes, exam_fn)
+        exam_text = extract_text_from_file(exam_bytes, exam_fn, subject)
         if not exam_text.strip():
             raise ValueError("No text could be extracted from the exam file.")
         print(f"[Pipeline] Exam text: {len(exam_text)} chars")
@@ -920,7 +730,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
         memo_map   = {}
         memo_bytes, memo_fn = download_file_for_extraction(meta, "memo")
         if memo_bytes:
-            memo_text = extract_text_from_file(memo_bytes, memo_fn)
+            memo_text = extract_text_from_file(memo_bytes, memo_fn, subject)
             if memo_text.strip():
                 raw_memo = parse_memo_answers(memo_text, subject, grade)
                 memo_map = {_normalise_qnum(k): v for k, v in raw_memo.items()}

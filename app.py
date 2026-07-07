@@ -837,6 +837,17 @@ def upload_exam():
         }, merge=True)
 
         print(f"[Upload] Created exam {exam_id} for school {school_id}")
+
+        # Trigger extraction immediately — don't depend on the Firestore
+        # collection group listener, which requires a composite index.
+        # The listener still runs as a catch-up mechanism for missed events.
+        threading.Thread(
+            target=_launch_pipeline,
+            args=(exam_id, record, school_id, subject),
+            daemon=True,
+        ).start()
+        print(f"[Upload] Extraction triggered for {exam_id}")
+
         return jsonify({"examId": exam_id, "duplicate": False})
 
     except Exception as e:

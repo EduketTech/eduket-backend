@@ -202,7 +202,7 @@ def parse_memo_answers(memo_text, subject, grade):
         print(f"[Memo] Chunk {idx+1}")
         try:
             resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": f"""You are reading a South African CAPS/NSC exam MARKING MEMORANDUM.
 Extract EVERY answer. Return ONLY a valid JSON object mapping question_number to answer.
 For MCQ give just the letter. For True/False give "True" or "False".
@@ -378,7 +378,7 @@ Exam data:
 
     try:
         resp  = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="qwen/qwen3-32b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2, max_tokens=2500,
         )

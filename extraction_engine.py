@@ -73,7 +73,7 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 
 _VISION_MODEL        = "meta-llama/llama-4-scout-17b-16e-instruct"
-_PARSER_MODEL        = "llama-3.3-70b-versatile"
+_PARSER_MODEL        = "llama-3.1-8b-instant"
 _PAGE_DPI            = 200          # 200 DPI = clear A4 page, good for diagrams
 _MAX_TOKENS_PER_PAGE = 4096
 

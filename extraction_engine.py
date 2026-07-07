@@ -46,6 +46,8 @@ For each question, render in order:
   4. Question text (may also contain [DIAGRAM: ...] for accessibility)
 """
 
+from __future__ import annotations  # makes type hints Python 3.8+ compatible
+
 import io
 import os
 import re

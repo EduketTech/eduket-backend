@@ -26,27 +26,18 @@ import time
 import base64
 import traceback
 import threading
-import tempfile
 import uuid
 
 import requests as http_requests
-import fitz  # PyMuPDF
 
 from datetime import datetime
 from difflib import SequenceMatcher
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from extraction_engine import extract_text_from_file, parse_questions_universal, extract_questions_from_file
-
-from odf.opendocument import load as load_odt
-from odf import text as odf_text
-from odf import teletype
-import mammoth
 from groq import Groq
 from datetime import datetime, timezone
 
@@ -222,20 +213,6 @@ def download_file_for_extraction(meta: dict, file_type: str):
 
     print(f"[Storage] No source found for {file_type}")
     return None, filename
-
-
-# ═══════════════════════════════════════════════════════════════
-# TEXT EXTRACTION
-# ═══════════════════════════════════════════════════════════════
-
-def _iter_block_items(parent):
-    from docx.oxml.table import CT_Tbl
-    from docx.oxml.text.paragraph import CT_P
-    for child in parent.element.body.iterchildren():
-        if isinstance(child, CT_P):
-            yield Paragraph(child, parent)
-        elif isinstance(child, CT_Tbl):
-            yield Table(child, parent)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1025,15 +1002,19 @@ def _load_exam(exam_id: str):
         questions.append({
             "question_number": str(d.get("questionNumber", "")),
             "parent_question": d.get("parentQuestion", ""),
-            "parent_context":  d.get("parentContext"),
-            "section":         d.get("section", "A"),
-            "question":        d.get("questionText", ""),
-            "type":            d.get("type", "open").lower(),
-            "options":         options,
-            "column_a":        d.get("columnA"),
-            "column_b":        d.get("columnB"),
-            "marks":           d.get("marks", 1),
-            "memo":            d.get("memo", ""),
+            "parent_context": d.get("parentContext"),
+            "section": d.get("section", "A"),
+            "question": d.get("questionText", ""),
+            "type": d.get("type", "open").lower(),
+            "options": options,
+            "column_a": d.get("columnA"),
+            "column_b": d.get("columnB"),
+            "marks": d.get("marks", 1),
+            "memo": d.get("memo", ""),
+            "questionImageUrl": d.get("questionImageUrl"),
+            "hasVisual": d.get("hasVisual", False),
+            "questionLatex": d.get("questionLatex"),
+            "questionTable": d.get("questionTable"),
         })
 
     return meta, questions

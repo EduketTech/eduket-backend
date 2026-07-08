@@ -101,7 +101,7 @@ _GROQ_MODEL_CANDIDATES = [
     "llama-3.1-70b-versatile",
     "llama3-70b-8192",
     "llama-3.3-70b-specdec",
-    "llama-3.1-8b-instant",     # last resort — small context, use only if others gone
+    # "llama-3.1-8b-instant",     # last resort — small context, use only if others gone
 ]
 
 _PAGE_DPI            = 200     # 200 DPI = sharp enough for diagrams and equations

@@ -42,7 +42,7 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 
 db     = None
 bucket = None
-
+GROQ_TEXT_MODEL = "mixtral-8x7b-32768"
 
 def _init_firebase():
     global db, bucket
@@ -202,7 +202,7 @@ def parse_memo_answers(memo_text, subject, grade):
         print(f"[Memo] Chunk {idx+1}")
         try:
             resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=GROQ_TEXT_MODEL,
                 messages=[{"role": "user", "content": f"""You are reading a South African CAPS/NSC exam MARKING MEMORANDUM.
 Extract EVERY answer. Return ONLY a valid JSON object mapping question_number to answer.
 For MCQ give just the letter. For True/False give "True" or "False".
@@ -304,7 +304,7 @@ Return ONLY this exact JSON:
 }}"""
     try:
         resp  = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1, max_tokens=800,
         )
@@ -378,7 +378,7 @@ Exam data:
 
     try:
         resp  = client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model=GROQ_TEXT_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2, max_tokens=2500,
         )
@@ -1354,7 +1354,7 @@ Latest questions: {latest_questions}"""
 
         client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
             messages=messages, temperature=0.4, max_tokens=600,
         )
         reply = completion.choices[0].message.content.strip()

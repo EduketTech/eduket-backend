@@ -20,6 +20,7 @@ google-api-python-client
 google-auth
 google-auth-httplib2
 google-api-python-client
+google-generativeai>=0.8.5
 
 # ── Utilities ─────────────────────────────────────────────
 python-dotenv>=1.0.0

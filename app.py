@@ -63,11 +63,12 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 # Groq model priority list — first available wins.
 # Checked against Groq's live /models endpoint on first call.
 _GROQ_MODEL_CANDIDATES = [
+    "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
-    "llama3-70b-8192",
-    "llama-3.3-70b-specdec",
-    # "llama-3.1-8b-instant",    # last resort — small context
+    "openai/gpt-oss-120b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
+
 
 _RESOLVED_GROQ_MODEL: str | None = None
 

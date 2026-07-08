@@ -1,165 +1,876 @@
-```markdown
-# Eduket Backend — AI Exam Study System
+# Eduket OS — Backend API
+### AI-Powered School Assessment & Extraction Engine
 
-This is the production backend api for **Eduket**, an AI-powered exam study and automated extraction platform tailored for Grade 12 Computer Applications Technology (CAT) students working within the CAPS curriculum framework.
-
-It is built using Python (Flask) and optimized for deployment on cloud platforms like PythonAnywhere or Render. The system employs an intelligent agent-based loop alongside a high-throughput multi-format document extraction pipeline to transform raw teacher exam uploads into immediately executable digital assessments.
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![Flask](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com)
+[![Firebase](https://img.shields.io/badge/Firebase-Admin_SDK-orange.svg)](https://firebase.google.com)
+[![Render](https://img.shields.io/badge/Deployed_on-Render-purple.svg)](https://render.com)
+[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 
 ---
 
 ## Overview
 
-The backend manages the entire lifecyle of digital exam administration and AI-driven student remediation:
+The Eduket OS backend is a production Flask API that powers Africa's first AI-driven school assessment operating system. It handles exam document extraction, AI-based marking, real-time analysis, billing, and a multi-provider AI coaching interface for learners.
 
-- **Document Extraction Pipeline:** Multi-threaded processing of `.docx`, `.pdf`, `.odt`, and `.doc` teacher exam files with OCR vision fallback and automatic memorandum schema merging.
-- **AI Tutoring Agent:** Dynamic, agentic conversation handling that avoids rigid rule-based logic to actively guide students.
-- **Exam Simulation & Grading Engine:** Automated structured parsing and processing of multi-format assessments with real-time student availability metrics.
-- **Student Progress Analytics:** Automated logging of student weaknesses, historical tracking, and personalized performance insight maps.
-- **RAG Architecture:** High-performance vector embeddings via FAISS for contextual curriculum textbook retrieval.
-- **Persistent Student Memory:** Dedicated structural storage utilizing local relational configurations for fast, stateful memory recall.
+Teachers upload Word documents. The backend converts them, renders every page, extracts questions using vision AI, and delivers fully marked, individually analysed results — within minutes of a student submitting.
 
 ---
 
-## How the AI Agent Works
-
-The architecture relies on a cyclic execution loop where the LLM evaluates user inputs and historical context, then elects to invoke specific tools prior to rendering a final token stream:
-
+## Architecture
 
 ```
-
-```
-Student Input
-     │
-     ▼
-
-```
-
-┌───────────────┐
-│  Load Student │ <─── Syncs history, weak topics,
-│    Context    │      and CAPS tracking profile
-└───────┬───────┘
-│
-▼
-┌───────────────┐
-│ Agent Loop    ├─► [Tool Invoke: Vector Search Curriculum]
-│ Evaluation    ├─► [Tool Invoke: Calculate Weak Metrics]
-└───────┬───────┘─► [Tool Invoke: Adjust Personalized Study Plan]
-│
-▼
-Final Output ──────► Streaming response back to Frontend
-
+┌─────────────────────────────────────────────────────────────┐
+│                    Eduket OS Backend                         │
+│                   (Flask on Render)                          │
+│                                                              │
+│  ┌─────────────┐    ┌──────────────────┐    ┌───────────┐  │
+│  │  Flask API  │───▶│ extraction_engine│───▶│LibreOffice│  │
+│  │  app.py     │    │ (render-first)   │    │ headless  │  │
+│  └──────┬──────┘    └────────┬─────────┘    └───────────┘  │
+│         │                    │                               │
+│  ┌──────▼──────┐    ┌────────▼─────────┐    ┌───────────┐  │
+│  │  Billing    │    │   PyMuPDF        │    │Groq Vision│  │
+│  │  Routes     │    │  Page Renderer   │───▶│+ Gemini   │  │
+│  └─────────────┘    └──────────────────┘    └───────────┘  │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │            AI Provider Chain                         │    │
+│  │  Groq (primary) → Gemini (fallback)                 │    │
+│  │  Auto model resolution · Auto fallback · Retry      │    │
+│  └─────────────────────────────────────────────────────┘    │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │     Firebase            │
+              │  Firestore · Auth       │
+              │  Storage · Admin SDK    │
+              └─────────────────────────┘
 ```
 
 ---
 
 ## Tech Stack
 
-* **Core Engine:** Python 3.10+ / Flask Framework
-* **Orchestration & AI Models:** Groq API SDK (`llama-3.3-70b-versatile` & `llama-4-scout-17b` for Vision OCR fallback)
-* **Vector Stores:** FAISS (Facebook AI Similarity Search)
-* **Cloud Infrastructure & Integrations:** Firebase Admin SDK (Cloud Firestore & Firebase Storage)
-* **Document Processing:** PyMuPDF (`fitz`), `python-docx`, `mammoth`, `odfpy`
-* **Local Identity Storage:** SQLite3
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| Runtime | Python 3.11+ | Core language |
+| Web framework | Flask 3.x + Flask-CORS | REST API |
+| Server | Gunicorn (gthread) | Production WSGI server |
+| Document conversion | LibreOffice headless | DOCX/ODT → PDF |
+| PDF rendering | PyMuPDF (fitz) | PDF → page images at 200 DPI |
+| AI — vision | Groq `llama-4-scout-17b-16e-instruct` | Page image → question JSON |
+| AI — text (primary) | Groq (auto-resolved model) | Marking, analysis, parsing |
+| AI — text (fallback) | Google Gemini 2.0 Flash | Automatic failover |
+| Database | Firebase Firestore (Admin SDK) | All persistent data |
+| Storage | Firebase Storage (Admin SDK) | Exam files + page images |
+| Authentication | Firebase Auth (token verification) | All route auth |
+| Billing | PayFast | ZAR payment processing |
+| Deployment | Render.com | Cloud hosting |
 
 ---
 
-## API Endpoints
-
-**Base URL (Production):** `https://abitonp.pythonanywhere.com`
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/` | System heartbeat, health checks, and engine metadata. |
-| `POST` | `/auto-extract` | Manual fallback route to force trigger document parsing for an exam ID. |
-| `POST` | `/start-exam` | Initializes an active student assessment session block. |
-| `POST` | `/agent-chat` | Dispatches user conversational tokens directly to the AI agent loop. |
-| `POST` | `/question` | Fetches a cleanly formatted target question schema block for a student. |
-| `POST` | `/answer` | Commits individual question submission states for state preservation. |
-| `POST` | `/submit` | Aggregates all session answers, triggers AI marking evaluations, and commits grades. |
-| `POST` | `/dashboard` | Computes complex analytical metrics, weak content vectors, and study history. |
-| `POST` | `/clear-history` | flushes the current context stack to restart a fresh tutoring chat loop. |
-
----
-
-## Document & Extraction Architecture
-
-The processing architecture handles complex layouts, including columns, matching tables, and embedded images, through a strict verification pipeline:
-
-1. **Change Interception:** Firestore collection group listeners (`teacherExamUploads/{schoolId}/subjects/{subject}`) monitor and flag files marked as `pending_extraction`.
-2. **Structural Parse:** The pipeline reads native OpenXML components (`.docx`) or uses PyMuPDF layout streams.
-3. **Vision Fallback:** Scanned components or structural failures automatically bypass to an OCR vision model chunking sequence via Groq.
-4. **Memorandum Merge:** Documents undergo simultaneous parsing where questions are automatically mapped to their corresponding memorandum keys via string-distance and numbering normalization techniques (`_normalise_qnum`).
-5. **Batch Transaction:** The pipeline chunks data structures into sequential blocks under the 500-document limit for atomic transactions inside Cloud Firestore.
-
----
-
-## Database Schema (Local SQLite Layer)
-
-For localized performance or lightweight state caching, the following core tables are generated automatically at startup:
-
-* **`students`** — Preserves identity tokens, classroom profiles, and school contextual settings.
-* **`sessions`** — Tracks comprehensive telemetry on completed and in-progress exams.
-* **`weak_questions`** — Catalogs failed question codes to prioritize item generation inside the remediation loops.
-* **`conversation_history`** — Persistent, rolling storage for chat histories.
-* **`study_plan`** — Highly personalized structural maps generated by the AI to pinpoint topics requiring attention.
-
----
-
-## Local Setup
-
-### 1. Clone the Repository
-```bash
-git clone [https://github.com/abiton198.git](https://github.com/abiton198.git)
-cd your-repo
+## Repository Structure
 
 ```
-
-### 2. Install Dependencies
-
-Ensure you have system-level library configurations ready for processing binary formats, then install the Python dependencies:
-
-```bash
-pip install flask flask-cors groq python-dotenv faiss-cpu python-docx pymupdf mammoth odfpy firebase-admin requests
-
+eduket-backend/
+├── app.py                  # Flask application, all routes, marking engine
+├── extraction_engine.py    # Render-first exam extraction pipeline
+├── billing_routes.py       # PayFast billing, pricing, ITN handler
+├── pricing_engine.py       # Regional pricing, FX rates, tier multipliers
+├── requirements.txt        # Python dependencies (pinned)
+├── gunicorn.conf.py        # Gunicorn worker configuration
+├── Procfile                # Render start command
+├── .env.example            # Environment variable template (no secrets)
+└── README.md               # This file
 ```
 
-### 3. Environment Variables Configuration
+---
 
-Create a `.env` file in the root working directory:
+## Extraction Pipeline
 
-```env
-PORT=8000
-GROQ_API_KEY=your_groq_production_api_key_here
-FIREBASE_STORAGE_BUCKET=your-app.appspot.com
-FIREBASE_SERVICE_ACCOUNT_JSON={"type": "service_account", "project_id": ...}
+The core value of the platform is the **render-first extraction pipeline**. Every document — regardless of format, complexity, or content — goes through the same five-stage process.
 
 ```
+DOCX / ODT uploaded
+        │
+        ▼
+┌───────────────┐
+│ LibreOffice   │  Converts DOCX/ODT → PDF.
+│ headless      │  Renders fonts, OMML equations, embedded images,
+│ (Stage 1)     │  and table formatting exactly as Word displays them.
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ PyMuPDF       │  Renders each PDF page as a PNG at 200 DPI.
+│ Page Renderer │  Produces pixel-perfect page images including
+│ (Stage 2)     │  all diagrams, equations, and table layouts.
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ Firebase      │  Each page PNG is uploaded to Firebase Storage.
+│ Storage       │  Returns a tokenized download URL stored against
+│ (Stage 3)     │  each question that has a visual element.
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ Groq Vision   │  Each page image is sent to the vision model with
+│ (Stage 4)     │  a subject-aware extraction prompt. Returns a
+│               │  structured JSON array of question dicts including
+│               │  LaTeX, markdown tables, and image URLs.
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ Merge +       │  Questions from all pages are merged, deduplicated
+│ Firestore     │  by question number, and written to Firestore in
+│ (Stage 5)     │  batches of 400. Status updated to "extracted".
+└───────────────┘
+```
 
-### 4. Boot the Microservice
+**Why render-first?** Parsing document internals (XML, ZIP blobs, namespace lookups) is fragile and format-specific. Rendering the document and using vision AI to read the result is the same approach a human takes — and handles every edge case: custom fonts, OMML equations, embedded images, merged table cells, and complex layouts.
+
+---
+
+## AI Provider Chain
+
+Every AI call goes through a two-provider chain. If Groq fails for any reason — model deprecation, rate limit, timeout — Gemini is tried automatically. No manual intervention required.
+
+```python
+ai_text(prompt)
+  │
+  ├─▶ Groq (primary)
+  │     Auto-resolves best available model from /models endpoint
+  │     Invalidates model cache on decommission error
+  │     Retries once on model-not-found errors
+  │     │
+  │     └─▶ Success → return response
+  │         Failure → continue to fallback
+  │
+  └─▶ Gemini 2.0 Flash (fallback)
+        Free tier: 1,500 requests/day, 1M token context
+        │
+        └─▶ Success → return response
+            Failure → raise RuntimeError
+```
+
+**Groq model candidates** (tried in order, first available wins):
+1. `llama-3.1-70b-versatile`
+2. `llama3-70b-8192`
+3. `llama-3.3-70b-specdec`
+4. `llama-3.1-8b-instant` (last resort — reduced chunk size applies)
+
+The resolved model is cached in memory for the process lifetime. When Groq deprecates a model mid-deployment, the next request automatically re-queries `/models` and resolves the next available candidate.
+
+---
+
+## Environment Variables
+
+Create a `.env` file in the project root (never commit this file):
 
 ```bash
+# ── Firebase ──────────────────────────────────────────────────────────────────
+# Paste the full service account JSON as a single-line string, OR provide
+# the path to a local JSON file. Render uses the inline string approach.
+FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account","project_id":"..."}'
+
+# Firebase Storage bucket name (without gs:// prefix)
+FIREBASE_STORAGE_BUCKET=your-project.firebasestorage.app
+
+# ── AI Providers ──────────────────────────────────────────────────────────────
+# Groq — primary AI provider (console.groq.com)
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
+
+# Google Gemini — automatic fallback (aistudio.google.com — free tier)
+GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxx
+
+# ── PayFast Billing ───────────────────────────────────────────────────────────
+# Never commit these. All three required for payment processing.
+PAYFAST_MERCHANT_ID=12345678
+PAYFAST_MERCHANT_KEY=xxxxxxxxxxxx
+PAYFAST_PASSPHRASE=your_secure_passphrase_here
+
+# ── URLs ──────────────────────────────────────────────────────────────────────
+# Production frontend origin (no trailing slash — browsers never send one)
+FRONTEND_BASE_URL=https://eduket.tech
+
+# This backend's own URL (used for PayFast notify_url in ITN handler)
+BACKEND_BASE_URL=https://your-service.onrender.com
+
+# ── Server ────────────────────────────────────────────────────────────────────
+PORT=10000
+```
+
+> **Render deployment:** Set all variables above in your Render service dashboard under **Environment**. Never use a `.env` file in production — Render injects them as real environment variables.
+
+---
+
+## Local Development Setup
+
+### Prerequisites
+- Python 3.11+
+- LibreOffice (for document conversion)
+- Firebase project with Firestore, Storage, and Auth enabled
+
+### Installation
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/nextgenskills/eduket-backend.git
+cd eduket-backend
+
+# 2. Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 3. Install Python dependencies
+pip install -r requirements.txt
+
+# 4. Install LibreOffice (required for document conversion)
+# Ubuntu/Debian:
+sudo apt-get install -y libreoffice --no-install-recommends
+
+# macOS:
+brew install --cask libreoffice
+
+# 5. Copy environment variable template and fill in your values
+cp .env.example .env
+# Edit .env with your actual credentials
+
+# 6. Run the development server
 python app.py
-
+# Server starts on http://localhost:10000
 ```
 
-The extraction API and agent endpoint will bind to: `http://localhost:8000`
+### Verify setup
+
+```bash
+# Check the health endpoint
+curl http://localhost:10000/
+# Expected: {"status": "ok", "service": "Eduket Extraction & Marking API", "version": "5.0"}
+
+# Verify LibreOffice is accessible
+libreoffice --version
+# Expected: LibreOffice 7.x.x ...
+
+# Check Firebase connection (should print ✅ Ready in server logs)
+# If Firebase initialization fails the server exits with SystemExit(1)
+```
 
 ---
 
-## Deployment Configuration
+## API Reference
 
-When hosting on a shared provider like **PythonAnywhere**:
+All endpoints require a valid Firebase ID token in the `Authorization` header unless marked as public.
 
-* Ensure your `WSGI` configuration file points accurately to your project directory and imports the `app` instance cleanly.
-* Set `debug=False` inside production startup configurations to prevent background threads from crashing or spinning duplicate event configurations.
-* Ensure your service account JSON environment variable is populated as a single-line string or point to a local system file layout.
+```
+Authorization: Bearer <firebase_id_token>
+```
+
+### Health
+
+```
+GET /
+```
+Public. Returns service status and version. Used by the frontend keep-alive ping.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "service": "Eduket Extraction & Marking API",
+  "version": "5.0"
+}
+```
+
+---
+
+### Exam Upload
+
+```
+POST /exams/upload
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+Creates the exam record in Firestore and immediately triggers the extraction pipeline in a background thread. Does not wait for extraction to complete.
+
+**Request body:**
+```json
+{
+  "examId":          "uid_timestamp",
+  "title":           "Grade 12 Maths Paper 1",
+  "subject":         "Mathematics",
+  "grade":           "Grade 12",
+  "year":            "2026",
+  "curriculum":      "CAPS",
+  "examDuration":    90,
+  "examFileName":    "Maths_P1.docx",
+  "examStoragePath": "exams/schoolFolder/subject/examId/exam_Maths_P1.docx",
+  "examStorageUrl":  "https://firebasestorage.googleapis.com/...",
+  "memoFileName":    "Maths_P1_memo.docx",
+  "memoStoragePath": "exams/.../memo_Maths_P1_memo.docx",
+  "memoStorageUrl":  "https://firebasestorage.googleapis.com/...",
+  "aiMarkingOnly":   false,
+  "schoolFolder":    "schoolId_SchoolName",
+  "schoolName":      "Prince Edward High",
+  "teacherName":     "Mr Zulu"
+}
+```
+
+**Response:**
+```json
+{ "examId": "uid_timestamp", "duplicate": false }
+```
+
+**Error responses:**
+```json
+{ "error": "limit_reached", "message": "...", "tier": "free", "limit": 5, "used": 5 }  // 403
+{ "error": "User profile not found" }  // 404
+{ "error": "School not found" }        // 404
+```
+
+> **Firestore index required:** `exams` collection — composite index on `schoolId ASC, uploadedAt ASC`. Without it this route returns 500. Create the index in the Firebase Console → Firestore → Indexes.
+
+---
+
+### Exam Usage
+
+```
+GET /exams/usage
+Authorization: Bearer <token>
+```
+
+Returns the school's monthly exam upload count against their tier limit.
+
+**Response:**
+```json
+{
+  "tier":      "gold",
+  "limit":     120,
+  "used":      14,
+  "remaining": 106,
+  "atLimit":   false
+}
+```
+
+---
+
+### List Exams
+
+```
+GET /exams
+```
+
+Returns all exams with `status: "ready"`. Used by student dashboard to populate the exam selector.
+
+**Response:**
+```json
+{
+  "exams": [
+    {
+      "id":           "examId",
+      "name":         "Grade 12 Maths Paper 1",
+      "subject":      "Mathematics",
+      "grade":        "Grade 12",
+      "year":         "2026",
+      "curriculum":   "CAPS",
+      "memoMerged":   true,
+      "examDuration": 90
+    }
+  ]
+}
+```
+
+---
+
+### Start Exam
+
+```
+POST /start_exam
+Content-Type: application/json
+```
+
+Creates an in-memory session for a student attempt. Returns all questions with rich content fields.
+
+**Request body:**
+```json
+{ "exam_id": "examId", "student_id": "studentUid" }
+```
+
+**Response:**
+```json
+{
+  "session_id":            "uuid",
+  "questions":             [...],
+  "total_questions":       18,
+  "memo_merged":           true,
+  "subject":               "Mathematics",
+  "title":                 "Grade 12 Maths Paper 1",
+  "exam_duration_minutes": 90
+}
+```
+
+Each question in the array includes:
+```json
+{
+  "question_number": "1.1",
+  "question":        "Calculate the value of x if...",
+  "type":            "calculation",
+  "marks":           4,
+  "options":         null,
+  "questionImageUrl": "https://firebasestorage.googleapis.com/...",
+  "hasVisual":        true,
+  "questionLatex":    "$x^2 + 3x - 10 = 0$",
+  "questionTable":    null
+}
+```
+
+> **Important:** Memo answers are NOT returned to the student before submission. The `memo` field is stripped from the session data before the response is sent.
+
+---
+
+### Save Answer
+
+```
+POST /answer
+Content-Type: application/json
+```
+
+Saves a single answer to the session. Called after every question to support autosave.
+
+**Request body:**
+```json
+{ "session_id": "uuid", "index": 0, "answer": "B" }
+```
+
+---
+
+### Submit Exam
+
+```
+POST /submit
+Content-Type: application/json
+```
+
+Marks all answers, generates per-question feedback, runs cognitive analysis, and returns complete results. This is the most computationally expensive endpoint — allow up to 60 seconds for a 20-question paper.
+
+**Request body:**
+```json
+{
+  "exam_id":    "examId",
+  "student_id": "studentUid",
+  "answers":    { "0": "B", "1": "True", "2": "RAM is volatile..." }
+}
+```
+
+**Response:**
+```json
+{
+  "score":      34,
+  "total":      50,
+  "percentage": 68.0,
+  "subject":    "Computer Science",
+  "feedback":   "Good effort. A solid attempt...",
+  "analysis": {
+    "overallSummary":    "...",
+    "strengths":         ["..."],
+    "weaknesses":        ["..."],
+    "misconceptions":    ["..."],
+    "cognitiveAnalysis": { "remember": 80, "understand": 60, "apply": 40, ... },
+    "studyPlan":         ["..."],
+    "teacherSummary":    "...",
+    "parentSummary":     "..."
+  },
+  "results": [
+    {
+      "question_number": "1.1",
+      "question":        "What does RAM stand for?",
+      "type":            "short_answer",
+      "marks":           2,
+      "earned":          2,
+      "status":          "correct",
+      "student_answer":  "Random Access Memory",
+      "correct_answer":  "Random Access Memory",
+      "feedback":        "Correct.",
+      "concept_gap":     "",
+      "model_answer":    "Random Access Memory"
+    }
+  ]
+}
+```
+
+**Marking logic:**
+1. Rule-based marking against memo answer (exact match, fuzzy similarity ≥ 0.75, MCQ letter, True/False)
+2. AI marking fallback when memo is absent, inconclusive, or similarity < 0.75
+3. Spelling errors are forgiven — conceptual understanding is evaluated
+
+---
+
+### Autosave
+
+```
+POST /autosave
+GET  /autosave/<exam_id>/<student_id>
+```
+
+Saves and restores in-progress exam answers. Prevents data loss on browser refresh.
+
+---
+
+### AI Remark
+
+```
+POST /remark
+Content-Type: application/json
+```
+
+Re-marks one or more questions using AI. Used when a teacher disputes a mark.
+
+**Request body:**
+```json
+{
+  "subject": "Mathematics",
+  "results": [
+    {
+      "question":        "Calculate x...",
+      "student_answer":  "x = 2 or x = -5",
+      "correct_answer":  "x = 2 or x = -5",
+      "marks":           4
+    }
+  ]
+}
+```
+
+---
+
+### AI Study Coach
+
+```
+POST /agent-chat
+Content-Type: application/json
+```
+
+Real-time AI academic coaching. The coach is aware of the student's results, subject, and weak areas.
+
+**Request body:**
+```json
+{
+  "student_id":      "uid",
+  "message":         "I don't understand how to factorise",
+  "learningProfile": { "subjects": ["Mathematics"], "overallAverage": 62, "weakAreas": [...] },
+  "latestAttempt":   { "examTitle": "Maths P1", "percentage": 58, "markedResults": [...] },
+  "history":         [{ "role": "user", "content": "..." }, { "role": "assistant", "content": "..." }]
+}
+```
+
+---
+
+### Admin Routes
+
+These routes are for internal use during development and production debugging.
+
+```
+GET /admin/extraction-status/<exam_id>
+```
+Returns current extraction status, question count, and whether the exam is student-accessible.
+
+```
+GET /admin/trigger-extract/<exam_id>
+```
+Manually re-triggers extraction for a stuck exam. Use when `status` is `error` or has been `pending_extraction` for more than 5 minutes. After calling this, poll `/admin/extraction-status/<exam_id>` until status is `extracted`.
+
+```
+POST /admin/cleanup-sessions
+```
+Deletes exam sessions older than 24 hours. Run periodically to keep `exam_sessions` collection clean.
+
+---
+
+### Billing Routes
+
+Registered via `billing_bp` blueprint. All billing routes are prefixed `/api/billing/`.
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/api/billing/quote` | POST | Price quote for a single tier |
+| `/api/billing/quotes` | GET | Quotes for all tiers at once |
+| `/api/billing/initiate` | POST | Create pending transaction + PayFast form data |
+| `/api/payfast/itn` | POST | PayFast ITN webhook — upgrades school tier |
+
+> **Security:** The ITN handler is the sole authority for tier upgrades. It verifies the PayFast signature, confirms the payment amount matches the pending transaction, and only then writes the new tier to `schools/{schoolId}` via the Admin SDK.
+
+---
+
+## Firestore Schema
+
+### Collections written by the backend
+
+```
+exams/{examId}
+  ├── examId, title, subject, grade, curriculum
+  ├── uploadedBy, teacherName, schoolId, schoolFolder
+  ├── examDuration, examStoragePath, memoStoragePath
+  ├── status: "pending_extraction" | "processing" | "extracted" | "error"
+  ├── questionsExtracted: bool
+  ├── memoMerged: bool
+  ├── totalQuestions: int
+  └── extractedAt: timestamp
+
+exam_questions/{examId}_{nnnn}
+  ├── examId, questionNumber, parentQuestion, parentContext
+  ├── section, questionText, type, marks
+  ├── options: {A, B, C, D} | null
+  ├── columnA, columnB (for matching questions)
+  ├── memo: string (answer — not sent to student before submission)
+  ├── order: int
+  ├── questionImageUrl: string | null  (Firebase Storage URL for page PNG)
+  ├── hasVisual: bool
+  ├── questionLatex: string | null     (LaTeX for maths equations)
+  └── questionTable: string | null     (Markdown for accounting tables)
+
+exam_sessions/{sessionId}
+  ├── exam_id, exam, subject, student_id
+  ├── questions: [...] (full question array, no memos)
+  └── answers: {index: answer}
+
+exam_autosaves/{examId}_{studentId}
+  ├── examId, studentId
+  └── answers: {index: answer}
+
+exam_pages/{schoolFolder}/{examId}/page_{nnn}.png
+  └── (Firebase Storage — page renders for visual questions)
+
+teacherExamUploads/{schoolId}/subjects/{subject}
+  └── uploads: [{examId, status, ...}, ...]
+
+paymentTransactions/{paymentId}
+  ├── schoolId, tierId, fromTier, billingCycle
+  ├── expectedAmount (ZAR), expectedCurrency: "ZAR"
+  ├── displayAmount (local), displayCurrency
+  └── status: "pending" | "complete"
+```
+
+---
+
+## Firestore Indexes Required
+
+Create these in **Firebase Console → Firestore → Indexes → Composite**:
+
+| Collection | Fields | Required by |
+|------------|--------|-------------|
+| `exams` | `schoolId ASC, uploadedAt ASC` | `/exams/upload` monthly count |
+| `exam_attempts` | `schoolId ASC, completedAt DESC` | Teacher results tab |
+| `exam_attempts` | `schoolId ASC, subject ASC, completedAt DESC` | Subject-filtered results |
+
+**Collection group index:**
+| Collection group | Field | Required by |
+|-----------------|-------|-------------|
+| `subjects` | (any field) | Startup sweep + Firestore listener |
+
+> When an index is missing, Firestore returns a `FailedPrecondition` error with a direct link to create it. This link appears in Render logs — click it to create the index automatically.
+
+---
+
+## Deployment (Render)
+
+### Build command
+
+```bash
+apt-get install -y libreoffice --no-install-recommends && pip install -r requirements.txt
+```
+
+LibreOffice (~400MB) must be installed at build time. Without it the extraction pipeline falls back to text-only parsing and cannot process embedded images or equations.
+
+### Start command
+
+```bash
+gunicorn app:app --config gunicorn.conf.py
+```
+
+### `gunicorn.conf.py`
+
+```python
+workers     = 2
+worker_class = "gthread"
+threads     = 4
+timeout     = 120          # extraction can take up to 90 seconds for large papers
+bind        = "0.0.0.0:10000"
+preload_app = False        # must be False — Firebase Admin SDK initialises per-worker
+```
+
+> **Note:** `preload_app = True` causes the Firebase Admin SDK to share a single gRPC connection across forked worker processes, which breaks Firestore listeners. Keep it `False`.
+
+### Environment variables (set in Render dashboard)
+
+```
+FIREBASE_SERVICE_ACCOUNT_JSON  (paste full JSON as single-line string)
+FIREBASE_STORAGE_BUCKET
+GROQ_API_KEY
+GEMINI_API_KEY
+PAYFAST_MERCHANT_ID
+PAYFAST_MERCHANT_KEY
+PAYFAST_PASSPHRASE
+FRONTEND_BASE_URL              https://eduket.tech
+BACKEND_BASE_URL               https://your-service.onrender.com
+PORT                           10000
+```
+
+### Verify deployment
+
+After deploying, confirm these lines appear in Render logs:
+
+```
+[Firebase] project_id : your-project-id
+[Firebase] ✅ Ready
+[Model] Groq model resolved: llama-3.1-70b-versatile
+[Listener] Active — watching all subjects
+[Startup] Sweep complete — N extraction(s) launched
+```
+
+---
+
+## Security Architecture
+
+### Authentication flow
+
+Every protected route calls `verify_request_token(request)` first. This verifies the Firebase ID token server-side using the Admin SDK. The decoded token provides the `uid` — **no client-supplied uid is ever trusted**.
+
+```python
+uid, err = verify_request_token(request)
+if err:
+    return err  # returns 401 immediately
+# uid is now verified from the token
+```
+
+### schoolId derivation
+
+The `schoolId` for any school-scoped operation is **always** derived from the authenticated user's Firestore document (`users/{uid}.schoolId`), never from the request body. This prevents a malicious actor from sending a different `schoolId` to access another school's data.
+
+### Billing security
+
+- **Client cannot upgrade tier** — `schools/{schoolId}.tier` is write-protected in Firestore rules. Only the ITN handler can write it via the Admin SDK.
+- **ITN signature verification** — every PayFast notification is verified using MD5 signature + passphrase before any action is taken.
+- **Amount verification** — the ITN handler confirms `amount_gross` matches the amount stored in `paymentTransactions/{id}` within ±0.01 ZAR (floating point tolerance).
+- **PayFast always receives ZAR** — international schools see local currency in the UI but PayFast always processes in ZAR. The `amountZarEquivalent` field is what gets submitted.
+
+### CORS
+
+```python
+CORS(app, resources={r"/*": {
+    "origins": [
+        "https://eduket.tech",      # no trailing slash
+        "http://localhost:5173",     # dev only
+        ...
+    ],
+    "methods":       ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"],
+}})
+```
+
+**Note:** The `@app.before_request` OPTIONS handler was removed — it conflicted with Flask-CORS and caused header mismatches on preflights. Flask-CORS handles OPTIONS correctly on its own.
+
+---
+
+## Troubleshooting
+
+### Exam stuck in `pending_extraction`
+
+1. Check Render logs for `[Listener] Error` — the collection group index may be missing.
+2. Manually trigger: `GET /admin/trigger-extract/<examId>`
+3. Poll status: `GET /admin/extraction-status/<examId>`
+4. Look for `[LibreOffice] Not installed` in logs — build command may be missing the `apt-get` prefix.
+
+### "No questions could be extracted"
+
+1. Check `[Model] Groq model resolved:` in logs — if it shows a model that was decommissioned, invalidate the cache by restarting the service.
+2. Check `[Parser] Chunk 1: Error code: 413` — chunk size too large. The 413 retry with half-chunk should handle this automatically.
+3. Check `[Gemini] Failed:` — confirms Gemini fallback was tried. Verify `GEMINI_API_KEY` is set.
+4. Confirm LibreOffice is installed: the log should show `[LibreOffice] <filename> → PDF (NNNNN bytes)`, not `Not installed`.
+
+### CORS errors on `/exams/upload`
+
+1. Confirm `FRONTEND_BASE_URL` in Render has no trailing slash — `https://eduket.tech` not `https://eduket.tech/`.
+2. Confirm the PWA service worker has `NetworkOnly` rule for cross-origin requests in `vite.config.js`.
+3. Confirm `@app.before_request` OPTIONS handler is removed from `app.py`.
+
+### PayFast "403 Forbidden" on payment
+
+1. Confirm `PAYFAST_MERCHANT_ID` and `PAYFAST_MERCHANT_KEY` are set in Render env vars.
+2. Confirm `PAYFAST_PASSPHRASE` matches exactly what is set in the PayFast merchant dashboard.
+3. Confirm `BACKEND_BASE_URL` is set — the `notify_url` is built from this value.
+4. Confirm the notify URL domain is whitelisted in the PayFast merchant dashboard under **Settings → Integration**.
+5. Confirm `currency` field is NOT in the PayFast form POST — PayFast has no such parameter and rejects unknown fields.
+
+### Firebase initialization fails
+
+1. Confirm `FIREBASE_SERVICE_ACCOUNT_JSON` is a valid single-line JSON string (not a file path in production).
+2. Confirm `private_key` field contains actual newlines, not the literal string `\n`. The `_init_firebase()` function handles this replacement automatically.
+3. Confirm the service account has the required Firebase roles: **Firebase Admin SDK Administrator Service Agent**.
+
+---
+
+## Monitoring
+
+### Key log markers to watch in Render
+
+| Log line | Meaning |
+|----------|---------|
+| `[Firebase] ✅ Ready` | Firebase initialized successfully |
+| `[Model] Groq model resolved: <model>` | AI model selected for this deployment |
+| `[Listener] Active` | Firestore extraction listener is watching |
+| `[Pipeline] ═══ <examId>` | Extraction started for an exam |
+| `[Pipeline] ✓ Done — N questions` | Extraction completed successfully |
+| `[Pipeline] FAILED: <error>` | Extraction failed — check errorMessage in Firestore |
+| `[AI] Gemini fallback responded` | Groq failed, Gemini took over |
+| `[Groq] Model decommissioned — re-resolving` | Auto model rotation triggered |
+
+### Recommended checks after each deployment
+
+```bash
+# 1. Health check
+curl https://your-service.onrender.com/
+
+# 2. Trigger a known-good exam extraction
+curl https://your-service.onrender.com/admin/trigger-extract/<knownExamId>
+
+# 3. Check extraction completed
+curl https://your-service.onrender.com/admin/extraction-status/<knownExamId>
+```
+
+---
+
+## Contributing
+
+1. Branch from `main`: `git checkout -b feature/your-feature-name`
+2. Never commit `.env`, service account JSON, or any credentials
+3. Run `pip freeze > requirements.txt` after adding dependencies
+4. Test the health endpoint and at least one extraction before opening a PR
+5. All PRs require review from a second engineer before merging to `main`
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 5.0 | July 2026 | Multi-provider AI chain (Groq → Gemini). Auto model resolution. Render-first extraction with Firebase Storage page image upload. Subject-aware vision prompts for Accounting, Mathematics, Sciences, Languages, CAT/IT, History. |
+| 4.0 | July 2026 | LibreOffice headless conversion. PyMuPDF 200 DPI rendering. Groq vision per-page extraction. `questionImageUrl`, `questionLatex`, `questionTable` fields on exam_questions. |
+| 3.0 | June 2026 | Billing system with PayFast ITN. Regional pricing with FX rates. Diamond tier. Security hardening: ITN signature verification, server-side schoolId derivation, client-side tier write disabled. |
+| 2.0 | June 2026 | Flask deployment on Render. Gunicorn gthread workers. Firebase Admin SDK. Role-based routing. Firestore security rules. |
+| 1.0 | May 2026 | Initial extraction pipeline. Groq question parser. Memo-based marking. AI fallback marking. AI study coach. |
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the codebase defaults for details.
+Proprietary — Nextgen Skills Development
+All rights reserved. Unauthorised use, reproduction, or distribution is prohibited.
 
-```
+---
 
-```
+*Eduket OS Backend — Built by Nextgen Skills Development*
+*For support: support@eduket.tech*

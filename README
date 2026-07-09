@@ -839,8 +839,7 @@ curl https://your-service.onrender.com/admin/trigger-extract/<knownExamId>
 
 # 3. Check extraction completed
 curl https://your-service.onrender.com/admin/extraction-status/<knownExamId>
-```
-
+``
 ---
 
 ## Contributing
@@ -868,7 +867,7 @@ curl https://your-service.onrender.com/admin/extraction-status/<knownExamId>
 ## License
 
 Proprietary — Nextgen Skills Development
-All rights reserved. Unauthorised use, reproduction, or distribution is prohibited.
+All rights reserved. Unauthorised use, reproduction, or distribution is strictly prohibited.
 
 ---
 

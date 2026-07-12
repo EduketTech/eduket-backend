@@ -96,10 +96,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BASE_TIER_PRICES_ZAR = {
     "free": {"monthly": 0, "annual": 0},
-    "silver": {"monthly": 799, "annual": 7990},
-    "gold": {"monthly": 1399, "annual": 13990},
-    "platinum": {"monthly": 2999, "annual": 29990},
-    "diamond": {"monthly": 5998, "annual": 59980},  # = 2x platinum, as requested
+    "silver": {"monthly": 999, "annual": 9990},
+    "gold": {"monthly": 1999, "annual": 19990},
+    "platinum": {"monthly": 4999, "annual": 49990},
+    "diamond": {"monthly": 9998, "annual": 99980},  # = 2x platinum, as requested
 }
 
 # ---------------------------------------------------------------------------

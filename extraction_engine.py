@@ -73,6 +73,8 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+import magic
+import zipfile
 
 import fitz          # PyMuPDF
 import mammoth
@@ -391,40 +393,133 @@ def _upload_page_image(school_folder: str, exam_id: str,
 def _lo_available() -> bool:
     return bool(shutil.which("libreoffice") or shutil.which("soffice"))
 
+MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024  # 2 MB hard limit
+
+
+def _validate_document(file_bytes: bytes, filename: str) -> str | None:
+    """
+    Validate an uploaded document before passing it to LibreOffice.
+    Returns an error message if the document is invalid; otherwise returns None.
+    """
+    # 1. Size check
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        return f"File exceeds the 50 MB limit ({len(file_bytes) // 1024 // 1024} MB)"
+
+    # 2. Magic-byte validation (reject files that lie about their extension)
+    try:
+        detected = magic.from_buffer(file_bytes[:2048], mime=True)
+        allowed_mimes = {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+            "application/vnd.oasis.opendocument.text",
+            "application/pdf",
+        }
+
+        if detected not in allowed_mimes:
+            return f"Invalid file type detected: {detected}"
+
+    except Exception:
+        # python-magic unavailable — continue with other checks
+        pass
+
+    # 3. DOCX ZIP bomb check
+    if filename.lower().endswith(".docx"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                total_uncompressed = sum(f.file_size for f in z.infolist())
+
+                if total_uncompressed > 500 * 1024 * 1024:
+                    return "File rejected: ZIP bomb detected"
+
+                if len(z.infolist()) > 10000:
+                    return "File rejected: too many ZIP entries"
+
+        except zipfile.BadZipFile:
+            return "Invalid DOCX file format"
+
+    return None
+
 
 def _convert_to_pdf(file_bytes: bytes, filename: str) -> bytes | None:
     """
-    Convert DOCX / ODT / DOC / RTF → PDF using LibreOffice headless.
+    Convert DOCX / DOC / ODT / RTF to PDF using LibreOffice in headless mode.
+
     LibreOffice renders fonts, OMML equations, embedded images, and table
-    formatting exactly as Microsoft Word/Calc would display them.
-    Returns PDF bytes or None if LibreOffice is unavailable or conversion fails.
+    formatting similarly to Microsoft Word.
+
+    Returns PDF bytes, or None if conversion fails.
     """
+
+    error = _validate_document(file_bytes, filename)
+    if error:
+        logger.error("[Security] File rejected: %s", error)
+        return None
+
     if not _lo_available():
         logger.warning("[LibreOffice] Not installed — falling back to text extraction")
         return None
 
     cmd = shutil.which("libreoffice") or shutil.which("soffice")
+
     with tempfile.TemporaryDirectory() as tmp:
         inp = os.path.join(tmp, filename)
+
         with open(inp, "wb") as f:
             f.write(file_bytes)
+
         try:
             subprocess.run(
-                [cmd, "--headless", "--convert-to", "pdf", "--outdir", tmp, inp],
-                check=True, timeout=120, capture_output=True,
+                [
+                    cmd,
+                    "--headless",
+                    "--norestore",
+                    "--nofirststartwizard",
+                    "--infilter=writer_pdf_Export",
+                    "-env:UserInstallation=file:///tmp/libreoffice-sandbox",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    tmp,
+                    inp,
+                ],
+                check=True,
+                timeout=90,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "http_proxy": "http://127.0.0.1:0",
+                    "https_proxy": "http://127.0.0.1:0",
+                    "no_proxy": "",
+                },
             )
+
             pdf_path = os.path.join(tmp, Path(filename).stem + ".pdf")
+
             if os.path.exists(pdf_path):
-                data = open(pdf_path, "rb").read()
-                logger.info("[LibreOffice] %s → PDF (%d bytes)", filename, len(data))
+                with open(pdf_path, "rb") as f:
+                    data = f.read()
+
+                logger.info(
+                    "[LibreOffice] %s → PDF (%d bytes)",
+                    filename,
+                    len(data),
+                )
                 return data
+
             logger.error("[LibreOffice] PDF not produced for %s", filename)
+
         except subprocess.TimeoutExpired:
             logger.error("[LibreOffice] Timeout converting %s", filename)
+
         except subprocess.CalledProcessError as e:
-            logger.error("[LibreOffice] %s", e.stderr.decode(errors="replace")[:300])
+            logger.error(
+                "[LibreOffice] %s",
+                e.stderr.decode(errors="replace")[:300],
+            )
+
         except Exception as e:
             logger.error("[LibreOffice] %s", e)
+
     return None
 
 

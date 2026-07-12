@@ -35,3 +35,5 @@ mammoth
 gevent>=24.10.1
 flask-limiter==3.5.0
 flask-talisman==1.1.0
+python-magic==0.4.27
+python-dotenv==1.0.1

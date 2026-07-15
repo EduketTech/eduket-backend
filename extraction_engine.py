@@ -101,7 +101,6 @@ _VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Update this list after checking console.groq.com/docs/models.
 _GROQ_MODEL_CANDIDATES = [
     "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
     "openai/gpt-oss-120b",
     "meta-llama/llama-4-maverick-17b-128e-instruct"
 ]

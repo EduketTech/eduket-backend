@@ -66,7 +66,7 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 
 # Priority list — first available model on Groq wins.
 # Queried against the live /models endpoint on first call and cached.
-_GROQ_MODEL_CANDIDATES = [ "llama-3.1-70b-versatile" ]
+_GROQ_MODEL_CANDIDATES = [ "llama-3.3-70b-versatile" ]
 
 _RESOLVED_GROQ_MODEL: str | None = None
 

@@ -66,12 +66,7 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 
 # Priority list — first available model on Groq wins.
 # Queried against the live /models endpoint on first call and cached.
-_GROQ_MODEL_CANDIDATES = [
-    "llama-3.1-70b-versatile",
-    "llama3-70b-8192",
-    "llama-3.3-70b-specdec",
-    # "llama-3.1-8b-instant",   # last resort — small context window
-]
+_GROQ_MODEL_CANDIDATES = [ "llama-3.1-70b-versatile" ]
 
 _RESOLVED_GROQ_MODEL: str | None = None
 
@@ -415,7 +410,7 @@ def not_found(e):
 
 @app.errorhandler(413)
 def request_too_large(e):
-    return jsonify({"error": "Request body too large. Maximum 10 MB."}), 413
+    return jsonify({"error": "Request body too large. Maximum 5MB."}), 413
 
 @app.errorhandler(429)
 def rate_limited(e):

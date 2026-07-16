@@ -45,6 +45,7 @@ from urllib.parse import quote_plus
 
 import requests as http_requests
 from flask import Blueprint, request, jsonify
+from urllib.parse import urlencode, quote_plus
 
 import firebase_admin
 from firebase_admin import firestore as fs_admin, auth as fb_auth
@@ -325,33 +326,33 @@ def _get_school_pricing_context(school_id: str) -> dict:
 def _generate_payfast_signature(params: dict) -> str:
     """
     Generate PayFast MD5 signature.
-
-    PayFast requires parameters sorted ALPHABETICALLY.
-    The Node.js reference implementation used .sort() — this must match.
-    quote_plus encodes spaces as + which matches PayFast's expectation.
-    Passphrase appended ONLY when it has a non-empty value.
+    Sort alphabetically, exclude empty values and 'signature'.
+    Append passphrase only if configured.
+    Use same encoding PayFast uses: quote_plus with %20 converted to +.
     """
-    # Sort alphabetically — this is the critical fix
-    sorted_items = sorted(
-        [(k, v) for k, v in params.items()
-         if k != "signature"
-         and v is not None
-         and str(v).strip() != ""],
-        key=lambda x: x[0]
-    )
+    # Filter and sort alphabetically
+    filtered = {
+        k: str(v).strip()
+        for k, v in params.items()
+        if k != "signature"
+        and v is not None
+        and str(v).strip() != ""
+    }
+    sorted_items = sorted(filtered.items(), key=lambda x: x[0])
 
-    parts = [f"{k}={quote_plus(str(v))}" for k, v in sorted_items]
+    # Build param string — spaces as +, special chars as %XX
+    parts = []
+    for k, v in sorted_items:
+        encoded_v = quote_plus(v)
+        parts.append(f"{k}={encoded_v}")
+
     param_string = "&".join(parts)
 
-    # Only append passphrase if one is actually configured
+    # Append passphrase only if set
     if PAYFAST_PASSPHRASE and PAYFAST_PASSPHRASE.strip():
         param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE.strip())}"
 
-    print(f"[PayFast SIG] param_string: {param_string}")
-    sig = hashlib.md5(param_string.encode("utf-8")).hexdigest()
-    print(f"[PayFast SIG] signature:    {sig}")
-    return sig
-
+    return hashlib.md5(param_string.encode("utf-8")).hexdigest()
 
 def _verify_payfast_signature(data: dict) -> bool:
     """
@@ -361,7 +362,7 @@ def _verify_payfast_signature(data: dict) -> bool:
     received = data.get("signature", "")
     check    = {k: v for k, v in data.items() if k != "signature"}
     expected = _generate_payfast_signature(check)
-    print(f"[PayFast VERIFY] received={received} expected={expected}")
+    # print(f"[PayFast VERIFY] received={received} expected={expected}")
     return received == expected
 
 # ══════════════════════════════════════════════════════════════════════════════

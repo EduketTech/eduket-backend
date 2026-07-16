@@ -324,23 +324,39 @@ def _get_school_pricing_context(school_id: str) -> dict:
 
 def _generate_payfast_signature(params: dict) -> str:
     """
-    Generate the MD5 signature PayFast expects.
-    Excludes 'signature' field, URL-encodes values, appends passphrase.
+    Generate PayFast MD5 signature.
+    Parameters must be in the SAME ORDER as the payment form.
+    Empty values excluded. Passphrase appended ONLY if configured.
     """
-    parts = [
-        f"{key}={quote_plus(str(value))}"
-        for key, value in params.items()
-        if key != "signature" and value is not None and str(value).strip() != ""
-    ]
-    param_string  = "&".join(parts)
-    param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE)}"
+    parts = []
+    for key, value in params.items():
+        if key == "signature":
+            continue
+        if value is None:
+            continue
+        str_val = str(value).strip()
+        if str_val == "":
+            continue
+        parts.append(f"{key}={quote_plus(str_val)}")
+
+    param_string = "&".join(parts)
+
+    # CRITICAL: only append passphrase if it is actually set
+    # Appending &passphrase= with an empty value breaks the signature
+    if PAYFAST_PASSPHRASE and PAYFAST_PASSPHRASE.strip():
+        param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE.strip())}"
+
     return hashlib.md5(param_string.encode("utf-8")).hexdigest()
 
 
 def _verify_payfast_signature(data: dict) -> bool:
-    """Verify a PayFast ITN signature. Returns True if valid."""
+    """
+    Verify a PayFast ITN signature.
+    Uses the parameter order as received from PayFast's POST body.
+    """
     received = data.get("signature", "")
-    check    = {k: v for k, v in data.items() if k != "signature"}
+    # Build check dict preserving received order, excluding signature
+    check = {k: v for k, v in data.items() if k != "signature"}
     expected = _generate_payfast_signature(check)
     return received == expected
 
@@ -595,7 +611,7 @@ def payfast_itn():
       7. Amount        — paid amount must match expected ± 1%
     """
     try:
-        itn_data = dict(request.form)
+        itn_data = request.form.to_dict(flat=True)
 
         # 1. IP allowlist check (warn only — signature is the real gate)
         sender_ip = request.headers.get(

@@ -28,7 +28,7 @@ Environment variables required
     PAYFAST_MERCHANT_KEY  — from PayFast merchant dashboard
     PAYFAST_PASSPHRASE    — set in PayFast Settings → Integration → Passphrase
     FRONTEND_BASE_URL     — e.g. https://eduket.tech  (no trailing slash)
-    BACKEND_BASE_URL      — e.g. https://your-service.onrender.com
+    BACKEND_BASE_URL      — e.g. https://chatbot-backend-educat.onrender.com
     EXCHANGE_RATE_API_KEY — optional; open.er-api.com free tier used if absent
 
 PayFast notes
@@ -86,7 +86,7 @@ if not all([PAYFAST_MERCHANT_ID, PAYFAST_MERCHANT_KEY]):
     )
 
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://eduket.tech").rstrip("/")
-BACKEND_BASE_URL  = os.environ.get("BACKEND_BASE_URL", "http://localhost:5000").rstrip("/")
+BACKEND_BASE_URL  = os.environ.get("BACKEND_BASE_URL", "https://chatbot-backend-educat.onrender.com").rstrip("/")
 
 # PayFast known IP ranges — only ITN POST from these IPs are trusted.
 # Source: https://developers.payfast.co.za/docs#step_4_confirm_payment

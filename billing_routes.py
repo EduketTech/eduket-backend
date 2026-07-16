@@ -351,7 +351,7 @@ def _generate_payfast_signature(params: dict) -> str:
     if PAYFAST_PASSPHRASE and PAYFAST_PASSPHRASE.strip():
         param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE.strip())}"
         # Add this line temporarily just before the return
-        print(f"[SIG] {param_string}")
+        # print(f"[SIG] {param_string}")
 
     return hashlib.md5(param_string.encode("utf-8")).hexdigest()
 

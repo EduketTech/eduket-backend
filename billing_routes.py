@@ -156,20 +156,20 @@ def _audit(action: str, actor: str, target: str, details: dict = {}):
 
 SUBSCRIPTION_TIERS = {
     "free": {
-        "id": "free", "name": "Free", "price_zar": 0, "exam_limit": 5,
+        "id": "free", "name": "Free", "price_zar": 0, "exam_limit": 4,
         "description": "5 exam uploads per month. Perfect for a trial.",
-        "features": ["5 exam uploads/month", "AI marking",
+        "features": ["4 exam uploads/month", "AI marking",
                      "Student results", "Basic analytics"],
     },
     "silver": {
-        "id": "silver", "name": "Silver", "price_zar": 799, "exam_limit": 30,
+        "id": "silver", "name": "Silver", "price_zar": 1299, "exam_limit": 30,
         "description": "Ideal for individual teachers.",
-        "features": ["30 exam uploads/month", "All Free features",
+        "features": ["15 exam uploads/month", "All Free features",
                      "Memo-based marking", "Class performance reports",
                      "AI study coach"],
     },
     "gold": {
-        "id": "gold", "name": "Gold", "price_zar": 1399, "exam_limit": 120,
+        "id": "gold", "name": "Gold", "price_zar": 1999, "exam_limit": 120,
         "description": "For departments and small schools.",
         "features": ["120 exam uploads/month", "All Silver features",
                      "Multi-subject analytics", "PDF report export",

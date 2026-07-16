@@ -326,31 +326,32 @@ def _get_school_pricing_context(school_id: str) -> dict:
 def _generate_payfast_signature(params: dict) -> str:
     """
     Generate PayFast MD5 signature.
-    Sort alphabetically, exclude empty values and 'signature'.
-    Append passphrase only if configured.
-    Use same encoding PayFast uses: quote_plus with %20 converted to +.
-    """
-    # Filter and sort alphabetically
-    filtered = {
-        k: str(v).strip()
-        for k, v in params.items()
-        if k != "signature"
-        and v is not None
-        and str(v).strip() != ""
-    }
-    sorted_items = sorted(filtered.items(), key=lambda x: x[0])
 
-    # Build param string — spaces as +, special chars as %XX
+    CRITICAL: Do NOT sort alphabetically.
+    PayFast verifies using the order fields are received in the form POST.
+    The form sends fields in dict insertion order (Python 3.7+ preserves this).
+    Sorting here breaks the signature because PayFast sees a different order.
+
+    Reference: PayFast PHP SDK iterates in insertion order, not sorted.
+    """
     parts = []
-    for k, v in sorted_items:
-        encoded_v = quote_plus(v)
-        parts.append(f"{k}={encoded_v}")
+    for k, v in params.items():
+        if k == "signature":
+            continue
+        if v is None:
+            continue
+        str_val = str(v).strip()
+        if str_val == "":
+            continue
+        parts.append(f"{k}={quote_plus(str_val)}")
 
     param_string = "&".join(parts)
 
-    # Append passphrase only if set
+    # Append passphrase only if configured
     if PAYFAST_PASSPHRASE and PAYFAST_PASSPHRASE.strip():
         param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE.strip())}"
+        # Add this line temporarily just before the return
+        print(f"[SIG] {param_string}")
 
     return hashlib.md5(param_string.encode("utf-8")).hexdigest()
 

@@ -325,41 +325,44 @@ def _get_school_pricing_context(school_id: str) -> dict:
 def _generate_payfast_signature(params: dict) -> str:
     """
     Generate PayFast MD5 signature.
-    Parameters must be in the SAME ORDER as the payment form.
-    Empty values excluded. Passphrase appended ONLY if configured.
-    """
-    parts = []
-    for key, value in params.items():
-        if key == "signature":
-            continue
-        if value is None:
-            continue
-        str_val = str(value).strip()
-        if str_val == "":
-            continue
-        parts.append(f"{key}={quote_plus(str_val)}")
 
+    PayFast requires parameters sorted ALPHABETICALLY.
+    The Node.js reference implementation used .sort() — this must match.
+    quote_plus encodes spaces as + which matches PayFast's expectation.
+    Passphrase appended ONLY when it has a non-empty value.
+    """
+    # Sort alphabetically — this is the critical fix
+    sorted_items = sorted(
+        [(k, v) for k, v in params.items()
+         if k != "signature"
+         and v is not None
+         and str(v).strip() != ""],
+        key=lambda x: x[0]
+    )
+
+    parts = [f"{k}={quote_plus(str(v))}" for k, v in sorted_items]
     param_string = "&".join(parts)
 
-    # CRITICAL: only append passphrase if it is actually set
-    # Appending &passphrase= with an empty value breaks the signature
+    # Only append passphrase if one is actually configured
     if PAYFAST_PASSPHRASE and PAYFAST_PASSPHRASE.strip():
         param_string += f"&passphrase={quote_plus(PAYFAST_PASSPHRASE.strip())}"
 
-    return hashlib.md5(param_string.encode("utf-8")).hexdigest()
+    print(f"[PayFast SIG] param_string: {param_string}")
+    sig = hashlib.md5(param_string.encode("utf-8")).hexdigest()
+    print(f"[PayFast SIG] signature:    {sig}")
+    return sig
 
 
 def _verify_payfast_signature(data: dict) -> bool:
     """
     Verify a PayFast ITN signature.
-    Uses the parameter order as received from PayFast's POST body.
+    Uses same alphabetical sort as _generate_payfast_signature.
     """
     received = data.get("signature", "")
-    # Build check dict preserving received order, excluding signature
-    check = {k: v for k, v in data.items() if k != "signature"}
+    check    = {k: v for k, v in data.items() if k != "signature"}
     expected = _generate_payfast_signature(check)
+    print(f"[PayFast VERIFY] received={received} expected={expected}")
     return received == expected
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE: Single tier price quote

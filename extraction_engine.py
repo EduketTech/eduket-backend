@@ -309,21 +309,30 @@ def ai_vision(image_b64: str, prompt: str) -> str:
     """Send a page image + prompt to Groq vision → Gemini vision fallback."""
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        try:
-            client = Groq(api_key=groq_key)
-            resp   = client.chat.completions.create(
-                model=_VISION_MODEL,
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    {"type": "text", "text": prompt},
-                ]}],
-                max_tokens=_MAX_TOKENS_PER_PAGE,
-                temperature=0,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning("[Vision] Groq failed: %s", str(e)[:120])
+        for attempt in range(3):           # ← retry up to 3 times
+            try:
+                client = Groq(api_key=groq_key)
+                resp   = client.chat.completions.create(
+                    model=_VISION_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {"type": "text", "text": prompt},
+                    ]}],
+                    max_tokens=_MAX_TOKENS_PER_PAGE,
+                    temperature=0,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate_limit" in err.lower():
+                    wait = 2 ** attempt      # 1s, 2s, 4s
+                    logger.warning("[Vision] Groq rate limit — waiting %ds (attempt %d/3)",
+                                   wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
+                logger.warning("[Vision] Groq failed: %s", err[:120])
+                break                        # non-429 error → fall through to Gemini
 
     gemini_key = os.getenv("GEMINI_API_KEY")
     if gemini_key:
@@ -707,6 +716,25 @@ def _merge_pages(page_results: list[list[dict]]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # PRIMARY PUBLIC API — QUESTION EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
+def _render_pages(pdf_bytes: bytes) -> list[tuple[int, bytes, str]]:
+    """Returns (page_num, png_bytes, native_text) for each page."""
+    pages = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        mat = fitz.Matrix(_PAGE_DPI / 72, _PAGE_DPI / 72)
+        for i, page in enumerate(doc):
+            try:
+                native_text = page.get_text().strip()
+                pix         = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                png         = pix.tobytes("png")
+                pages.append((i + 1, png, native_text))
+            except Exception as e:
+                logger.error("[Render] Page %d: %s", i + 1, e)
+        doc.close()
+    except Exception as e:
+        logger.error("[Render] PDF open failed: %s", e)
+    return pages
+
 
 def extract_questions_from_file(
     file_bytes:    bytes,
@@ -732,14 +760,21 @@ def extract_questions_from_file(
         raw_pages = _render_pages(pdf_bytes)
         if raw_pages:
             page_results: list[list[dict]] = []
-            for page_num, png_bytes in raw_pages:
-                page_url  = (_upload_page_image(school_folder, exam_id, page_num, png_bytes)
-                             if exam_id else None)
-                page_b64  = base64.b64encode(png_bytes).decode()
-                questions = _extract_page_questions(
-                    page_b64, page_url, subject, grade, page_num
-                )
+            for page_num, png_bytes, native_text in raw_pages:
+                # If page has plenty of native text, use text extraction (no API call)
+                if len(native_text) > 300:
+                    logger.info("[Extract] Page %d: using native text (%d chars)", page_num, len(native_text))
+                    # Parse the native text directly for this page
+                    # (falls through to parse_questions_universal at the end)
+                    page_results.append([])  # vision skipped
+                    continue
+
+                # Otherwise use vision (for diagram-heavy pages)
+                page_b64 = base64.b64encode(png_bytes).decode()
+                page_url = (_upload_page_image(...) if exam_id else None)
+                questions = _extract_page_questions(page_b64, page_url, subject, grade, page_num)
                 page_results.append(questions)
+                time.sleep(0.5)
             questions = _merge_pages(page_results)
             if questions:
                 logger.info("[Extract] ✓ %d questions via render-first pipeline", len(questions))

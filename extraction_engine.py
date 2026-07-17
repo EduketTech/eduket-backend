@@ -1,11 +1,11 @@
 """
-extraction_engine.py — Eduket OS  v5  (multi-provider, render-first)
+extraction_engine.py — Eduket OS  v5.1  (multi-provider, render-first)
 ═══════════════════════════════════════════════════════════════════════════════
 Architecture
 ──────────────
 Every uploaded DOCX / ODT is converted to PDF by LibreOffice, rendered
 page-by-page at 200 DPI, each page is uploaded to Firebase Storage, and
-Groq vision reads the page image to extract a structured question JSON.
+vision AI reads the page image to extract a structured question JSON.
 
 This "render-first" approach handles everything in one pass:
   • Diagrams, graphs, maps, circuit diagrams  — visible in the page render
@@ -13,53 +13,19 @@ This "render-first" approach handles everything in one pass:
   • Accounting tables / financial statements — exact layout preserved
   • Any font, any formatting                 — LibreOffice renders it all
 
+Two-phase extraction (v5.1 improvement):
+  Phase 1 — classify each page (cover / instructions / toc / questions / ...)
+  Phase 2 — extract questions only from genuine question pages
+  This prevents instruction numbers (1. Do not... 2. Write neatly...) from
+  being falsely extracted as exam questions.
+
 AI provider chain (automatic fallback)
 ──────────────────────────────────────
-Text tasks (parsing, marking, memo extraction):
-  1. Groq    — fastest, generous free tier
-  2. Gemini  — 1,500 free calls/day, 1M context
-  3. Together AI — $25 credit covers months of testing
-
-Vision tasks (page image → question JSON):
-  1. Groq vision  (llama-4-scout)
-  2. Gemini vision (gemini-2.0-flash)
-
-Public API
-──────────
-  extract_questions_from_file(file_bytes, filename, subject, grade,
-                              exam_id, school_folder) → list[dict]
-      Primary entry point for question papers.
-
-  extract_text_from_file(file_bytes, filename, subject) → str
-      Fast text-only path — used for memo extraction.
-
-  parse_questions_universal(text, subject, grade) → list[dict]
-      LLM text parser — fallback when vision pipeline unavailable.
-
-app.py integration
-──────────────────
-  In run_extraction_pipeline, replace:
-      exam_text = extract_text_from_file(exam_bytes, exam_fn)
-      questions = parse_questions_universal(exam_text, subject, grade)
-  with:
-      questions = extract_questions_from_file(
-          exam_bytes, exam_fn, subject, grade,
-          exam_id=exam_id,
-          school_folder=meta.get("schoolFolder", school_id),
-      )
-
-Render build command
-─────────────────────
-  apt-get install -y libreoffice --no-install-recommends && pip install -r requirements.txt
-
-Environment variables required
-────────────────────────────────
-  GROQ_API_KEY      — primary AI provider
-  GEMINI_API_KEY    — fallback AI provider (aistudio.google.com — free)
-  TOGETHER_API_KEY  — final fallback (together.ai — $25 free credit)
+Text tasks: Groq → Gemini
+Vision tasks: Groq vision (llama-4-scout) → Gemini vision (gemini-2.0-flash)
 """
 
-from __future__ import annotations   # Python 3.8+ type hint compatibility
+from __future__ import annotations
 
 import io
 import os
@@ -72,12 +38,13 @@ import shutil
 import logging
 import subprocess
 import tempfile
-from pathlib import Path
-import magic
 import zipfile
+from pathlib import Path
+from typing import Optional
 
 import fitz          # PyMuPDF
 import mammoth
+import magic
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -93,158 +60,23 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Vision model — handles page image → question JSON.
-# llama-4-scout supports image input and is not in the deprecation list.
 _VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-# Text model priority list — tried in order, first available wins.
-# Update this list after checking console.groq.com/docs/models.
 _GROQ_MODEL_CANDIDATES = [
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "meta-llama/llama-4-maverick-17b-128e-instruct"
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
-_PAGE_DPI            = 200     # 200 DPI = sharp enough for diagrams and equations
-_MAX_TOKENS_PER_PAGE = 4096    # Groq vision response budget per page
-_CHUNK_SIZE          = 6_000   # chars per text chunk (≈1,500 tokens + prompt overhead)
-_CHUNK_OVERLAP       = 400     # overlap to avoid splitting questions across chunks
+_PAGE_DPI            = 200
+_MAX_TOKENS_PER_PAGE = 4096
+_CHUNK_SIZE          = 6_000
+_CHUNK_OVERLAP       = 400
 
-# Module-level cache — resolved on first call, reused for all subsequent calls
 _RESOLVED_GROQ_MODEL: str | None = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MULTI-PROVIDER AI LAYER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _resolve_groq_model() -> str:
-    """
-    Query Groq's /models endpoint and return the first candidate that
-    is currently available. Caches the result so the API is only called once
-    per process lifetime.
-    """
-    global _RESOLVED_GROQ_MODEL
-    if _RESOLVED_GROQ_MODEL:
-        return _RESOLVED_GROQ_MODEL
-
-    try:
-        client    = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        available = {m.id for m in client.models.list().data}
-        for candidate in _GROQ_MODEL_CANDIDATES:
-            if candidate in available:
-                logger.info("[Model] Groq parser model resolved: %s", candidate)
-                _RESOLVED_GROQ_MODEL = candidate
-                return candidate
-    except Exception as e:
-        logger.warning("[Model] Could not query Groq models: %s", e)
-
-    fallback = _GROQ_MODEL_CANDIDATES[-1]
-    logger.warning("[Model] Falling back to last-resort Groq model: %s", fallback)
-    _RESOLVED_GROQ_MODEL = fallback
-    return fallback
-
-
-def ai_text(prompt: str, max_tokens: int = 2000, temperature: float = 0.1) -> str:
-    """
-    Send a text prompt to the AI provider chain.
-    Tries Groq → Gemini → Together AI in order.
-    Raises RuntimeError only if all three fail.
-    """
-    last_error: Exception | None = None
-
-    # ── 1. Groq ───────────────────────────────────────────────────────────
-    groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        for attempt in range(2):
-            try:
-                client = Groq(api_key=groq_key)
-                resp   = client.chat.completions.create(
-                    model=_resolve_groq_model(),
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return resp.choices[0].message.content.strip()
-            except Exception as e:
-                err_str = str(e)
-                if "decommissioned" in err_str or "deprecated" in err_str:
-                    # Invalidate cached model so next call re-resolves
-                    global _RESOLVED_GROQ_MODEL
-                    _RESOLVED_GROQ_MODEL = None
-                    logger.warning("[Groq] Model decommissioned — re-resolving")
-                    continue
-                if "413" in err_str and attempt == 0:
-                    # Token limit — will be handled by caller with smaller chunks
-                    raise
-                last_error = e
-                logger.warning("[Groq] Attempt %d failed: %s", attempt + 1, err_str[:120])
-                time.sleep(1)
-                break
-
-    # ── 2. Gemini ─────────────────────────────────────────────────────────
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if gemini_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            model    = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
-            logger.info("[AI] Gemini responded successfully")
-            return response.text.strip()
-        except Exception as e:
-            last_error = e
-            logger.warning("[Gemini] Failed: %s", str(e)[:120])
-
-    raise RuntimeError(
-        f"All AI providers failed. Last error: {last_error}. "
-        "Check GROQ_API_KEY or GEMINI_API_KEY in environment."
-    )
-
-
-def ai_vision(image_b64: str, prompt: str) -> str:
-    """
-    Send a page image + prompt to the vision provider chain.
-    Tries Groq vision → Gemini vision.
-    """
-    # ── 1. Groq vision ────────────────────────────────────────────────────
-    groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        try:
-            client = Groq(api_key=groq_key)
-            resp   = client.chat.completions.create(
-                model=_VISION_MODEL,
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    {"type": "text", "text": prompt},
-                ]}],
-                max_tokens=_MAX_TOKENS_PER_PAGE,
-                temperature=0,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning("[Vision] Groq failed: %s", str(e)[:120])
-
-    # ── 2. Gemini vision ──────────────────────────────────────────────────
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if gemini_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            model  = genai.GenerativeModel("gemini-2.0-flash")
-            img    = {"inline_data": {"mime_type": "image/png", "data": image_b64}}
-            result = model.generate_content([img, prompt])
-            logger.info("[Vision] Gemini vision responded")
-            return result.text.strip()
-        except Exception as e:
-            logger.warning("[Vision] Gemini failed: %s", str(e)[:120])
-
-    raise RuntimeError("All vision providers failed. Check API keys.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SUBJECT CLASSIFICATION + PARSING HINTS
+# SUBJECT CLASSIFICATION  (single definition — no duplicate below)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SUBJECT_MAP = {
@@ -264,7 +96,9 @@ _SUBJECT_MAP = {
     "history":       {"history"},
 }
 
+
 def _subject_category(subject: str) -> str:
+    """Map a subject name to a parsing hints category. Single definition."""
     s = subject.lower().strip()
     for cat, keywords in _SUBJECT_MAP.items():
         if any(k in s for k in keywords):
@@ -272,84 +106,238 @@ def _subject_category(subject: str) -> str:
     return "general"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PARSING HINTS  (single definition — comprehensive, not overwritten below)
+# ══════════════════════════════════════════════════════════════════════════════
+
 _PARSING_HINTS: dict[str, str] = {
     "accounting": """
-ACCOUNTING: Financial statements (Income Statement, Balance Sheet, Cash Flow, Notes)
-are ONE question. Reproduce the COMPLETE table in question_table as GitHub markdown:
+ACCOUNTING: Financial statements (Income Statement, Balance Sheet, Cash Flow)
+are ONE question. Reproduce the COMPLETE table in question_table as markdown:
 | Account | Debit (R) | Credit (R) |
 |---------|-----------|------------|
-| ...     | ...       | ...        |
-Preserve EVERY row, header, subtotal, and total line exactly as shown.
-T-accounts: capture both debit AND credit columns in question_table.
-Trial balance: every account name and balance in question_table.
-Journal entries: date, account, debit, credit in question_table.
+Preserve EVERY row, header, subtotal, and total line.
+T-accounts: capture both debit AND credit columns.
 type="accounting_statement" for statement preparation questions.
 has_visual=true for any question containing a financial table or diagram.""",
 
     "mathematics": """
-MATHEMATICS: Every equation and formula must appear in question_latex using LaTeX syntax.
-Fractions: \\frac{num}{den}  Powers: x^{2}  Roots: \\sqrt{x}
-Subscripts: x_{n}  Greek: \\alpha \\beta \\theta \\pi
-Trig: \\sin \\cos \\tan  Limits: \\lim_{x \\to 0}
-Use inline $...$ for formulas within sentences, display $$...$$ for standalone equations.
-type="proof" for Show that / Prove that questions.
-type="calculation" for numerical answer questions.
-has_visual=true for geometric figures, graphs, number lines.""",
+MATHEMATICS — NSC/SC EXAM RULES:
+
+LATEX — every equation, expression, and formula goes in question_latex:
+  Quadratic:      $(x+5)(x-2)=0$
+  Exponential:    $2 \\cdot 2^{2x} - 9 \\cdot 2^x + 4 = 0$
+  Surd/nested:    $\\sqrt{\\sqrt{\\frac{1}{x}} + 2} = \\frac{1}{\\sqrt{x}}$
+  Logarithm:      $f(x) = \\log_{\\frac{1}{3}} x$
+  Summation:      $\\sum_{p=k}^{117}(4p-1) = 26\\,675$
+  Sequence:       $T_n = -n^2 + 38n - 1$
+  First princip:  $f'(x) = \\lim_{h \\to 0} \\frac{f(x+h)-f(x)}{h}$
+  2nd deriv:      $f''(x)$
+  Rational dy/dx: $\\frac{dy}{dx}$ if $y = \\frac{2x^4+1}{x^2}$
+  Inverse fn:     $f^{-1}$, $T_{25}$, $S_{\\infty}$
+
+SECTION TOTAL vs QUESTION MARKS — critical:
+  (2) immediately right of question text → marks=2 for THAT question
+  [25] at END of question block          → section TOTAL, NOT a question's marks
+  Example: "1.2 ... (6) [25]" → marks=6 (the [25] is QUESTION 1 total)
+
+PARENT CONTEXT — capture EVERYTHING shared by sub-questions:
+  Scenario text + ANY data table in the scenario must ALL go into parent_context.
+  Example Q3: parent_context must include the torpedo scenario text AND the table:
+    "The depth of a torpedo forms a quadratic pattern...
+     | Time | Depth (m) |
+     |------|-----------|
+     | At the end of the first second | 36 |
+     | At the end of the first 2 seconds | 71 |
+     | At the end of the first 3 seconds | 104 |"
+
+DATA TABLE inside a question body → question_table (markdown):
+  | | JUICE | ENERGY DRINKS | TOTAL |
+  |---|---|---|---|
+  | Female | a | b | c |
+  Sub-questions under that question inherit it via parent_context.
+
+QUESTION TYPES:
+  "Show that..."                   → type="proof"
+  "Prove that..."                  → type="proof"
+  "Determine f'(x) from first principles" → type="proof"
+  "Calculate...", "Determine..."   → type="calculation"
+  "Write down..."                  → type="short_answer"
+  "Draw the graph...", "Sketch..." → type="open", has_visual=true
+  "Describe the transformation"    → type="short_answer"
+  Inequality solve (8x²>2x)        → type="calculation"
+
+GRAPH PAGES — has_visual=true for ALL sub-questions when:
+  - A graph/diagram appears on the same page
+  - Describe the graph in parent_context:
+      "[DIAGRAM: Graph of f(x)=log_{1/3}x. Decreasing curve.
+       Point A on positive x-axis. Point (3;t) below x-axis.]"
+
+BULLET POINT conditions before a single mark allocation = ONE question:
+  "1.2 Calculate x and y if:
+    • x is the sum of 2 and y
+    • Five times the product..."  (6)
+  → question_number="1.2", marks=6 — NOT two separate questions
+
+SIGMA/SUMMATION:
+  Always in LaTeX: $\\sum_{p=k}^{117}(4p-1) = 26\\,675$
+  Do NOT write as plain text "sum from p=k to 117"
+
+SECOND DERIVATIVE: f''(x) → $f''(x)$  (two primes, not f double prime)
+""",
 
     "sciences": """
 PHYSICAL SCIENCES: Preserve ALL SI units exactly (m·s⁻², N, J, Pa, mol·dm⁻³).
 Circuit diagrams, force diagrams, velocity-time graphs: has_visual=true.
-Also describe in question text: [DIAGRAM: resistor R1=10Ω connected in series...].
-Equations: use question_latex e.g. $v^2 = u^2 + 2as$.
-Scenario / "given information" block before sub-questions → parent_context.
-type="practical" for investigation questions.
-type="calculation" for formula application questions.""",
+Describe inline: [DIAGRAM: resistor R1=10Ω connected in series...].
+Equations in question_latex. type="practical" for investigation questions.""",
 
     "life_sciences": """
 LIFE SCIENCES: Biological diagrams (cells, organs, food webs): has_visual=true.
-Describe all labelled structures in question text: [DIAGRAM: plant cell showing...].
+Describe all labelled structures: [DIAGRAM: plant cell showing chloroplast...].
 Data tables: reproduce as markdown in question_table.
-"Label parts A, B, C" → diagram description in parent_context, has_visual=true.
 type="practical" for investigation questions.""",
 
     "geography": """
-GEOGRAPHY: Maps, climate graphs, cross-sections, topographic extracts: has_visual=true.
-Describe: [MAP: Gauteng region showing N1 highway and surrounding municipalities].
-Stimulus / case study text → parent_context for all sub-questions below it.
-Data tables → question_table in markdown.
-Preserve all statistics, co-ordinates, and place names exactly.""",
+GEOGRAPHY: Maps, climate graphs, cross-sections: has_visual=true.
+Describe: [MAP: Gauteng region showing N1 highway...].
+Stimulus/case study text → parent_context for sub-questions.
+Data tables → question_table in markdown.""",
 
     "business": """
 BUSINESS STUDIES / ECONOMICS:
-Case study or scenario text → parent_context (never repeat it per sub-question).
-type="essay" for discuss / critically analyse / evaluate questions (20-40 marks).
-type="short_answer" for define / identify / list questions (2-4 marks).
+Case study or scenario text → parent_context (never repeat per sub-question).
+type="essay" for discuss / critically analyse / evaluate (20-40 marks).
+type="short_answer" for define / identify / list (2-4 marks).
 Financial data tables → question_table in markdown.""",
 
     "language": """
-LANGUAGE / LIFE SKILLS / LIFE ORIENTATION:
-Reading passage / scenario text → parent_context for ALL sub-questions below it.
+ENGLISH / LANGUAGE / LIFE ORIENTATION:
+Reading passage / extract / poem → parent_context for ALL sub-questions.
 type="mcq" for vocabulary / grammar / comprehension multiple-choice.
 type="essay" for creative writing / formal essay / summary tasks.
-Quoted lines of poetry or prose that a question asks about → include in question field.
-For Life Orientation case studies: scenario text is always parent_context.""",
+COLUMN A / COLUMN B matching → type="matching", use column_a and column_b.
+"(a) What tone... (b) Why would..." → two separate sub-questions.
+"Discuss your view" → type="essay". Figure of speech ID → type="short_answer".
+Marks shown as "(4 × 1) (4)" = 4 marks total for 4 matching items.""",
 
     "cat_it": """
-CAT / IT: Code snippets MUST be preserved EXACTLY including indentation.
-Wrap in triple backticks: ```python\\n    x = 5\\n```.
-Scenario text → parent_context.
-Spreadsheet cell references like B2:B10 or $A$1 preserved exactly.
+CAT / IT: Code snippets preserved EXACTLY with indentation in triple backticks.
+Spreadsheet references like B2:B10 or $A$1 preserved exactly.
 type="practical" for spreadsheet / database / word-processing tasks.
 type="calculation" for algorithm / pseudocode / trace table questions.""",
 
     "history": """
 HISTORY: Source text (Document A, Cartoon B, photograph) → parent_context.
 type="essay" for "to what extent" / "discuss" questions.
-has_visual=true for cartoons, photographs, or maps.
-Preserve all dates, names, and quoted text exactly.""",
+has_visual=true for cartoons, photographs, or maps.""",
 
     "general": "",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-PROVIDER AI LAYER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_groq_model() -> str:
+    global _RESOLVED_GROQ_MODEL
+    if _RESOLVED_GROQ_MODEL:
+        return _RESOLVED_GROQ_MODEL
+    try:
+        client    = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        available = {m.id for m in client.models.list().data}
+        for candidate in _GROQ_MODEL_CANDIDATES:
+            if candidate in available:
+                logger.info("[Model] Groq model resolved: %s", candidate)
+                _RESOLVED_GROQ_MODEL = candidate
+                return candidate
+    except Exception as e:
+        logger.warning("[Model] Could not query Groq models: %s", e)
+    fallback = _GROQ_MODEL_CANDIDATES[0]
+    logger.warning("[Model] Falling back to: %s", fallback)
+    _RESOLVED_GROQ_MODEL = fallback
+    return fallback
+
+
+def ai_text(prompt: str, max_tokens: int = 2000, temperature: float = 0.1) -> str:
+    """Send a text prompt to Groq → Gemini fallback chain."""
+    last_error: Exception | None = None
+
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        for attempt in range(2):
+            try:
+                client = Groq(api_key=groq_key)
+                resp   = client.chat.completions.create(
+                    model=_resolve_groq_model(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                err_str = str(e)
+                if "decommissioned" in err_str or "deprecated" in err_str:
+                    global _RESOLVED_GROQ_MODEL
+                    _RESOLVED_GROQ_MODEL = None
+                    logger.warning("[Groq] Model decommissioned — re-resolving")
+                    continue
+                if "413" in err_str and attempt == 0:
+                    raise
+                last_error = e
+                logger.warning("[Groq] Attempt %d failed: %s", attempt + 1, err_str[:120])
+                time.sleep(1)
+                break
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model    = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            logger.warning("[Gemini] Failed: %s", str(e)[:120])
+
+    raise RuntimeError(f"All AI providers failed. Last error: {last_error}")
+
+
+def ai_vision(image_b64: str, prompt: str) -> str:
+    """Send a page image + prompt to Groq vision → Gemini vision fallback."""
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        try:
+            client = Groq(api_key=groq_key)
+            resp   = client.chat.completions.create(
+                model=_VISION_MODEL,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    {"type": "text", "text": prompt},
+                ]}],
+                max_tokens=_MAX_TOKENS_PER_PAGE,
+                temperature=0,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning("[Vision] Groq failed: %s", str(e)[:120])
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model  = genai.GenerativeModel("gemini-2.0-flash")
+            img    = {"inline_data": {"mime_type": "image/png", "data": image_b64}}
+            result = model.generate_content([img, prompt])
+            return result.text.strip()
+        except Exception as e:
+            logger.warning("[Vision] Gemini failed: %s", str(e)[:120])
+
+    raise RuntimeError("All vision providers failed. Check API keys.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -357,27 +345,19 @@ Preserve all dates, names, and quoted text exactly.""",
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _upload_page_image(school_folder: str, exam_id: str,
-                        page_num: int, png_bytes: bytes) -> str | None:
-    """
-    Upload a rendered page PNG to Firebase Storage.
-    Returns a tokenized download URL or None on failure.
-    Path: exam_pages/{schoolFolder}/{examId}/page_{nnn}.png
-    The Admin SDK bypasses Firestore rules — no permission issues.
-    """
+                        page_num: int, png_bytes: bytes) -> Optional[str]:
     try:
         from firebase_admin import storage as fb_storage
-        bucket       = fb_storage.bucket()
-        token        = str(uuid.uuid4())
-        path         = f"exam_pages/{school_folder}/{exam_id}/page_{page_num:03d}.png"
-        blob         = bucket.blob(path)
+        bucket  = fb_storage.bucket()
+        token   = str(uuid.uuid4())
+        path    = f"exam_pages/{school_folder}/{exam_id}/page_{page_num:03d}.png"
+        blob    = bucket.blob(path)
         blob.metadata = {"firebaseStorageDownloadTokens": token}
         blob.upload_from_string(png_bytes, content_type="image/png")
         blob.patch()
         encoded = path.replace("/", "%2F")
-        url = (
-            f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}"
-            f"/o/{encoded}?alt=media&token={token}"
-        )
+        url = (f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}"
+               f"/o/{encoded}?alt=media&token={token}")
         logger.info("[Storage] Page %d uploaded → %s", page_num, path)
         return url
     except Exception as e:
@@ -392,133 +372,75 @@ def _upload_page_image(school_folder: str, exam_id: str,
 def _lo_available() -> bool:
     return bool(shutil.which("libreoffice") or shutil.which("soffice"))
 
-MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024  # 2 MB hard limit
+
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
-def _validate_document(file_bytes: bytes, filename: str) -> str | None:
-    """
-    Validate an uploaded document before passing it to LibreOffice.
-    Returns an error message if the document is invalid; otherwise returns None.
-    """
-    # 1. Size check
+def _validate_document(file_bytes: bytes, filename: str) -> Optional[str]:
     if len(file_bytes) > MAX_FILE_SIZE_BYTES:
         return f"File exceeds the 50 MB limit ({len(file_bytes) // 1024 // 1024} MB)"
-
-    # 2. Magic-byte validation (reject files that lie about their extension)
     try:
         detected = magic.from_buffer(file_bytes[:2048], mime=True)
-        allowed_mimes = {
+        allowed  = {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/msword",
             "application/vnd.oasis.opendocument.text",
             "application/pdf",
         }
-
-        if detected not in allowed_mimes:
+        if detected not in allowed:
             return f"Invalid file type detected: {detected}"
-
     except Exception:
-        # python-magic unavailable — continue with other checks
         pass
-
-    # 3. DOCX ZIP bomb check
     if filename.lower().endswith(".docx"):
         try:
             with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-                total_uncompressed = sum(f.file_size for f in z.infolist())
-
-                if total_uncompressed > 500 * 1024 * 1024:
+                if sum(f.file_size for f in z.infolist()) > 500 * 1024 * 1024:
                     return "File rejected: ZIP bomb detected"
-
                 if len(z.infolist()) > 10000:
                     return "File rejected: too many ZIP entries"
-
         except zipfile.BadZipFile:
             return "Invalid DOCX file format"
-
     return None
 
 
-def _convert_to_pdf(file_bytes: bytes, filename: str) -> bytes | None:
-    """
-    Convert DOCX / DOC / ODT / RTF to PDF using LibreOffice in headless mode.
-
-    LibreOffice renders fonts, OMML equations, embedded images, and table
-    formatting similarly to Microsoft Word.
-
-    Returns PDF bytes, or None if conversion fails.
-    """
-
+def _convert_to_pdf(file_bytes: bytes, filename: str) -> Optional[bytes]:
     error = _validate_document(file_bytes, filename)
     if error:
         logger.error("[Security] File rejected: %s", error)
         return None
-
     if not _lo_available():
         logger.warning("[LibreOffice] Not installed — falling back to text extraction")
         return None
-
     cmd = shutil.which("libreoffice") or shutil.which("soffice")
-
     with tempfile.TemporaryDirectory() as tmp:
         inp = os.path.join(tmp, filename)
-
         with open(inp, "wb") as f:
             f.write(file_bytes)
-
         try:
             subprocess.run(
-                [
-                    cmd,
-                    "--headless",
-                    "--norestore",
-                    "--nofirststartwizard",
-                    "--infilter=writer_pdf_Export",
-                    "-env:UserInstallation=file:///tmp/libreoffice-sandbox",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    tmp,
-                    inp,
-                ],
-                check=True,
-                timeout=90,
-                capture_output=True,
-                env={
-                    **os.environ,
-                    "http_proxy": "http://127.0.0.1:0",
-                    "https_proxy": "http://127.0.0.1:0",
-                    "no_proxy": "",
-                },
+                [cmd, "--headless", "--norestore", "--nofirststartwizard",
+                 "--infilter=writer_pdf_Export",
+                 "-env:UserInstallation=file:///tmp/libreoffice-sandbox",
+                 "--convert-to", "pdf", "--outdir", tmp, inp],
+                check=True, timeout=90, capture_output=True,
+                env={**os.environ,
+                     "http_proxy":  "http://127.0.0.1:0",
+                     "https_proxy": "http://127.0.0.1:0",
+                     "no_proxy": ""},
             )
-
             pdf_path = os.path.join(tmp, Path(filename).stem + ".pdf")
-
             if os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
                     data = f.read()
-
-                logger.info(
-                    "[LibreOffice] %s → PDF (%d bytes)",
-                    filename,
-                    len(data),
-                )
+                logger.info("[LibreOffice] %s → PDF (%d bytes)", filename, len(data))
                 return data
-
             logger.error("[LibreOffice] PDF not produced for %s", filename)
-
         except subprocess.TimeoutExpired:
             logger.error("[LibreOffice] Timeout converting %s", filename)
-
         except subprocess.CalledProcessError as e:
-            logger.error(
-                "[LibreOffice] %s",
-                e.stderr.decode(errors="replace")[:300],
-            )
-
+            logger.error("[LibreOffice] %s", e.stderr.decode(errors="replace")[:300])
         except Exception as e:
             logger.error("[LibreOffice] %s", e)
-
     return None
 
 
@@ -527,10 +449,6 @@ def _convert_to_pdf(file_bytes: bytes, filename: str) -> bytes | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_pages(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
-    """
-    Render each PDF page as a PNG at _PAGE_DPI (200).
-    Returns [(page_number_1based, png_bytes), ...].
-    """
     pages: list[tuple[int, bytes]] = []
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -550,31 +468,89 @@ def _render_pages(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISION EXTRACTION — rendered page → question JSON
+# TWO-PHASE VISION EXTRACTION
+# Phase 1: classify page type (skip covers, instructions, TOC, checklists)
+# Phase 2: extract questions from genuine question pages only
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_page_questions(page_b64: str, page_url: str | None,
-                             subject: str, grade: str,
-                             page_num: int) -> list[dict]:
-    """
-    Send one rendered page image to the vision AI and get back a structured
-    list of question dicts. The vision model sees exactly what the teacher's
-    Word document looks like — diagrams, equations, and tables are all visible.
-    """
-    cat   = _subject_category(subject)
-    hints = _PARSING_HINTS.get(cat, "")
+_PAGE_CLASSIFIER_PROMPT = """You are reading a page from a South African school exam paper (NSC/SC or lower grade).
 
-    prompt = f"""You are a professional South African exam parser reading page {page_num} of a {subject} Grade {grade} exam paper.
+Classify this page into EXACTLY ONE of these categories:
 
-Extract EVERY question on this page into a JSON array. Be thorough — include all sub-questions.
+- "cover"        : Title page — subject name, grade, date, marks, time only
+- "instructions" : "INSTRUCTIONS AND INFORMATION" or "Read this page carefully" — administrative rules (Do not... Write neatly...)
+- "toc"          : Table of contents listing question numbers and page numbers
+- "checklist"    : Tick-box checklist of sections answered
+- "formula"      : Formula sheet, periodic table, data sheet, conversion table
+- "extract"      : A passage, poem, short story, or extract WITHOUT questions (just source text for students to read)
+- "questions"    : Page containing actual exam questions (numbered 1.1, 1.2.3, QUESTION 1 etc.)
+- "mixed"        : Contains BOTH a passage/extract AND questions about it on the same page
 
-OUTPUT SCHEMA (all fields required for every question):
+KEY RULES:
+- "INSTRUCTIONS AND INFORMATION" or "Read this page carefully before you begin" → ALWAYS "instructions"
+- Numbered administrative rules (do not copy, write neatly, answer TWO sections) → "instructions"
+- Numbered items asking students to DO something (explain, describe, state) → "questions"
+- "TABLE OF CONTENTS" at top → "toc"
+- "CHECKLIST" at top → "checklist"
+- Only title + marks + time → "cover"
+
+Return ONLY valid JSON:
+{"page_type": "questions", "reason": "one sentence"}"""
+
+
+def _build_extraction_prompt(subject: str, grade: str,
+                              page_num: int, subject_hints: str) -> str:
+    return f"""You are a professional South African NSC exam parser reading page {page_num} of a {subject} Grade {grade} exam paper.
+
+WHAT IS NOT A QUESTION — skip these entirely:
+  ✗ Numbered administrative instructions (1. Do not... 2. Answer TWO... 3. Write neatly...)
+  ✗ TABLE OF CONTENTS rows
+  ✗ CHECKLIST rows
+  ✗ Section headings: "SECTION A: NOVEL", "SECTION B: DRAMA"
+  ✗ Notes: "NOTE: Answer questions from ANY TWO sections"
+  ✗ Directions: "Answer ALL the questions on the novel you have studied"
+  ✗ Source references: "[Book 1, Chapter 8]", "[Act 3, Scene 1]"
+  ✗ Footer text: "Copyright reserved", "Please turn over"
+  ✗ Passage / poem / extract text that students READ (not answer)
+  ✗ "The number of marks allocated serves as a guide to expected length"
+  ✗ "Read the extract below and answer the questions set on each"
+
+WHAT IS A QUESTION — extract these:
+  ✓ Numbered items asking students to DO something: 1.1, 1.1.1, 1.1.2, 2.3.1
+  ✓ "Explain", "Describe", "State", "Choose", "Refer to", "Discuss", "Identify"
+  ✓ MCQ with options A B C D
+  ✓ COLUMN A / COLUMN B matching tables
+  ✓ "Discuss your view" essay questions
+  ✓ Sub-questions (a) (b) (c) under a numbered question
+
+SA NUMBERING RULES:
+  "QUESTION 1" → section header only. parent_question = "QUESTION 1". Do NOT create a question entry.
+  "1.1" → sub-question. parent_question = "QUESTION 1", question_number = "1.1"
+  "1.1.1" → sub-sub-question. question_number = "1.1.1", parent_question = "QUESTION 1"
+  "(a)" under "1.1.5" → question_number = "1.1.5(a)", parent_question = "QUESTION 1"
+  "5.1", "5.2" → sub-questions of QUESTION 5
+  "6.1.1" → sub-question of section 6.1 of QUESTION 6
+
+PARENT CONTEXT:
+  If a passage/extract appears on the same page ABOVE the questions, copy it
+  into parent_context for ALL questions on the page that refer to it.
+  If the extract was on a previous page, set parent_context = null.
+
+MATCHING QUESTIONS (COLUMN A / COLUMN B):
+  type = "matching"
+  column_a = {{"(a)": "Mrs Kumalo", "(b)": "Johannes Pafuri", ...}}
+  column_b = {{"A": "is forgiving...", "B": "is prepared to...", ...}}
+  marks = number of items (e.g. 4 items × 1 = 4 marks)
+
+MARKS: (2)=2, [2]=2, (4×1)=4, (4 x 1)=4. Default = 1 if not shown.
+
+OUTPUT SCHEMA:
 {{
-  "question_number":  "1.1",
+  "question_number":  "1.1.1",
   "parent_question":  "QUESTION 1",
   "parent_context":   null,
   "section":          "A",
-  "question":         "Full question text including any [DIAGRAM: ...] descriptions",
+  "question":         "Full question text",
   "type":             "short_answer",
   "marks":            2,
   "options":          null,
@@ -586,47 +562,112 @@ OUTPUT SCHEMA (all fields required for every question):
   "question_table":   null
 }}
 
-FIELD RULES:
-- question_number: exactly as printed — "1.1", "2.3.1", "QUESTION 3"
-- parent_question: the section heading above this question — "QUESTION 1"
-- parent_context: scenario / passage / source text shared by sub-questions (null if none)
-- section: visible letter (A, B, C) or "A" as default
-- question: FULL text. For ANY diagram, graph, circuit, map, or figure visible
-  near this question: describe it inline → [DIAGRAM: all labels, axes, units, values]
-- type: mcq | true_false | calculation | proof | essay | short_answer |
-        matching | practical | accounting_statement | open
-- marks: integer from (2) or [2], default 1
-- options: MCQ only — {{"A":"...","B":"...","C":"...","D":"..."}} — full answer text
-- has_visual: true if this question has a diagram, graph, figure, table, or image
-- question_latex: LaTeX string for any equation e.g. "$x^2 + 1 = 0$" (null if none)
-- question_table: full GitHub markdown table for accounting / data tables (null if none)
-- memo: always null for question papers
+TYPES: mcq | true_false | matching | essay | short_answer | calculation | proof | open | accounting_statement
 
-{hints}
+{subject_hints}
 
-IMPORTANT:
-- Include EVERY question on this page including sub-questions.
-- Marks notation "(3)" at end of line must be captured in the marks field.
-- MCQ options must contain the full answer text, not just the letter.
-- Return [] for cover pages, instruction pages, or formula sheets.
+CRITICAL:
+  1. Return [] for any non-question page.
+  2. NEVER create an entry for a heading or instruction paragraph.
+  3. Preserve the EXACT question number as printed ("1.1.1" not "Q1.1.1").
+  4. For MCQ include FULL option text, not just the letter.
+  5. memo is ALWAYS null.
+  6. For diagrams: [DIAGRAM: x-axis=time(s), y-axis=velocity(m/s), peak at t=3s]
 
-Return ONLY a valid JSON array. No markdown fences. No explanation."""
+Return ONLY a valid JSON array. No markdown. No explanation."""
 
+
+_SKIP_PAGE_TYPES = {"cover", "instructions", "toc", "checklist", "formula", "extract"}
+
+_INSTRUCTION_PHRASES = [
+    "do not attempt", "read this page carefully",
+    "this question paper consists of", "answer two questions",
+    "number the answers correctly", "start each section on a new page",
+    "suggested time management", "write neatly and legibly",
+    "copyright reserved", "please turn over", "table of contents",
+    "the number of marks allocated", "serves as a guide to the expected",
+    "answer the questions set on both",
+]
+
+
+def _extract_page_questions(page_b64: str, page_url: Optional[str],
+                             subject: str, grade: str,
+                             page_num: int) -> list[dict]:
+    """
+    Two-phase extraction:
+      Phase 1 — classify page type (cheap call)
+      Phase 2 — extract questions (only for question/mixed pages)
+    """
+    cat   = _subject_category(subject)
+    hints = _PARSING_HINTS.get(cat, "")
+
+    # ── Phase 1: classify ─────────────────────────────────────────────────
+    page_type = "questions"  # safe default
+    try:
+        raw = ai_vision(page_b64, _PAGE_CLASSIFIER_PROMPT)
+        raw = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        m   = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            obj       = json.loads(m.group())
+            page_type = obj.get("page_type", "questions")
+            logger.info("[Vision] Page %d → '%s': %s",
+                        page_num, page_type, obj.get("reason", ""))
+    except Exception as e:
+        logger.warning("[Vision] Page %d classify failed: %s", page_num, e)
+
+    if page_type in _SKIP_PAGE_TYPES:
+        logger.info("[Vision] Page %d skipped (%s)", page_num, page_type)
+        return []
+
+    # ── Phase 2: extract questions ────────────────────────────────────────
+    prompt = _build_extraction_prompt(subject, grade, page_num, hints)
     try:
         raw = ai_vision(page_b64, prompt)
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
         m   = re.search(r"\[.*\]", raw, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group())
-            if isinstance(parsed, list):
-                # Attach page image URL to questions with visual elements
-                if page_url:
-                    for q in parsed:
-                        if q.get("has_visual"):
-                            q["questionImageUrl"] = page_url
-                logger.info("[Vision] Page %d → %d questions", page_num, len(parsed))
-                return parsed
+        if not m:
+            return []
+
+        parsed = json.loads(m.group())
+        if not isinstance(parsed, list):
+            return []
+
+        valid = []
+        for q in parsed:
+            # Normalise question_number
+            qn = re.sub(r"^Q\.?\s*", "", str(q.get("question_number", "")).strip(),
+                        flags=re.IGNORECASE)
+            if not qn:
+                continue  # no question number = heading or instruction
+
+            # Normalise section
+            sec = str(q.get("section", "A")).strip().upper()
+            q["section"]         = sec if re.match(r"^[A-Z]$", sec) else "A"
+            q["question_number"] = qn
+
+            # Normalise marks
+            try:
+                q["marks"] = int(q.get("marks", 1))
+            except (TypeError, ValueError):
+                q["marks"] = 1
+
+            # Drop if question text is actually an instruction
+            qt = str(q.get("question", "")).strip().lower()
+            if any(p in qt for p in _INSTRUCTION_PHRASES):
+                logger.debug("[Vision] Dropped instruction as question: %s", qn)
+                continue
+
+            # Attach page image URL for visual questions
+            if page_url and q.get("has_visual"):
+                q["questionImageUrl"] = page_url
+
+            valid.append(q)
+
+        logger.info("[Vision] Page %d → %d questions (%d dropped)",
+                    page_num, len(valid), len(parsed) - len(valid))
+        return valid
+
     except json.JSONDecodeError as e:
         logger.error("[Vision] Page %d JSON error: %s", page_num, e)
     except Exception as e:
@@ -639,7 +680,6 @@ Return ONLY a valid JSON array. No markdown fences. No explanation."""
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _normalise_qnum(qn: str) -> str:
-    """Normalise question number for deduplication comparison."""
     s = str(qn).lower().strip()
     s = re.sub(r"^(question|q|ques|no|nr)[\s.\-]*", "", s)
     s = re.sub(r"[^a-z0-9]", "", s)
@@ -647,27 +687,18 @@ def _normalise_qnum(qn: str) -> str:
 
 
 def _merge_pages(page_results: list[list[dict]]) -> list[dict]:
-    """
-    Merge question arrays from all pages, deduplicating by question number.
-    When the same question number appears on two pages (carry-over), the later
-    version wins — it is likely more complete.
-    """
     seen:  dict[str, int] = {}
     final: list[dict]     = []
-
     for page_qs in page_results:
         for q in page_qs:
-            key = (
-                _normalise_qnum(q.get("question_number", ""))
-                or q.get("question", "")[:60].strip()
-            )
+            key = (_normalise_qnum(q.get("question_number", ""))
+                   or q.get("question", "")[:60].strip())
             if key and key in seen:
-                final[seen[key]] = q        # update with fuller later version
+                final[seen[key]] = q   # later version wins (more complete)
             else:
                 if key:
                     seen[key] = len(final)
                 final.append(q)
-
     logger.info("[Merge] %d unique questions from %d pages",
                 len(final), len(page_results))
     return final
@@ -686,66 +717,40 @@ def extract_questions_from_file(
     school_folder: str = "shared",
 ) -> list[dict]:
     """
-    PRIMARY entry point for question paper extraction.
-
-    Pipeline:
-      DOCX/ODT → LibreOffice → PDF → PyMuPDF renders pages at 200 DPI
-      → pages uploaded to Firebase Storage (if exam_id provided)
-      → vision AI extracts questions per page with image URLs, LaTeX, tables
-      → merged and deduplicated question list returned
-
+    Primary entry point. DOCX/ODT → LibreOffice → PDF → vision AI → questions.
     Falls back to text extraction + LLM parse if LibreOffice unavailable.
     """
     lower = filename.lower()
 
-    # ── Step 1: Get PDF ───────────────────────────────────────────────────
     if lower.endswith(".pdf"):
         pdf_bytes = file_bytes
-        logger.info("[Extract] Direct PDF: %s", filename)
     else:
         logger.info("[Extract] Converting %s → PDF via LibreOffice", filename)
         pdf_bytes = _convert_to_pdf(file_bytes, filename)
 
     if pdf_bytes:
-        # ── Step 2: Render pages ──────────────────────────────────────────
         raw_pages = _render_pages(pdf_bytes)
-
-        if not raw_pages:
-            logger.error("[Extract] No pages rendered from %s", filename)
-        else:
-            # ── Step 3: Upload page images + vision extract ───────────────
+        if raw_pages:
             page_results: list[list[dict]] = []
-
             for page_num, png_bytes in raw_pages:
-                # Upload PNG to Firebase Storage
-                page_url = (
-                    _upload_page_image(school_folder, exam_id, page_num, png_bytes)
-                    if exam_id else None
-                )
-                # Vision extraction
+                page_url  = (_upload_page_image(school_folder, exam_id, page_num, png_bytes)
+                             if exam_id else None)
                 page_b64  = base64.b64encode(png_bytes).decode()
                 questions = _extract_page_questions(
                     page_b64, page_url, subject, grade, page_num
                 )
                 page_results.append(questions)
-
             questions = _merge_pages(page_results)
-
             if questions:
-                logger.info("[Extract] ✓ %d questions via render-first pipeline",
-                            len(questions))
+                logger.info("[Extract] ✓ %d questions via render-first pipeline", len(questions))
                 return questions
-
             logger.warning("[Extract] Vision returned 0 questions — trying text fallback")
 
-    # ── Fallback: text extraction + LLM parse ────────────────────────────
-    # Used when LibreOffice is not installed or vision returns nothing.
+    # Text fallback
     logger.info("[Extract] Text fallback: %s", filename)
     text = extract_text_from_file(file_bytes, filename, subject)
-
     if text.strip():
         return parse_questions_universal(text, subject, grade)
-
     logger.error("[Extract] All methods exhausted for %s", filename)
     return []
 
@@ -753,8 +758,6 @@ def extract_questions_from_file(
 # ══════════════════════════════════════════════════════════════════════════════
 # TEXT EXTRACTION — fast path for memos
 # ══════════════════════════════════════════════════════════════════════════════
-# Memos only need question_number → answer text mapping.
-# No vision, no images, no structure preservation needed.
 
 def _docx_text(file_bytes: bytes) -> str:
     from docx.oxml.table import CT_Tbl
@@ -768,7 +771,6 @@ def _docx_text(file_bytes: bytes) -> str:
                     lines.append(t)
             elif isinstance(child, CT_Tbl):
                 for row in Table(child, doc).rows:
-                    # Deduplicate merged cells by underlying _tc identity
                     seen_tc: set[int] = set()
                     cells = []
                     for c in row.cells:
@@ -801,23 +803,19 @@ def _odt_text(file_bytes: bytes) -> str:
 
 
 def _pdf_text(file_bytes: bytes, subject: str) -> str:
-    """Extract text from PDF — tries native text first, falls back to vision OCR."""
     try:
         doc  = fitz.open(stream=file_bytes, filetype="pdf")
         text = "".join(page.get_text() + "\n" for page in doc)
         doc.close()
         if len(text.strip()) > 100:
             return text
-
-        # Scanned PDF — run vision OCR page by page
         logger.info("[PDF text] No native text — running vision OCR")
         doc, all_text = fitz.open(stream=file_bytes, filetype="pdf"), ""
         for i, page in enumerate(doc):
             pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             img = base64.b64encode(pix.tobytes("png")).decode()
             try:
-                result   = ai_vision(img,
-                    f"{subject} exam memo page. Extract ALL text. Plain text only.")
+                result    = ai_vision(img, f"{subject} exam memo. Extract ALL text. Plain text only.")
                 all_text += result + "\n\n"
             except Exception as e:
                 logger.error("[PDF OCR] Page %d: %s", i + 1, e)
@@ -828,17 +826,16 @@ def _pdf_text(file_bytes: bytes, subject: str) -> str:
         return ""
 
 
-def extract_text_from_file(file_bytes: bytes,
-                           filename:   str,
-                           subject:    str = "General") -> str:
-    """
-    Text-only extraction — used for memo parsing.
-    Fast path: no vision, no images, no structure preservation.
-    """
+def extract_text_from_file(file_bytes: bytes, filename: str,
+                           subject: str = "General") -> str:
+    """Text-only extraction — used for memo parsing."""
     lower = filename.lower()
-    if lower.endswith(".docx"):              return _docx_text(file_bytes)
-    if lower.endswith(".odt"):               return _odt_text(file_bytes)
-    if lower.endswith(".pdf"):               return _pdf_text(file_bytes, subject)
+    if lower.endswith(".docx"):
+        return _docx_text(file_bytes)
+    if lower.endswith(".odt"):
+        return _odt_text(file_bytes)
+    if lower.endswith(".pdf"):
+        return _pdf_text(file_bytes, subject)
     if lower.endswith((".doc", ".docm", ".rtf")):
         try:
             return mammoth.extract_raw_text(io.BytesIO(file_bytes)).value
@@ -855,18 +852,12 @@ def extract_text_from_file(file_bytes: bytes,
 def parse_questions_universal(exam_text: str,
                                subject:   str,
                                grade:     str) -> list[dict]:
-    """
-    LLM-based question parser for plain text.
-    Called when the render-first pipeline is unavailable (no LibreOffice) or
-    when vision returns zero questions.
-    Chunks the text to stay within model token limits and deduplicates results.
-    """
+    """LLM-based question parser for plain text. Chunked to stay within token limits."""
     cat     = _subject_category(subject)
     hints   = _PARSING_HINTS.get(cat, "")
     all_qs: list[dict] = []
     seen:   set[str]   = set()
 
-    # Build chunks with overlap so questions are never split across boundaries
     chunks: list[str] = []
     start = 0
     while start < len(exam_text):
@@ -875,7 +866,6 @@ def parse_questions_universal(exam_text: str,
 
     for idx, chunk in enumerate(chunks):
         logger.info("[Parser] Chunk %d/%d — %s", idx + 1, len(chunks), subject)
-
         prompt = f"""Parse this {subject} Grade {grade} exam into a JSON array.
 
 MCQ → type="mcq" + options dict. True/False → "true_false". Calculation → "calculation".
@@ -892,7 +882,6 @@ Return ONLY a valid JSON array. Each item:
 EXAM TEXT:
 {chunk}"""
 
-        # Retry once with half-chunk on 413 token limit error
         for attempt, current_prompt in enumerate([prompt, prompt[:len(prompt)//2]]):
             try:
                 raw = ai_text(current_prompt, max_tokens=8000, temperature=0)
@@ -903,14 +892,12 @@ EXAM TEXT:
                     parsed = json.loads(m.group())
                     if isinstance(parsed, list):
                         for q in parsed:
-                            key = (
-                                _normalise_qnum(q.get("question_number", ""))
-                                or q.get("question", "")[:60]
-                            )
+                            key = (_normalise_qnum(q.get("question_number", ""))
+                                   or q.get("question", "")[:60])
                             if key not in seen:
                                 seen.add(key)
                                 all_qs.append(q)
-                break  # success
+                break
             except Exception as e:
                 if "413" in str(e) and attempt == 0:
                     logger.warning("[Parser] Chunk %d too large, retrying at half", idx + 1)

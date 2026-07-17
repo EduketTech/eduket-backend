@@ -1,13 +1,11 @@
 services:
   - type: web
     name: chatbot-backend-educat
-    env: python
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     region: oregon
-    buildCommand: |
-      pip install -r requirements.txt
-      apt-get update -qq
-      apt-get install -y -qq libreoffice --no-install-recommends
-    startCommand: gunicorn app:app --workers 2 --timeout 180 --bind 0.0.0.0:$PORT
+    plan: starter
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11"

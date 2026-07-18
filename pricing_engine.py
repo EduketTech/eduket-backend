@@ -458,7 +458,7 @@ def compute_subscription_price(tier_id, billing_cycle, institution_type, country
     rates, rate_source = _get_rates_with_source()
 
     if ENABLE_DOLLARIZED_ECONOMY_OVERRIDE and alpha2 in DOLLARIZED_ECONOMY_OVERRIDES:
-        currency_multiplier = 1
+        currency_multiplier = 2
     else:
         currency_multiplier = get_currency_multiplier(currency_code, rates=rates)
 

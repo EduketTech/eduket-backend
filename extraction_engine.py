@@ -941,4 +941,4 @@ EXAM TEXT:
                 break
 
     logger.info("[Parser] %d questions extracted (text fallback)", len(all_qs))
-    return all_qs
+    return all_qs# rebuilt Mon Jul 20 02:03:46 PM SAST 2026

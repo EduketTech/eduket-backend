@@ -1,3 +1,4 @@
+from google.cloud.firestore_v1.base_query import FieldFilter
 """
 app.py — Eduket OS  Production API  v5.1  (security-hardened)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -788,6 +789,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
     subject_ref = _subject_doc_ref(school_id, subject_name)
 
     def set_status(status: str, extra: dict = {}):
+        # ── ONLY this belongs inside set_status ───────────────────────────────
         try:
             snap = subject_ref.get()
             if not snap.exists:
@@ -803,20 +805,23 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
             print(f"[Status] Update failed: {e}")
 
     try:
-        subject = meta.get("subject", subject_name or "General")
-        grade   = meta.get("grade",   "12")
-        title   = meta.get("title",   "Exam")
+        # ── Guard: skip if already successfully extracted ─────────────────────
+        current = db.collection("exams").document(exam_id).get()
+        if current.exists and current.to_dict().get("status") == "ready":
+            print(f"[Pipeline] {exam_id} already ready — skipping re-extraction")
+            return
 
+        subject = meta.get("subject", subject_name or "General")
+        grade = meta.get("grade", "12")
+        title = meta.get("title", "Exam")
         print(f"\n[Pipeline] ═══ {exam_id} | {subject} Gr{grade}")
         set_status("processing",
                    {"processingStartedAt": datetime.utcnow().isoformat()})
 
         # 1. Download exam file
         exam_bytes, exam_fn = download_file_for_extraction(meta, "exam")
-        if not exam_bytes:
-            raise ValueError("Could not download exam file from Firebase Storage.")
 
-        # 2. Render-first extraction (LibreOffice → PDF → pages → vision AI)
+        # 2. Extract questions
         questions = extract_questions_from_file(
             exam_bytes, exam_fn, subject, grade,
             exam_id=exam_id,
@@ -829,7 +834,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
                 "and that LibreOffice is installed on Render."
             )
 
-        # 3. Download and parse memo (skipped for AI-only marking)
+        # 3. Download and parse memo
         memo_map: dict = {}
         if not meta.get("aiMarkingOnly"):
             memo_bytes, memo_fn = download_file_for_extraction(meta, "memo")
@@ -925,18 +930,41 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
             "memoMerged":     bool(memo_map),
         })
 
+
     except Exception as e:
+
         traceback.print_exc()
+
         print(f"[Pipeline] FAILED: {e}")
+
         set_status("error", {"errorMessage": str(e)[:500]})
+
         try:
-            db.collection("exams").document(exam_id).set(
-                {"status": "error", "errorMessage": str(e)[:500]},
-                merge=True,
-            )
+
+            # Only write error if not already successfully extracted
+
+            current = db.collection("exams").document(exam_id).get()
+
+            if current.exists and current.to_dict().get("status") != "ready":
+
+                db.collection("exams").document(exam_id).set(
+
+                    {"status": "error", "errorMessage": str(e)[:500]},
+
+                    merge=True,
+
+                )
+
+            else:
+
+                print(f"[Pipeline] Suppressing error — exam already ready")
+
         except Exception:
+
             pass
+
     finally:
+
         _unmark_processing(exam_id)
 
 # Always check calls to avoid failure
@@ -1147,7 +1175,7 @@ def _load_exam(exam_id: str) -> tuple[dict | None, list]:
         return meta, []
 
     raw_qs = sorted(
-        db.collection("exam_questions").where("examId", "==", exam_id).stream(),
+        db.collection("exam_questions").where(filter=FieldFilter("examId", "==", exam_id)).stream(),
         key=lambda d: d.to_dict().get("order", 0),
     )
 
@@ -1186,7 +1214,7 @@ def _load_exam_memos(exam_id: str) -> dict:
     Never returned to the student directly.
     """
     memos = {}
-    for q in db.collection("exam_questions").where("examId", "==", exam_id).stream():
+    for q in db.collection("exam_questions").where(filter=FieldFilter("examId", "==", exam_id)).stream():
         d  = q.to_dict()
         qn = _normalise_qnum(str(d.get("questionNumber", "")))
         if qn and d.get("memo"):
@@ -1249,7 +1277,7 @@ def upload_exam():
         current_count  = len(list(
             db.collection("exams")
               .where("schoolId",   "==", school_id)
-              .where("uploadedAt", ">=", start_of_month.isoformat())
+              .where(filter=FieldFilter("uploadedAt", ">=", start_of_month.isoformat()))
               .stream()
         ))
 
@@ -1374,7 +1402,7 @@ def exam_usage():
         used = len(list(
             db.collection("exams")
               .where("schoolId",   "==", school_id)
-              .where("uploadedAt", ">=", start_of_month.isoformat())
+              .where(filter=FieldFilter("uploadedAt", ">=", start_of_month.isoformat()))
               .stream()
         ))
 
@@ -1396,7 +1424,7 @@ def list_exams():
     """Return all exams with status 'ready'. Used by student exam selector."""
     exams = []
     try:
-        for doc in db.collection("exams").where("status", "==", "ready").stream():
+        for doc in db.collection("exams").where(filter=FieldFilter("status", "==", "ready")).stream():
             d = doc.to_dict()
             exams.append({
                 "id":           doc.id,
@@ -1621,7 +1649,7 @@ def get_results(exam_id, student_id):
         docs = list(
             db.collection("exam_attempts")
               .where("examId",    "==", exam_id)
-              .where("studentId", "==", student_id)
+              .where(filter=FieldFilter("studentId", "==", student_id))
               .order_by("completedAt", direction="DESCENDING")
               .limit(1)
               .stream()
@@ -1858,7 +1886,7 @@ def dashboard():
         try:
             attempts = list(
                 db.collection("exam_attempts")
-                  .where("studentId", "==", student_id)
+                  .where(filter=FieldFilter("studentId", "==", student_id))
                   .stream()
             )
         except Exception as e:
@@ -1917,7 +1945,7 @@ def extraction_status(exam_id):
         d       = doc.to_dict()
         q_count = sum(
             1 for _ in db.collection("exam_questions")
-                         .where("examId", "==", exam_id).stream()
+                         .where(filter=FieldFilter("examId", "==", exam_id)).stream()
         )
         return jsonify({
             "status":             d.get("status"),

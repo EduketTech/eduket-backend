@@ -1,24 +1,23 @@
 firebase-admin
-  google-api-python-client
-  google-auth
-  google-auth-httplib2
-  google-api-python-client
-  google-generativeai>=0.8.5
-
-  # ── Utilities ─────────────────────────────────────────────
-  python-dotenv>=1.0.0
-  numpy>=1.26.0
-  anthropic
-  pymupdf
-  pdfplumber
-  groq
-  python-docx
-  odfpy
-  mammoth
-  gevent>=24.10.1
-  flask-limiter==3.5.0
-  flask-talisman==1.1.0
-  python-magic==0.4.27
-  python-dotenv==1.0.1
-  tiktoken
-  gunicorn>=21.2.0
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-generativeai>=0.8.5
+python-dotenv>=1.0.0
+numpy>=1.26.0
+anthropic
+pymupdf
+pdfplumber
+groq
+python-docx
+odfpy
+mammoth
+gevent>=24.10.1
+flask>=3.0.0
+flask-cors>=4.0.0
+flask-limiter==3.5.0
+flask-talisman==1.1.0
+python-magic==0.4.27
+tiktoken
+gunicorn>=21.2.0
+requests>=2.31.0

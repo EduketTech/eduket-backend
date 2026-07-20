@@ -1,39 +1,23 @@
-# EduCAT backend — Python dependencies
-# Generated after LangChain migration
-
-# ── LangChain core ───────────────────────────────────────
-langchain>=0.3.0
-langchain-core>=0.3.0
-langchain-groq>=0.2.0
-langchain-community>=0.3.0
-langchain-huggingface>=0.1.0
-
-# ── Vector store ─────────────────────────────────────────
-faiss-cpu>=1.7.4
-
-# ── Web framework ─────────────────────────────────────────
-flask>=3.0.0
-flask-cors>=4.0.0
-gunicorn>=21.2.0
 firebase-admin
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-api-python-client
-google-generativeai>=0.8.5
+  google-api-python-client
+  google-auth
+  google-auth-httplib2
+  google-api-python-client
+  google-generativeai>=0.8.5
 
-# ── Utilities ─────────────────────────────────────────────
-python-dotenv>=1.0.0
-numpy>=1.26.0
-anthropic
-pymupdf
-pdfplumber
-groq
-python-docx
-odfpy
-mammoth
-gevent>=24.10.1
-flask-limiter==3.5.0
-flask-talisman==1.1.0
-python-magic==0.4.27
-python-dotenv==1.0.1
+  # ── Utilities ─────────────────────────────────────────────
+  python-dotenv>=1.0.0
+  numpy>=1.26.0
+  anthropic
+  pymupdf
+  pdfplumber
+  groq
+  python-docx
+  odfpy
+  mammoth
+  gevent>=24.10.1
+  flask-limiter==3.5.0
+  flask-talisman==1.1.0
+  python-magic==0.4.27
+  python-dotenv==1.0.1
+  tiktoken

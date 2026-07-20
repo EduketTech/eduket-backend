@@ -52,10 +52,12 @@ from extraction_engine import (
     parse_questions_universal,
     extract_questions_from_file,
 )
+import tiktoken
 
 from groq import Groq
 import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage, auth as fb_auth
+from collections import deque
 
 
 
@@ -936,6 +938,79 @@ def run_extraction_pipeline(exam_id: str, meta: dict,
             pass
     finally:
         _unmark_processing(exam_id)
+
+# Always check calls to avoid failure
+def estimate_tokens(text, model="llama-3.3-70b-versatile"):
+    # cl100k_base is a close-enough approximation for most Llama models
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+def chunk_within_budget(chunks, tpm_limit=12000, safety_margin=0.85):
+    """Split any chunk that would exceed the safe token budget."""
+    safe_limit = int(tpm_limit * safety_margin)
+    safe_chunks = []
+    for chunk in chunks:
+        tokens = estimate_tokens(chunk)
+        if tokens <= safe_limit:
+            safe_chunks.append(chunk)
+        else:
+            # crude split in half, recurse until each piece fits
+            mid = len(chunk) // 2
+            safe_chunks.extend(chunk_within_budget([chunk[:mid], chunk[mid:]], tpm_limit, safety_margin))
+    return safe_chunks
+
+def call_groq_with_retry(client, messages, model="llama-3.3-70b-versatile", max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+            )
+        except Exception as e:
+            error_str = str(e)
+            if "rate_limit_exceeded" in error_str or "429" in error_str:
+                # Try to parse the suggested wait time from Groq's error message
+                match = re.search(r"try again in ([\d.]+)s", error_str)
+                wait_time = float(match.group(1)) + 1 if match else 5 * attempt
+
+                print(f"[Groq] Rate limited (attempt {attempt}/{max_retries}), "
+                      f"waiting {wait_time:.1f}s before retry")
+
+                if attempt == max_retries:
+                    raise  # exhausted retries, bubble up to your provider fallback
+                time.sleep(wait_time)
+            else:
+                raise  # non-rate-limit errors shouldn't be retried the same way
+    raise RuntimeError("Groq retry loop exited unexpectedly")
+
+
+class TPMTracker:
+    def __init__(self, limit=12000, window_seconds=60):
+        self.limit = limit
+        self.window = window_seconds
+        self.usage = deque()  # (timestamp, tokens)
+
+    def _prune(self):
+        cutoff = time.time() - self.window
+        while self.usage and self.usage[0][0] < cutoff:
+            self.usage.popleft()
+
+    def current_usage(self):
+        self._prune()
+        return sum(tokens for _, tokens in self.usage)
+
+    def can_afford(self, tokens):
+        return self.current_usage() + tokens <= self.limit
+
+    def wait_if_needed(self, tokens):
+        while not self.can_afford(tokens):
+            time.sleep(2)
+            self._prune()
+
+    def record(self, tokens):
+        self.usage.append((time.time(), tokens))
+
+groq_tracker = TPMTracker(limit=12000)
 
 
 def _launch_pipeline(exam_id: str, meta: dict,

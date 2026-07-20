@@ -21,3 +21,4 @@ firebase-admin
   python-magic==0.4.27
   python-dotenv==1.0.1
   tiktoken
+  gunicorn>=21.2.0

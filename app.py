@@ -239,10 +239,12 @@ def _init_firebase():
     print(f"[Firebase] client_email:  {cred_dict['client_email']}")
 
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            credentials.Certificate(cred_dict),
-            {"storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET")},
-        )
+        firebase_admin.initialize_app(cred_dict), {
+            "storageBucket": os.environ.get(
+                "FIREBASE_STORAGE_BUCKET",
+                "eduket.firebasestorage.app"
+            )
+        }
 
     db     = fs_admin.client()
     bucket = storage.bucket()

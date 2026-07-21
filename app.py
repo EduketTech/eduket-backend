@@ -22,6 +22,12 @@ Environment variables required:
   FIREBASE_STORAGE_BUCKET · PAYFAST_MERCHANT_ID · PAYFAST_MERCHANT_KEY
   PAYFAST_PASSPHRASE · FRONTEND_BASE_URL · BACKEND_BASE_URL
 """
+try:
+    from gevent import monkey
+    monkey.patch_all(thread=False)  # thread=False prevents KeyError conflicts
+except ImportError:
+    pass
+
 
 from dotenv import load_dotenv
 load_dotenv()

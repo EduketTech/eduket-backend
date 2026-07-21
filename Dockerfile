@@ -23,8 +23,4 @@ COPY . .
 # gevent worker matches your requirements.txt; adjust --workers/--timeout
 # based on your Render plan's CPU/RAM. 120s timeout gives LibreOffice
 # conversions room to finish on slower instances.
-CMD gunicorn app:app \
-    --bind 0.0.0.0:$PORT \
-    --worker-class gevent \
-    --workers 2 \
-    --timeout 120
+CMD gunicorn app:app --config gunicorn.conf.py

@@ -2451,40 +2451,46 @@ def notify_principal_signup():
 
 @app.route("/school-activity", methods=["GET"])
 def get_school_activity():
-    """
-    Returns the activity feed for a school.
-    Used by the principal dashboard activity panel.
-    """
     try:
-        uid = request.args.get("uid", "")
         school_id = request.args.get("schoolId", "")
-
         if not school_id:
             return jsonify({"error": "schoolId required"}), 400
 
         events = []
-        for doc in (
-            db.collection("schoolActivity")
-              .where(filter=FieldFilter("schoolId", "==", school_id))
-              .order_by("timestamp", direction="DESCENDING")
-              .limit(50)
-              .stream()
-        ):
-            d = doc.to_dict()
-            events.append({
-                "id":          doc.id,
-                "type":        d.get("type",        ""),
-                "actorName":   d.get("actorName",   ""),
-                "actorEmail":  d.get("actorEmail",  ""),
-                "actorRole":   d.get("actorRole",   ""),
-                "description": d.get("description", ""),
-                "grade":       d.get("grade",       ""),
-                "subjects":    d.get("subjects",    []),
-                "timestamp":   d.get("timestamp").isoformat()
-                               if hasattr(d.get("timestamp"), "isoformat")
-                               else str(d.get("timestamp", "")),
-                "read":        d.get("read", False),
-            })
+        try:
+            # Requires composite index: schoolId ASC + timestamp DESC
+            docs = (
+                db.collection("schoolActivity")
+                  .where(filter=FieldFilter("schoolId", "==", school_id))
+                  .order_by("timestamp", direction="DESCENDING")
+                  .limit(50)
+                  .stream()
+            )
+            for doc in docs:
+                d = doc.to_dict()
+                ts = d.get("timestamp")
+                events.append({
+                    "id":          doc.id,
+                    "type":        d.get("type",        ""),
+                    "actorName":   d.get("actorName",   ""),
+                    "actorEmail":  d.get("actorEmail",  ""),
+                    "actorRole":   d.get("actorRole",   ""),
+                    "description": d.get("description", ""),
+                    "grade":       d.get("grade",       ""),
+                    "subjects":    d.get("subjects",    []),
+                    "timestamp":   ts.isoformat() if hasattr(ts, "isoformat") else str(ts or ""),
+                    "read":        d.get("read", False),
+                })
+        except Exception as index_err:
+            if "requires an index" in str(index_err):
+                # Index still building — return empty list with a hint
+                print(f"[Activity] Index not ready yet: {index_err}")
+                return jsonify({
+                    "events": [],
+                    "indexBuilding": True,
+                    "hint": "Activity feed index is building — check back in 2 minutes"
+                })
+            raise  # re-raise non-index errors
 
         return jsonify({"events": events})
 

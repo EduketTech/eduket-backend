@@ -213,6 +213,7 @@ def _sanitize_student_input(text: str) -> str:
 db     = None
 bucket = None
 
+from firebase_admin import credentials
 
 def _init_firebase():
     global db, bucket
@@ -221,33 +222,45 @@ def _init_firebase():
     if not raw:
         raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
 
-    cred_dict = (
-        json.load(open(raw))
-        if os.path.exists(raw)
-        else json.loads(raw)
-    )
-    # The private key sometimes arrives with literal \n from JSON serialisation
+    if os.path.exists(raw):
+        with open(raw, "r") as f:
+            cred_dict = json.load(f)
+    else:
+        cred_dict = json.loads(raw)
+
     if "private_key" in cred_dict:
         cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
 
-    missing = [k for k in ["type", "project_id", "private_key", "client_email"]
-               if not cred_dict.get(k)]
+    required = [
+        "type",
+        "project_id",
+        "private_key",
+        "client_email",
+    ]
+
+    missing = [k for k in required if not cred_dict.get(k)]
     if missing:
         raise ValueError(f"Credential dict missing: {missing}")
 
-    print(f"[Firebase] project_id:    {cred_dict['project_id']}")
-    print(f"[Firebase] client_email:  {cred_dict['client_email']}")
+    print(f"[Firebase] project_id:   {cred_dict['project_id']}")
+    print(f"[Firebase] client_email: {cred_dict['client_email']}")
 
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred_dict), {
-            "storageBucket": os.environ.get(
-                "FIREBASE_STORAGE_BUCKET",
-                "eduket.firebasestorage.app"
-            )
-        }
+        cred = credentials.Certificate(cred_dict)
 
-    db     = fs_admin.client()
+        firebase_admin.initialize_app(
+            cred,
+            {
+                "storageBucket": os.environ.get(
+                    "FIREBASE_STORAGE_BUCKET",
+                    "eduket.firebasestorage.app",
+                )
+            },
+        )
+
+    db = fs_admin.client()
     bucket = storage.bucket()
+
     print("[Firebase] ✅ Ready")
 
 

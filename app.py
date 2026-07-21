@@ -24,7 +24,17 @@ Environment variables required:
 """
 try:
     from gevent import monkey
-    monkey.patch_all(thread=False)  # thread=False prevents KeyError conflicts
+    monkey.patch_all(
+        socket=True,
+        dns=True,
+        time=True,
+        select=True,
+        thread=False,    # prevents KeyError conflicts
+        os=False,        # prevents recursion in os module
+        ssl=True,
+        httplib=False,   # prevents recursion in requests/urllib3
+        subprocess=False,
+    )
 except ImportError:
     pass
 
@@ -2199,23 +2209,17 @@ def send_welcome_email():
 </body>
 </html>"""
 
-        import requests as http_req
-        resp = http_req.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {resend_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "from":    "Eduket OS <noreply@eduket.tech>",
-                "to":      [email],
-                "subject": content["title"],
-                "html":    html,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return jsonify({"success": True, "messageId": resp.json().get("id")})
+        import resend as resend_client
+        resend_client.api_key = resend_key
+
+        params = {
+            "from": "Eduket OS <onboarding@resend.dev>",
+            "to": [email],
+            "subject": content["title"],
+            "html": html,
+        }
+        email_response = resend_client.Emails.send(params)
+        return jsonify({"success": True, "messageId": email_response.get("id")})
 
     except Exception as e:
         print(f"[Welcome Email] Failed: {e}")
@@ -2458,23 +2462,15 @@ def notify_principal_signup():
 </body>
 </html>"""
 
-        import requests as http_req
-        resp = http_req.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {resend_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "from":    "Eduket OS Alerts <alerts@eduket.tech>",
-                "to":      [principal_email],
-                "subject": f"{role_icon} {new_name} joined {school_name} as {new_role}",
-                "html":    html,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        print(f"[Notify] Principal alert sent to {principal_email} re: {new_email}")
+        import resend as resend_client
+        resend_client.api_key = resend_key
+
+        email_response = resend_client.Emails.send({
+            "from": "Eduket OS Alerts <onboarding@resend.dev>",
+            "to": [principal_email],
+            "subject": f"{role_icon} {new_name} joined {school_name} as {new_role}",
+            "html": html,
+        })
         return jsonify({"success": True})
 
     except Exception as e:

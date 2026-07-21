@@ -373,6 +373,7 @@ CORS(app, resources={r"/*": {
         "http://localhost:5177",
         "https://eduket.netlify.app",
         "https://eduket.tech",
+"https://eduket-backend-1.onrender.com"
     ],
     "methods":       ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     "allow_headers": ["Content-Type", "Authorization"],

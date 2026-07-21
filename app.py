@@ -2015,6 +2015,497 @@ def trigger_extract(exam_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/send-welcome-email", methods=["POST"])
+def send_welcome_email():
+    """Send a welcome email to a newly registered user via Resend."""
+    try:
+        data        = request.get_json() or {}
+        email       = data.get("email", "").strip()
+        name        = data.get("displayName") or data.get("firstName", "")
+        role        = data.get("role", "student")
+        school_name = data.get("schoolName", "")
+        subjects    = data.get("subjects", [])
+        grade       = data.get("grade", "")
+        dashboard   = data.get("dashboardUrl", "https://eduket.tech")
+
+        if not email:
+            return jsonify({"error": "Email required"}), 400
+
+        resend_key = os.getenv("RESEND_API_KEY")
+        if not resend_key:
+            return jsonify({"error": "Email service not configured"}), 503
+
+        # ── Build role-specific content ────────────────────────────────────
+        role_messages = {
+            "principal": {
+                "title":    "Your school is live on Eduket OS! 🏫",
+                "subtitle": "Welcome, Principal",
+                "body":     f"Your school <strong>{school_name}</strong> has been successfully registered. You can now invite teachers and students to join your school on Eduket OS.",
+                "btn_text": "Go to Principal Dashboard",
+                "colour":   "#7c3aed",
+            },
+            "teacher": {
+                "title":    "Welcome to Eduket OS, Teacher! 📚",
+                "subtitle": "Your profile is ready",
+                "body":     f"You have been set up as a teacher at <strong>{school_name}</strong>. Start by uploading your first exam paper and let Eduket AI handle the marking.",
+                "btn_text": "Go to Teacher Dashboard",
+                "colour":   "#059669",
+            },
+            "student": {
+                "title":    "Welcome to Eduket OS! 🎓",
+                "subtitle": "Your student profile is ready",
+                "body":     f"You are enrolled at <strong>{school_name}</strong>{f', Grade {grade}' if grade else ''}. Your exams will appear in your dashboard as teachers upload them.",
+                "btn_text": "Go to My Exams",
+                "colour":   "#1d4ed8",
+            },
+        }
+        content = role_messages.get(role, role_messages["student"])
+
+        # ── Build details table ────────────────────────────────────────────
+        details_rows = ""
+        if name:
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>Name</td><td style='padding:8px 0;font-weight:700;font-size:13px'>{name}</td></tr>"
+        if email:
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>Email</td><td style='padding:8px 0;font-weight:700;font-size:13px'>{email}</td></tr>"
+        if role:
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>Role</td><td style='padding:8px 0;font-weight:700;font-size:13px;text-transform:capitalize'>{role}</td></tr>"
+        if school_name:
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>School</td><td style='padding:8px 0;font-weight:700;font-size:13px'>{school_name}</td></tr>"
+        if grade:
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>Grade</td><td style='padding:8px 0;font-weight:700;font-size:13px'>{grade}</td></tr>"
+        if subjects:
+            subj_str = ", ".join(subjects) if isinstance(subjects, list) else subjects
+            details_rows += f"<tr><td style='padding:8px 0;color:#6b7280;font-size:13px'>Subjects</td><td style='padding:8px 0;font-weight:700;font-size:13px'>{subj_str}</td></tr>"
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0"
+             style="max-width:560px;background:#fff;border-radius:20px;
+                    overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,0.08);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,{content['colour']},{content['colour']}dd);
+                     padding:36px 32px;text-align:center;">
+            <p style="margin:0 0 8px;font-size:28px;">🎓</p>
+            <h1 style="margin:0;font-size:26px;font-weight:900;color:#fff;letter-spacing:-0.5px;">
+              Eduket OS
+            </h1>
+            <p style="margin:8px 0 0;font-size:13px;color:rgba(255,255,255,0.8);">
+              AI-Powered School Assessment Platform
+            </p>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:36px 32px;">
+            <p style="margin:0 0 4px;font-size:11px;font-weight:700;
+                       color:{content['colour']};text-transform:uppercase;letter-spacing:1px;">
+              {content['subtitle']}
+            </p>
+            <h2 style="margin:4px 0 16px;font-size:22px;font-weight:900;color:#1f2937;
+                       letter-spacing:-0.3px;">
+              {content['title']}
+            </h2>
+            <p style="margin:0 0 24px;font-size:14px;color:#6b7280;line-height:1.7;">
+              Hi <strong>{name}</strong>, {content['body']}
+            </p>
+
+            <!-- Details table -->
+            <div style="background:#f8fafc;border-radius:12px;padding:16px 20px;
+                        border:1px solid #e2e8f0;margin-bottom:28px;">
+              <p style="margin:0 0 12px;font-size:10px;font-weight:700;
+                         color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">
+                Your Registration Details
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0"
+                     style="border-collapse:collapse;">
+                {details_rows}
+              </table>
+            </div>
+
+            <!-- CTA Button -->
+            <table width="100%" cellpadding="0" cellspacing="0">
+              <tr><td align="center">
+                <a href="{dashboard}"
+                   style="display:inline-block;padding:15px 40px;
+                          background:{content['colour']};color:#fff;
+                          font-size:15px;font-weight:900;text-decoration:none;
+                          border-radius:12px;letter-spacing:0.3px;">
+                  {content['btn_text']} →
+                </a>
+              </td></tr>
+            </table>
+
+            <p style="margin:24px 0 0;font-size:12px;color:#94a3b8;text-align:center;
+                       line-height:1.6;">
+              If you did not create this account, you can safely ignore this email.<br/>
+              This is an automated message from Eduket OS.
+            </p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc;padding:20px 32px;
+                     border-top:1px solid #e2e8f0;text-align:center;">
+            <p style="margin:0;font-size:11px;color:#94a3b8;">
+              © 2026 Nextgen Skills · Eduket OS · eduket.tech
+            </p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+        import requests as http_req
+        resp = http_req.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "from":    "Eduket OS <noreply@eduket.tech>",
+                "to":      [email],
+                "subject": content["title"],
+                "html":    html,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return jsonify({"success": True, "messageId": resp.json().get("id")})
+
+    except Exception as e:
+        print(f"[Welcome Email] Failed: {e}")
+        # Non-fatal — user is already registered, email failure should not block them
+        return jsonify({"success": False, "error": str(e)}), 200
+
+
+"""
+school_notifications.py
+─────────────────────────────────────────────────────────────────────────────
+These routes to app.py (or register as a blueprint).
+
+Handles:
+  POST /notify-principal-signup   — emails principal when teacher/student joins
+  POST /log-school-activity       — writes activity to Firestore
+  GET  /school-activity           — returns activity feed for principal dashboard
+"""
+
+@app.route("/notify-principal-signup", methods=["POST"])
+def notify_principal_signup():
+    """
+    Called from PasswordPage.jsx after a teacher or student completes
+    profile setup. Emails the school principal with the new user's details.
+    Also logs the activity to Firestore for the principal dashboard.
+    Non-fatal — a failed email never blocks the user's registration.
+    """
+    try:
+        data        = request.get_json() or {}
+        school_id   = data.get("schoolId",   "").strip()
+        new_email   = data.get("email",      "").strip()
+        new_name    = data.get("displayName") or data.get("firstName", "New User")
+        new_role    = data.get("role",       "student")
+        school_name = data.get("schoolName", "Your School")
+        grade       = data.get("grade",      "")
+        subjects    = data.get("subjects",   [])
+        uid         = data.get("uid",        "")
+
+        if not school_id or not new_email:
+            return jsonify({"error": "schoolId and email required"}), 400
+
+        # ── 1. Log activity to Firestore ───────────────────────────────────
+        activity_ref = db.collection("schoolActivity").document()
+        activity_ref.set({
+            "schoolId":    school_id,
+            "schoolName":  school_name,
+            "type":        "user_joined",
+            "actorUid":    uid,
+            "actorName":   new_name,
+            "actorEmail":  new_email,
+            "actorRole":   new_role,
+            "grade":       grade,
+            "subjects":    subjects if isinstance(subjects, list) else [],
+            "description": f"{new_name} joined as {new_role}",
+            "timestamp":   fs_admin.SERVER_TIMESTAMP,
+            "read":        False,
+        })
+
+        # ── 2. Get principal's email from Firestore ────────────────────────
+        # Find the school document to get principalUid
+        school_doc = db.collection("schools").document(school_id).get()
+        if not school_doc.exists:
+            return jsonify({"error": "School not found"}), 404
+
+        principal_uid = school_doc.to_dict().get("principalUid", "")
+        if not principal_uid:
+            return jsonify({"success": False, "reason": "No principal linked to school"}), 200
+
+        principal_doc = db.collection("users").document(principal_uid).get()
+        if not principal_doc.exists:
+            return jsonify({"success": False, "reason": "Principal user not found"}), 200
+
+        principal_email = principal_doc.to_dict().get("email", "")
+        principal_name  = principal_doc.to_dict().get("firstName", "Principal")
+
+        if not principal_email:
+            return jsonify({"success": False, "reason": "Principal has no email"}), 200
+
+        # ── 3. Build email ─────────────────────────────────────────────────
+        resend_key = os.getenv("RESEND_API_KEY")
+        if not resend_key:
+            return jsonify({"success": False, "reason": "RESEND_API_KEY not set"}), 200
+
+        role_colour = {
+            "teacher":   "#059669",
+            "student":   "#1d4ed8",
+            "principal": "#7c3aed",
+        }.get(new_role, "#6b7280")
+
+        role_icon = {
+            "teacher": "👩‍🏫",
+            "student": "🎓",
+        }.get(new_role, "👤")
+
+        # Build details rows
+        details_rows = f"""
+        <tr>
+          <td style="padding:7px 0;color:#6b7280;font-size:13px;width:35%">Name</td>
+          <td style="padding:7px 0;font-weight:700;font-size:13px">{new_name}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 0;color:#6b7280;font-size:13px">Email</td>
+          <td style="padding:7px 0;font-weight:700;font-size:13px">{new_email}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 0;color:#6b7280;font-size:13px">Role</td>
+          <td style="padding:7px 0;font-weight:700;font-size:13px;
+                     text-transform:capitalize;color:{role_colour}">{new_role}</td>
+        </tr>"""
+
+        if grade:
+            details_rows += f"""
+        <tr>
+          <td style="padding:7px 0;color:#6b7280;font-size:13px">Grade</td>
+          <td style="padding:7px 0;font-weight:700;font-size:13px">{grade}</td>
+        </tr>"""
+
+        if subjects and isinstance(subjects, list) and len(subjects) > 0:
+            details_rows += f"""
+        <tr>
+          <td style="padding:7px 0;color:#6b7280;font-size:13px">Subjects</td>
+          <td style="padding:7px 0;font-weight:700;font-size:13px">{', '.join(subjects)}</td>
+        </tr>"""
+
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%d %B %Y at %H:%M UTC")
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;
+             font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0"
+         style="background:#f1f5f9;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0"
+             style="max-width:580px;background:#fff;border-radius:20px;
+                    overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,0.08);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#1e293b,#334155);
+                     padding:28px 32px;text-align:center;">
+            <h1 style="margin:0;font-size:22px;font-weight:900;color:#fff;">
+              Eduket OS · School Alert
+            </h1>
+            <p style="margin:6px 0 0;font-size:12px;color:rgba(255,255,255,0.6);">
+              {school_name}
+            </p>
+          </td>
+        </tr>
+
+        <!-- Alert banner -->
+        <tr>
+          <td style="background:{role_colour}15;border-bottom:3px solid {role_colour};
+                     padding:16px 32px;">
+            <p style="margin:0;font-size:14px;font-weight:700;color:{role_colour};">
+              {role_icon} New {new_role.title()} joined your school
+            </p>
+            <p style="margin:4px 0 0;font-size:12px;color:#6b7280;">
+              Registered on {timestamp}
+            </p>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:28px 32px;">
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
+              Hi <strong>{principal_name}</strong>, a new <strong>{new_role}</strong>
+              has completed registration for <strong>{school_name}</strong> on Eduket OS.
+            </p>
+
+            <!-- User details -->
+            <div style="background:#f8fafc;border-radius:12px;
+                        padding:16px 20px;border:1px solid #e2e8f0;
+                        margin-bottom:24px;">
+              <p style="margin:0 0 10px;font-size:10px;font-weight:700;
+                         color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">
+                New User Details
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0">
+                {details_rows}
+              </table>
+            </div>
+
+            <!-- Unknown user warning -->
+            <div style="background:#fef3c7;border:1px solid #fcd34d;
+                        border-radius:12px;padding:16px 20px;margin-bottom:24px;">
+              <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#92400e;">
+                ⚠️ Do you recognise this person?
+              </p>
+              <p style="margin:0;font-size:12px;color:#92400e;line-height:1.6;">
+                If you do not recognise <strong>{new_name} ({new_email})</strong>
+                as a legitimate member of {school_name}, please contact Eduket OS
+                support immediately so we can disable the account.
+              </p>
+            </div>
+
+            <!-- Action buttons -->
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="margin-bottom:8px;">
+              <tr>
+                <td style="padding-right:8px;">
+                  <a href="https://eduket.tech/principal-dashboard"
+                     style="display:block;text-align:center;padding:13px 0;
+                            background:#7c3aed;color:#fff;font-size:13px;
+                            font-weight:900;text-decoration:none;border-radius:10px;">
+                    View Dashboard →
+                  </a>
+                </td>
+                <td style="padding-left:8px;">
+                  <a href="mailto:support@eduket.tech?subject=Unknown user registered: {new_email}&body=Principal: {principal_name}%0ASchool: {school_name}%0AUnknown user: {new_name} ({new_email})"
+                     style="display:block;text-align:center;padding:13px 0;
+                            background:#dc2626;color:#fff;font-size:13px;
+                            font-weight:900;text-decoration:none;border-radius:10px;">
+                    🚨 Report Unknown User
+                  </a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc;padding:16px 32px;
+                     border-top:1px solid #e2e8f0;text-align:center;">
+            <p style="margin:0;font-size:11px;color:#94a3b8;">
+              Eduket OS · eduket.tech · support@eduket.tech
+            </p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+        import requests as http_req
+        resp = http_req.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "from":    "Eduket OS Alerts <alerts@eduket.tech>",
+                "to":      [principal_email],
+                "subject": f"{role_icon} {new_name} joined {school_name} as {new_role}",
+                "html":    html,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        print(f"[Notify] Principal alert sent to {principal_email} re: {new_email}")
+        return jsonify({"success": True})
+
+    except Exception as e:
+        print(f"[Notify] Principal alert failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 200
+
+
+@app.route("/school-activity", methods=["GET"])
+def get_school_activity():
+    """
+    Returns the activity feed for a school.
+    Used by the principal dashboard activity panel.
+    """
+    try:
+        uid = request.args.get("uid", "")
+        school_id = request.args.get("schoolId", "")
+
+        if not school_id:
+            return jsonify({"error": "schoolId required"}), 400
+
+        events = []
+        for doc in (
+            db.collection("schoolActivity")
+              .where(filter=FieldFilter("schoolId", "==", school_id))
+              .order_by("timestamp", direction="DESCENDING")
+              .limit(50)
+              .stream()
+        ):
+            d = doc.to_dict()
+            events.append({
+                "id":          doc.id,
+                "type":        d.get("type",        ""),
+                "actorName":   d.get("actorName",   ""),
+                "actorEmail":  d.get("actorEmail",  ""),
+                "actorRole":   d.get("actorRole",   ""),
+                "description": d.get("description", ""),
+                "grade":       d.get("grade",       ""),
+                "subjects":    d.get("subjects",    []),
+                "timestamp":   d.get("timestamp").isoformat()
+                               if hasattr(d.get("timestamp"), "isoformat")
+                               else str(d.get("timestamp", "")),
+                "read":        d.get("read", False),
+            })
+
+        return jsonify({"events": events})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/school-activity/mark-read", methods=["POST"])
+def mark_activity_read():
+    """Mark activity events as read."""
+    try:
+        data      = request.get_json() or {}
+        event_ids = data.get("eventIds", [])
+        batch     = db.batch()
+        for eid in event_ids:
+            batch.update(db.collection("schoolActivity").document(eid), {"read": True})
+        batch.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin

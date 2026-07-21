@@ -218,9 +218,16 @@ from firebase_admin import credentials
 def _init_firebase():
     global db, bucket
 
-    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    raw = (
+            os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON") or
+            os.environ.get("FIREBASE_SERVICE_ACCOUNT") or
+            ""
+    ).strip()
     if not raw:
-        raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
+        raise ValueError(
+            "Firebase credentials not set. Add FIREBASE_SERVICE_ACCOUNT_JSON "
+            "to your Render environment variables."
+        )
 
     if os.path.exists(raw):
         with open(raw, "r") as f:

@@ -363,21 +363,25 @@ Talisman(app, force_https=not is_local)
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # No trailing slash on origins — browsers never send one and Flask-CORS
 # does exact string matching. "https://eduket.tech/" would never match.
-CORS(app, resources={r"/*": {
-    "origins": [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://localhost:5176",
-        "http://localhost:5177",
-        "https://eduket.netlify.app",
-        "https://eduket.tech",
-"https://eduket-backend-1.onrender.com"
-    ],
-    "methods":       ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    "allow_headers": ["Content-Type", "Authorization"],
-}}, supports_credentials=False)
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://localhost:5176",
+    "http://localhost:5177",
+    "https://eduket.netlify.app",
+    "https://eduket.tech",
+    "https://eduket-backend-1.onrender.com"
+]
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+    supports_credentials=True  # Set to True for smooth authorization handling
+)
 
 # ── CRIT-01: Rate limiting ────────────────────────────────────────────────────
 # Prevents DoS attacks, brute-force attempts, and AI cost explosion.

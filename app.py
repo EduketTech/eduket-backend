@@ -23,17 +23,18 @@ Environment variables required:
 """
 try:
     from gevent import monkey
-    monkey.patch_all(
-        socket=True,
-        dns=True,
-        time=True,
-        select=True,
-        thread=False,
-        os=False,
-        ssl=True,
-        httplib=False,
-        subprocess=False,
-    )
+    if not monkey.is_module_patched('socket'):
+        monkey.patch_all(
+            socket=True,
+            dns=True,
+            time=True,
+            select=True,
+            thread=False,
+            os=False,
+            ssl=True,
+            httplib=False,
+            subprocess=False,
+        )
 except ImportError:
     pass
 
@@ -1170,13 +1171,15 @@ def _start_auto_extraction_listener():
 
 def _sweep_pending_on_startup():
     """Re-queue any extractions pending from before the last server restart."""
+    # Guard — db may not be initialized yet in some worker contexts
+    if db is None:
+        print("[Startup] Skipping sweep — db not ready")
+        return
+
     print("[Startup] Sweeping for pending extractions...")
     launched = 0
-    try:
-        # OPTION A: Filter by a top-level flag if you store 'hasPendingExtractions'
-        # docs = db.collection_group("subjects").where("hasPendingExtractions", "==", True).stream()
 
-        # OPTION B: Bounded stream to prevent gRPC 300s timeout
+    try:
         subjects_stream = db.collection_group("subjects").limit(100).stream()
 
         for doc in subjects_stream:
@@ -1186,7 +1189,7 @@ def _sweep_pending_on_startup():
             if not doc.reference.parent or not doc.reference.parent.parent:
                 continue
 
-            school_id = doc.reference.parent.parent.id
+            school_id    = doc.reference.parent.parent.id
             subject_name = doc.id
 
             for upload in data.get("uploads", []):
@@ -1205,7 +1208,6 @@ def _sweep_pending_on_startup():
         traceback.print_exc()
 
     print(f"[Startup] Sweep complete — {launched} queued")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION HELPERS
@@ -2130,9 +2132,11 @@ threading.Thread(target=run_startup_sweep, daemon=True).start()
 # ══════════════════════════════════════════════════════════════════════════════
 try:
     _init_firebase()
+    _sweep_pending_on_startup()
+    _start_auto_extraction_listener()
 except Exception as e:
-    traceback.print_exc()
-    raise SystemExit(1)
+    print(f"[Startup] Warning: {e}")
+
 
 # Only run listener and sweep in the main process.
 # gunicorn workers import this module via post_fork — running these

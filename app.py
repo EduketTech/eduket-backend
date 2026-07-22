@@ -1170,8 +1170,6 @@ def _start_auto_extraction_listener():
 
 
 def _sweep_pending_on_startup():
-    """Re-queue any extractions pending from before the last server restart."""
-    # Guard — db may not be initialized yet in some worker contexts
     if db is None:
         print("[Startup] Skipping sweep — db not ready")
         return
@@ -1180,32 +1178,29 @@ def _sweep_pending_on_startup():
     launched = 0
 
     try:
-        subjects_stream = db.collection_group("subjects").limit(100).stream()
-
+        # Short timeout — never block startup
+        import google.api_core.retry as _retry
+        subjects_stream = (
+            db.collection_group("subjects")
+              .limit(20)              # ← reduced from 100
+              .stream()
+        )
         for doc in subjects_stream:
             data = doc.to_dict() or {}
-
-            # Guard against root-level parent missing
             if not doc.reference.parent or not doc.reference.parent.parent:
                 continue
-
             school_id    = doc.reference.parent.parent.id
             subject_name = doc.id
-
             for upload in data.get("uploads", []):
                 exam_id = upload.get("examId") or upload.get("id")
                 if not exam_id:
                     continue
-
                 if (upload.get("status") == "pending_extraction"
-                        and (upload.get("examStoragePath") or upload.get("examStorageUrl"))
                         and not _is_processing(exam_id)):
                     if _launch_pipeline(exam_id, upload, school_id, subject_name):
                         launched += 1
-
     except Exception as e:
-        print(f"[Startup] Sweep error: {e}")
-        traceback.print_exc()
+        print(f"[Startup] Sweep error (non-fatal): {e}")
 
     print(f"[Startup] Sweep complete — {launched} queued")
 
@@ -2137,17 +2132,13 @@ except Exception as e:
     raise SystemExit(1)
 
 def _background_startup():
-    """Run sweep and listener in background so HTTP server starts immediately."""
     import time
-    time.sleep(3)  # Wait for worker to fully initialize
-    try:
-        _sweep_pending_on_startup()
-    except Exception as e:
-        print(f"[Startup] Sweep error: {e}")
+    time.sleep(5)
     try:
         _start_auto_extraction_listener()
     except Exception as e:
         print(f"[Startup] Listener error: {e}")
+
 
 import threading as _threading
 _startup_thread = _threading.Thread(

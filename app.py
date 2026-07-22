@@ -65,12 +65,15 @@ from collections import deque
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from services.notifications import (
+    send_welcome_email_handler,
     notify_principal_signup_handler,
-    send_welcome_email_handler
+    get_school_activity_handler,
+    mark_activity_read_handler,
 )
+
 from services.school_activity import (
     get_school_activity_handler,
-    mark_activity_read_handler
+    mark_activity_read_handler,
 )
 
 # Suppress harmless gevent thread cleanup KeyError
@@ -2076,20 +2079,19 @@ def trigger_extract(exam_id):
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
-
-@app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
-def notify_principal():
-    return notify_principal_signup_handler(db)
-
 @app.route("/send-welcome-email", methods=["POST", "OPTIONS"])
 def send_welcome_email():
     return send_welcome_email_handler()
 
-@app.route("/school-activity", methods=["GET", "OPTIONS"])
-def get_school_activity():
+@app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
+def notify_principal_signup():
+    return notify_principal_signup_handler(db)
+
+@app.route("/school-activity", methods=["GET"])
+def school_activity():
     return get_school_activity_handler(db)
 
-@app.route("/school-activity/mark-read", methods=["POST", "OPTIONS"])
+@app.route("/school-activity/mark-read", methods=["POST"])
 def mark_activity_read():
     return mark_activity_read_handler(db)
 

@@ -1,5 +1,7 @@
 # gunicorn.conf.py
 import os
+import gevent.monkey
+gevent.monkey.patch_all()
 
 workers     = 1
 worker_class = "gevent"          # ← was "sync" — match Dockerfile

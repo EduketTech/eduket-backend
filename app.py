@@ -67,10 +67,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from services.notifications import (
     send_welcome_email_handler,
     notify_principal_signup_handler,
-    get_school_activity_handler,
-    mark_activity_read_handler,
 )
-
 from services.school_activity import (
     get_school_activity_handler,
     mark_activity_read_handler,

@@ -2132,21 +2132,31 @@ threading.Thread(target=run_startup_sweep, daemon=True).start()
 # ══════════════════════════════════════════════════════════════════════════════
 try:
     _init_firebase()
-    _sweep_pending_on_startup()
-    _start_auto_extraction_listener()
 except Exception as e:
-    print(f"[Startup] Warning: {e}")
+    traceback.print_exc()
+    raise SystemExit(1)
 
+def _background_startup():
+    """Run sweep and listener in background so HTTP server starts immediately."""
+    import time
+    time.sleep(3)  # Wait for worker to fully initialize
+    try:
+        _sweep_pending_on_startup()
+    except Exception as e:
+        print(f"[Startup] Sweep error: {e}")
+    try:
+        _start_auto_extraction_listener()
+    except Exception as e:
+        print(f"[Startup] Listener error: {e}")
 
-# Only run listener and sweep in the main process.
-# gunicorn workers import this module via post_fork — running these
-# in every worker creates duplicate listeners and Firestore conflicts.
-import multiprocessing as _mp
-if _mp.current_process().name == "MainProcess":
-    _sweep_pending_on_startup()
-    _start_auto_extraction_listener()
+import threading as _threading
+_startup_thread = _threading.Thread(
+    target=_background_startup,
+    daemon=True,
+    name="startup"
+)
+_startup_thread.start()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-

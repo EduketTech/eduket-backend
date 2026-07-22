@@ -1173,22 +1173,37 @@ def _sweep_pending_on_startup():
     print("[Startup] Sweeping for pending extractions...")
     launched = 0
     try:
-        for doc in db.collection_group("subjects").stream():
-            data         = doc.to_dict() or {}
-            school_id    = doc.reference.parent.parent.id
+        # OPTION A: Filter by a top-level flag if you store 'hasPendingExtractions'
+        # docs = db.collection_group("subjects").where("hasPendingExtractions", "==", True).stream()
+
+        # OPTION B: Bounded stream to prevent gRPC 300s timeout
+        subjects_stream = db.collection_group("subjects").limit(100).stream()
+
+        for doc in subjects_stream:
+            data = doc.to_dict() or {}
+
+            # Guard against root-level parent missing
+            if not doc.reference.parent or not doc.reference.parent.parent:
+                continue
+
+            school_id = doc.reference.parent.parent.id
             subject_name = doc.id
+
             for upload in data.get("uploads", []):
                 exam_id = upload.get("examId") or upload.get("id")
                 if not exam_id:
                     continue
+
                 if (upload.get("status") == "pending_extraction"
                         and (upload.get("examStoragePath") or upload.get("examStorageUrl"))
                         and not _is_processing(exam_id)):
                     if _launch_pipeline(exam_id, upload, school_id, subject_name):
                         launched += 1
+
     except Exception as e:
         print(f"[Startup] Sweep error: {e}")
         traceback.print_exc()
+
     print(f"[Startup] Sweep complete — {launched} queued")
 
 
@@ -2098,6 +2113,17 @@ def cleanup_sessions():
             doc.reference.delete()
             deleted += 1
     return jsonify({"deleted": deleted})
+
+
+def run_startup_sweep():
+    try:
+        _sweep_pending_on_startup()
+    except Exception as e:
+        print(f"[Startup Sweep Error]: {e}")
+
+# Kick off the sweep in a background thread so the server opens its HTTP port instantly
+threading.Thread(target=run_startup_sweep, daemon=True).start()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STARTUP SEQUENCE

@@ -45,9 +45,7 @@ def get_school_activity_handler(db):
                 def _sort_key(doc):
                     ts = doc.to_dict().get("timestamp")
                     if ts is None:
-                        # Return timezone-aware epoch so comparison works
                         return datetime(1970, 1, 1, tzinfo=timezone.utc)
-                    # Firestore DatetimeWithNanoseconds is timezone-aware
                     if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
                         return ts.replace(tzinfo=timezone.utc)
                     return ts
@@ -63,24 +61,27 @@ def get_school_activity_handler(db):
             d  = doc.to_dict()
             ts = d.get("timestamp")
 
-            # Safely format timestamp
             try:
                 ts_formatted = ts.isoformat() if hasattr(ts, "isoformat") else str(ts or "")
             except Exception:
                 ts_formatted = ""
 
             events.append({
-                "id":          doc.id,
-                "type":        d.get("type",        ""),
-                "actorUid":    d.get("actorUid",    ""),
-                "actorName":   d.get("actorName",   ""),
-                "actorEmail":  d.get("actorEmail",  ""),
-                "actorRole":   d.get("actorRole",   ""),
-                "description": d.get("description", ""),
-                "grade":       d.get("grade",       ""),     # student grade
-                "subjects":    d.get("subjects",    []),     # student/teacher subjects
-                "timestamp":   ts_formatted,
-                "read":        d.get("read",        False),
+                "id":             doc.id,
+                "type":           d.get("type",           ""),
+                "actorUid":       d.get("actorUid",       ""),
+                "actorName":      d.get("actorName",      ""),
+                "actorEmail":     d.get("actorEmail",     ""),
+                "actorRole":      d.get("actorRole",      ""),
+                "description":    d.get("description",    ""),
+                "grade":          d.get("grade",          ""),
+                "subjects":       d.get("subjects",       []),
+                "timestamp":      ts_formatted,
+                "read":           d.get("read",           False),
+                "approvalStatus": d.get("approvalStatus", None),
+                "approvedBy":     d.get("approvedBy",     None),
+                "declineReason":  d.get("declineReason",  None),
+                "schoolName":     d.get("schoolName",     ""),
             })
 
         return jsonify({"events": events, "success": True})
@@ -102,8 +103,7 @@ def mark_activity_read_handler(db):
         if not event_ids or not isinstance(event_ids, list):
             return jsonify({"success": True, "updated": 0})
 
-        # Firestore batch limit is 500 writes — chunk for large lists
-        CHUNK_SIZE = 500
+        CHUNK_SIZE    = 500
         total_updated = 0
 
         for i in range(0, len(event_ids), CHUNK_SIZE):
@@ -111,8 +111,10 @@ def mark_activity_read_handler(db):
             batch = db.batch()
             for eid in chunk:
                 if eid and isinstance(eid, str):
-                    doc_ref = db.collection("schoolActivity").document(eid)
-                    batch.update(doc_ref, {"read": True})
+                    batch.update(
+                        db.collection("schoolActivity").document(eid),
+                        {"read": True}
+                    )
                     total_updated += 1
             batch.commit()
 
@@ -121,3 +123,98 @@ def mark_activity_read_handler(db):
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+def approve_school_user_handler(db, req):
+    """POST /approve-school-user"""
+    if req.method == "OPTIONS":
+        return "", 204
+
+    try:
+        data           = req.get_json() or {}
+        activity_id    = data.get("activityId",    "").strip()
+        actor_uid      = data.get("actorUid",      "").strip()
+        actor_email    = data.get("actorEmail",    "").strip()
+        actor_name     = data.get("actorName",     "")
+        actor_role     = data.get("actorRole",     "student")
+        school_id      = data.get("schoolId",      "").strip()
+        action         = data.get("action",        "")
+        decline_reason = data.get("declineReason", "").strip()
+
+        if not activity_id or not school_id or action not in ("approved", "declined"):
+            return jsonify({"error": "activityId, schoolId and valid action required"}), 400
+
+        # ── Get principal name from token ──────────────────────────────────
+        principal_name = "Principal"
+        auth_header    = req.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            try:
+                from firebase_admin import auth as fb_auth
+                token   = auth_header.split("Bearer ", 1)[1].strip()
+                decoded = fb_auth.verify_id_token(token)
+                p_uid   = decoded.get("uid", "")
+                if p_uid:
+                    p_doc = db.collection("users").document(p_uid).get()
+                    if p_doc.exists:
+                        pd = p_doc.to_dict()
+                        principal_name = (
+                            pd.get("displayName") or
+                            f"{pd.get('firstName', '')} {pd.get('lastName', '')}".strip() or
+                            "Principal"
+                        )
+            except Exception:
+                pass  # non-fatal
+
+        # ── Update original activity document ──────────────────────────────
+        from firebase_admin import firestore as fs_admin
+
+        update_data = {
+            "approvalStatus": action,
+            "approvedBy":     principal_name,
+            "approvedAt":     fs_admin.SERVER_TIMESTAMP,
+            "read":           True,
+        }
+        if action == "declined" and decline_reason:
+            update_data["declineReason"] = decline_reason
+
+        db.collection("schoolActivity").document(activity_id).update(update_data)
+
+        # ── Log the principal's action as a new activity entry ─────────────
+        db.collection("schoolActivity").add({
+            "schoolId":      school_id,
+            "type":          f"user_{action}",
+            "actorName":     principal_name,
+            "targetName":    actor_name,
+            "targetEmail":   actor_email,
+            "targetRole":    actor_role,
+            "description":   f"{principal_name} {action} {actor_name} as {actor_role}",
+            "declineReason": decline_reason if action == "declined" else None,
+            "timestamp":     fs_admin.SERVER_TIMESTAMP,
+            "read":          True,
+        })
+
+        # ── Update user's approval status ──────────────────────────────────
+        if actor_uid:
+            role_col = (
+                "teachers" if actor_role == "teacher" else
+                "students" if actor_role == "student" else
+                "users"
+            )
+            try:
+                db.collection(role_col).document(actor_uid).update({
+                    "approvalStatus": action,
+                    "approvedBy":     principal_name,
+                    "approvedAt":     fs_admin.SERVER_TIMESTAMP,
+                })
+                db.collection("users").document(actor_uid).update({
+                    "approvalStatus": action,
+                })
+            except Exception as e:
+                print(f"[Approve] Could not update user doc (non-fatal): {e}")
+
+        print(f"[Approve] {principal_name} {action} {actor_email}")
+        return jsonify({"success": True, "action": action})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "success": False}), 500

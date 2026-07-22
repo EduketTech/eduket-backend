@@ -2075,7 +2075,8 @@ def trigger_extract(exam_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
+## ── Routes ────────────────────────────────────────────────────────────────
+
 @app.route("/send-welcome-email", methods=["POST", "OPTIONS"])
 def send_welcome_email():
     if request.method == "OPTIONS":
@@ -2095,28 +2096,80 @@ def send_welcome_email():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"success": True, "queued": True})
 
-@app.route('/notify-principal-signup', methods=['POST'])
+
+@app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
 def notify_principal_route():
-    # 1. Safely parse JSON payload inside Flask's request context
-    data = request.get_json() or {}
+    if request.method == "OPTIONS":
+        return "", 204
 
-    # 2. Dispatch to background thread without passing request context
-    thread = threading.Thread(
-        target=notify_principal_signup_handler,
-        args=(data, db, fs_admin, _send_email)
-    )
-    thread.start()
+    try:
+        data = request.get_json() or {}
+    except Exception:
+        data = {}
 
-    # 3. Respond quickly to client
-    return jsonify({"success": True, "message": "Notification dispatched."}), 200
+    # Write activity log in main thread — gRPC works here
+    try:
+        school_id   = data.get("schoolId",   "").strip()
+        new_name    = data.get("displayName") or data.get("firstName", "New User")
+        new_email   = data.get("email",      "").strip()
+        new_role    = data.get("role",       "student")
+        school_name = data.get("schoolName", "")
+        grade       = data.get("grade",      "")
+        subjects    = data.get("subjects",   [])
+        uid         = data.get("uid",        "")
 
-@app.route("/school-activity", methods=["GET"])
+        if school_id and new_email:
+            db.collection("schoolActivity").document().set({
+                "schoolId":    school_id,
+                "schoolName":  school_name,
+                "type":        "user_joined",
+                "actorUid":    uid,
+                "actorName":   new_name,
+                "actorEmail":  new_email,
+                "actorRole":   new_role,
+                "grade":       grade,
+                "subjects":    subjects if isinstance(subjects, list) else [],
+                "description": f"{new_name} joined as {new_role}",
+                "timestamp":   fs_admin.SERVER_TIMESTAMP,
+                "read":        False,
+            })
+            print(f"[Notify] Activity logged for {new_email}")
+    except Exception as e:
+        print(f"[Notify] Activity log failed (non-fatal): {e}")
+
+    # Send email in background — email only, no Firestore
+    def _run():
+        try:
+            from services.notifications import _notify_email_only
+            _notify_email_only(db, data)
+        except Exception as e:
+            print(f"[Notify] Email thread error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "queued": True})
+
+
+@app.route("/school-activity", methods=["GET", "OPTIONS"])
 def school_activity():
+    if request.method == "OPTIONS":
+        return "", 204
     return get_school_activity_handler(db)
 
-@app.route("/school-activity/mark-read", methods=["POST"])
+
+@app.route("/school-activity/mark-read", methods=["POST", "OPTIONS"])
 def mark_activity_read():
+    if request.method == "OPTIONS":
+        return "", 204
     return mark_activity_read_handler(db)
+
+
+@app.route("/approve-school-user", methods=["POST", "OPTIONS"])
+def approve_school_user_route():
+    if request.method == "OPTIONS":
+        return "", 204
+    from services.school_activity import approve_school_user_handler
+    return approve_school_user_handler(db, request)
+
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin

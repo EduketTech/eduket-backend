@@ -73,7 +73,16 @@ from services.school_activity import (
     mark_activity_read_handler
 )
 
+# Suppress harmless gevent thread cleanup KeyError
+import threading as _threading
+_original_delete = _threading.Thread._delete
 
+def _safe_thread_delete(self):
+    try:
+        _original_delete(self)
+    except KeyError:
+        pass
+_threading.Thread._delete = _safe_thread_delete
 
 
 # ══════════════════════════════════════════════════════════════════════════════

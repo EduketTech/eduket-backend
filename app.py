@@ -2559,15 +2559,19 @@ def cleanup_sessions():
 # ══════════════════════════════════════════════════════════════════════════════
 # STARTUP SEQUENCE
 # ══════════════════════════════════════════════════════════════════════════════
-
 try:
     _init_firebase()
 except Exception as e:
     traceback.print_exc()
     raise SystemExit(1)
 
-_sweep_pending_on_startup()
-_start_auto_extraction_listener()
+# Only run listener and sweep in the main process.
+# gunicorn workers import this module via post_fork — running these
+# in every worker creates duplicate listeners and Firestore conflicts.
+import multiprocessing as _mp
+if _mp.current_process().name == "MainProcess":
+    _sweep_pending_on_startup()
+    _start_auto_extraction_listener()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))

@@ -2078,11 +2078,47 @@ def trigger_extract(exam_id):
 # ── Routes ──────────────────────────────────────────────────────────────────
 @app.route("/send-welcome-email", methods=["POST", "OPTIONS"])
 def send_welcome_email():
-    return send_welcome_email_handler()
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        data = request.get_json() or {}
+    except Exception:
+        data = {}
+
+    def _run():
+        try:
+            from services.notifications import send_welcome_email_handler
+            send_welcome_email_handler(data)
+        except Exception as e:
+            print(f"[Welcome Email] Background error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "queued": True})
 
 @app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
 def notify_principal_signup():
-    return notify_principal_signup_handler(db)
+    if request.method == "OPTIONS":
+        return "", 204
+
+    # Capture request data immediately — request context won't exist in thread
+    try:
+        data = request.get_json() or {}
+    except Exception:
+        data = {}
+
+    # Fire and forget — never block the frontend
+    def _run():
+        try:
+            from services.notifications import notify_principal_signup_handler
+            # Pass db explicitly — thread has no Flask context
+            notify_principal_signup_handler(db, data)
+        except Exception as e:
+            print(f"[Notify] Background thread error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    # Return immediately — email sends in background
+    return jsonify({"success": True, "queued": True})
 
 @app.route("/school-activity", methods=["GET"])
 def school_activity():

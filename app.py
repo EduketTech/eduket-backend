@@ -66,7 +66,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from services.notifications import (
     send_welcome_email_handler,
-    notify_principal_signup_handler,
+    notify_principal_signup_handler, _send_email,
 )
 from services.school_activity import (
     get_school_activity_handler,
@@ -2095,30 +2095,20 @@ def send_welcome_email():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"success": True, "queued": True})
 
-@app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
-def notify_principal_signup():
-    if request.method == "OPTIONS":
-        return "", 204
+@app.route('/notify-principal-signup', methods=['POST'])
+def notify_principal_route():
+    # 1. Safely parse JSON payload inside Flask's request context
+    data = request.get_json() or {}
 
-    # Capture request data immediately — request context won't exist in thread
-    try:
-        data = request.get_json() or {}
-    except Exception:
-        data = {}
+    # 2. Dispatch to background thread without passing request context
+    thread = threading.Thread(
+        target=notify_principal_signup_handler,
+        args=(data, db, fs_admin, _send_email)
+    )
+    thread.start()
 
-    # Fire and forget — never block the frontend
-    def _run():
-        try:
-            from services.notifications import notify_principal_signup_handler
-            # Pass db explicitly — thread has no Flask context
-            notify_principal_signup_handler(db, data)
-        except Exception as e:
-            print(f"[Notify] Background thread error: {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
-
-    # Return immediately — email sends in background
-    return jsonify({"success": True, "queued": True})
+    # 3. Respond quickly to client
+    return jsonify({"success": True, "message": "Notification dispatched."}), 200
 
 @app.route("/school-activity", methods=["GET"])
 def school_activity():

@@ -200,28 +200,36 @@ def send_welcome_email_handler(data=None):
 
 # ── Principal notification — sent when teacher/student joins ──────────────
 
-def notify_principal_signup_handler(db, data=None):
-    # data is passed directly when called from background thread
-    # (request context not available in threads)
-    if data is None:
-        try:
-            data = request.get_json() or {}
-        except Exception:
+from datetime import datetime
+import traceback
+
+# /app/services/notifications.py
+
+def notify_principal_signup_handler(data, db, fs_admin, send_email_fn):
+    """
+    Accepts data dictionary directly.
+    Parameters:
+      - data: dict of user details
+      - db: firestore client instance
+      - fs_admin: firestore admin module (for SERVER_TIMESTAMP)
+      - send_email_fn: function reference to _send_email
+    """
+    try:
+        if not data or not isinstance(data, dict):
             data = {}
 
-    try:
-        data        = request.get_json() or {}
-        school_id   = data.get("schoolId",   "").strip()
-        new_email   = data.get("email",      "").strip()
+        school_id   = str(data.get("schoolId",   "")).strip()
+        new_email   = str(data.get("email",      "")).strip()
         new_name    = data.get("displayName") or data.get("firstName", "New User")
-        new_role    = data.get("role",       "student")
-        school_name = data.get("schoolName", "Your School")
+        new_role    = str(data.get("role",       "student")).strip()
+        school_name = str(data.get("schoolName", "Your School")).strip()
         grade       = data.get("grade",      "")
         subjects    = data.get("subjects",   [])
-        uid         = data.get("uid",        "")
+        uid         = str(data.get("uid",        "")).strip()
 
         if not school_id or not new_email:
-            return jsonify({"error": "schoolId and email required"}), 400
+            print("[Notify] Error: Missing schoolId or email.")
+            return {"success": False, "error": "schoolId and email required"}
 
         # 1. Log activity to Firestore
         db.collection("schoolActivity").document().set({
@@ -242,11 +250,13 @@ def notify_principal_signup_handler(db, data=None):
         # 2. Get principal details
         school_doc = db.collection("schools").document(school_id).get()
         if not school_doc.exists:
-            return jsonify({"error": "School not found"}), 404
+            print(f"[Notify] School {school_id} not found.")
+            return {"success": False, "error": "School not found"}
 
         principal_uid = school_doc.to_dict().get("principalUid", "")
         if not principal_uid:
-            return jsonify({"success": False, "reason": "No principal linked"}), 200
+            print(f"[Notify] No principal linked to school {school_id}.")
+            return {"success": False, "reason": "No principal linked"}
 
         # Try users collection first, fallback to principals
         principal_doc = db.collection("users").document(principal_uid).get()
@@ -254,14 +264,15 @@ def notify_principal_signup_handler(db, data=None):
             principal_doc = db.collection("principals").document(principal_uid).get()
 
         if not principal_doc.exists:
-            return jsonify({"success": False, "reason": "Principal not found"}), 200
+            print(f"[Notify] Principal account {principal_uid} not found.")
+            return {"success": False, "reason": "Principal not found"}
 
         principal_data  = principal_doc.to_dict()
         principal_email = principal_data.get("email", "")
         principal_name  = principal_data.get("firstName", "Principal")
 
         if not principal_email:
-            return jsonify({"success": False, "reason": "Principal has no email"}), 200
+            return {"success": False, "reason": "Principal has no email"}
 
         # 3. Build and send email
         role_colour = {
@@ -283,8 +294,7 @@ def notify_principal_signup_handler(db, data=None):
 </tr>
 <tr>
   <td style="padding:7px 0;color:#6b7280;font-size:13px">Role</td>
-  <td style="padding:7px 0;font-weight:700;font-size:13px;
-             text-transform:capitalize;color:{role_colour}">{new_role}</td>
+  <td style="padding:7px 0;font-weight:700;font-size:13px;text-transform:capitalize;color:{role_colour}">{new_role}</td>
 </tr>"""
 
         if grade:
@@ -318,8 +328,7 @@ def notify_principal_signup_handler(db, data=None):
        style="max-width:580px;background:#fff;border-radius:20px;
               overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,0.08);">
   <tr>
-    <td style="background:linear-gradient(135deg,#1e293b,#334155);
-               padding:28px 32px;text-align:center;">
+    <td style="background:linear-gradient(135deg,#1e293b,#334155);padding:28px 32px;text-align:center;">
       <h1 style="margin:0;font-size:22px;font-weight:900;color:#fff;">
         Eduket OS · School Alert
       </h1>
@@ -329,8 +338,7 @@ def notify_principal_signup_handler(db, data=None):
     </td>
   </tr>
   <tr>
-    <td style="background:{role_colour}18;border-bottom:3px solid {role_colour};
-               padding:14px 32px;">
+    <td style="background:{role_colour}18;border-bottom:3px solid {role_colour};padding:14px 32px;">
       <p style="margin:0;font-size:14px;font-weight:700;color:{role_colour};">
         {role_icon} New {new_role.title()} joined your school
       </p>
@@ -345,41 +353,33 @@ def notify_principal_signup_handler(db, data=None):
         Hi <strong>{principal_name}</strong>, a new <strong>{new_role}</strong>
         has completed registration for <strong>{school_name}</strong>.
       </p>
-      <div style="background:#f8fafc;border-radius:12px;padding:16px 20px;
-                  border:1px solid #e2e8f0;margin-bottom:20px;">
-        <p style="margin:0 0 10px;font-size:10px;font-weight:700;
-                   color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">
+      <div style="background:#f8fafc;border-radius:12px;padding:16px 20px;border:1px solid #e2e8f0;margin-bottom:20px;">
+        <p style="margin:0 0 10px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">
           New User Details
         </p>
         <table width="100%" cellpadding="0" cellspacing="0">
           {details_rows}
         </table>
       </div>
-      <div style="background:#fef3c7;border:1px solid #fcd34d;
-                  border-radius:12px;padding:14px 18px;margin-bottom:24px;">
+      <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:12px;padding:14px 18px;margin-bottom:24px;">
         <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#92400e;">
           ⚠️ Do you recognise this person?
         </p>
         <p style="margin:0;font-size:12px;color:#92400e;line-height:1.6;">
-          If you do not recognise <strong>{new_name} ({new_email})</strong>
-          as a member of {school_name}, contact Eduket OS support immediately.
+          If you do not recognise <strong>{new_name} ({new_email})</strong> as a member of {school_name}, contact Eduket OS support immediately.
         </p>
       </div>
       <table width="100%" cellpadding="0" cellspacing="0">
         <tr>
           <td style="padding-right:6px;">
             <a href="https://eduket.tech/principal-dashboard"
-               style="display:block;text-align:center;padding:13px 0;
-                      background:#7c3aed;color:#fff;font-size:13px;
-                      font-weight:900;text-decoration:none;border-radius:10px;">
+               style="display:block;text-align:center;padding:13px 0;background:#7c3aed;color:#fff;font-size:13px;font-weight:900;text-decoration:none;border-radius:10px;">
               View Dashboard →
             </a>
           </td>
           <td style="padding-left:6px;">
             <a href="mailto:support@eduket.tech?subject={mailto_subject}&body={mailto_body}"
-               style="display:block;text-align:center;padding:13px 0;
-                      background:#dc2626;color:#fff;font-size:13px;
-                      font-weight:900;text-decoration:none;border-radius:10px;">
+               style="display:block;text-align:center;padding:13px 0;background:#dc2626;color:#fff;font-size:13px;font-weight:900;text-decoration:none;border-radius:10px;">
               🚨 Report Unknown User
             </a>
           </td>
@@ -388,8 +388,7 @@ def notify_principal_signup_handler(db, data=None):
     </td>
   </tr>
   <tr>
-    <td style="background:#f8fafc;padding:16px 32px;
-               border-top:1px solid #e2e8f0;text-align:center;">
+    <td style="background:#f8fafc;padding:16px 32px;border-top:1px solid #e2e8f0;text-align:center;">
       <p style="margin:0;font-size:11px;color:#94a3b8;">
         Eduket OS · eduket.tech · support@eduket.tech
       </p>
@@ -401,82 +400,52 @@ def notify_principal_signup_handler(db, data=None):
 </body>
 </html>"""
 
-        result = _send_email(
+        # Call the passed function reference
+        result = send_email_fn(
             to=principal_email,
             subject=f"{role_icon} {new_name} joined {school_name} as {new_role}",
             html=html,
             from_addr="Eduket OS Alerts <onboarding@resend.dev>",
         )
 
-        print(f"[Notify] Principal alert {'sent' if result.get('success') else 'failed'}: {principal_email}")
-        return jsonify({"success": result.get("success", False)})
+        success = result.get("success", False) if isinstance(result, dict) else bool(result)
+        print(f"[Notify] Principal alert {'sent' if success else 'failed'}: {principal_email}")
+        return {"success": success}
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"[Notify] Error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 200
-
-
-# ── School activity feed ──────────────────────────────────────────────────
-
-def get_school_activity_handler(db):
-    """GET /school-activity?schoolId=xxx"""
-    try:
-        from google.cloud.firestore_v1.base_query import FieldFilter
-        school_id = request.args.get("schoolId", "")
-        if not school_id:
-            return jsonify({"error": "schoolId required"}), 400
-
-        events = []
-        try:
-            docs = (
-                db.collection("schoolActivity")
-                  .where(filter=FieldFilter("schoolId", "==", school_id))
-                  .order_by("timestamp", direction="DESCENDING")
-                  .limit(50)
-                  .stream()
-            )
-            for doc in docs:
-                d  = doc.to_dict()
-                ts = d.get("timestamp")
-                events.append({
-                    "id":          doc.id,
-                    "type":        d.get("type",        ""),
-                    "actorName":   d.get("actorName",   ""),
-                    "actorEmail":  d.get("actorEmail",  ""),
-                    "actorRole":   d.get("actorRole",   ""),
-                    "description": d.get("description", ""),
-                    "grade":       d.get("grade",       ""),
-                    "subjects":    d.get("subjects",    []),
-                    "timestamp":   ts.isoformat() if hasattr(ts, "isoformat") else str(ts or ""),
-                    "read":        d.get("read", False),
-                })
-        except Exception as idx_err:
-            if "requires an index" in str(idx_err):
-                print(f"[Activity] Index building: {idx_err}")
-                return jsonify({"events": [], "indexBuilding": True})
-            raise
-
-        return jsonify({"events": events})
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return {"success": False, "error": str(e)}
 
 
 def mark_activity_read_handler(db):
     """POST /school-activity/mark-read"""
     try:
-        data      = request.get_json() or {}
+        data = request.get_json() or {}
         event_ids = data.get("eventIds", [])
-        if not event_ids:
-            return jsonify({"success": True})
-        batch = db.batch()
-        for eid in event_ids:
-            batch.update(db.collection("schoolActivity").document(eid), {"read": True})
-        batch.commit()
-        return jsonify({"success": True})
+
+        if not isinstance(event_ids, list) or not event_ids:
+            return jsonify({"success": True, "updated": 0})
+
+        # Sanitize event IDs to string non-empty entries
+        valid_eids = [str(eid).strip() for eid in event_ids if str(eid).strip()]
+        if not valid_eids:
+            return jsonify({"success": True, "updated": 0})
+
+        # Firestore allows max 500 operations per batch
+        BATCH_SIZE = 500
+        for i in range(0, len(valid_eids), BATCH_SIZE):
+            chunk = valid_eids[i:i + BATCH_SIZE]
+            batch = db.batch()
+            for eid in chunk:
+                ref = db.collection("schoolActivity").document(eid)
+                batch.update(ref, {"read": True})
+            batch.commit()
+
+        return jsonify({"success": True, "updated": len(valid_eids)})
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500

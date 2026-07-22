@@ -21,22 +21,9 @@ Environment variables required:
   FIREBASE_STORAGE_BUCKET · PAYFAST_MERCHANT_ID · PAYFAST_MERCHANT_KEY
   PAYFAST_PASSPHRASE · FRONTEND_BASE_URL · BACKEND_BASE_URL
 """
-try:
-    from gevent import monkey
-    if not monkey.is_module_patched('socket'):
-        monkey.patch_all(
-            socket=True,
-            dns=True,
-            time=True,
-            select=True,
-            thread=False,
-            os=False,
-            ssl=True,
-            httplib=False,
-            subprocess=False,
-        )
-except ImportError:
-    pass
+# — let gevent worker handle patching ─────────────────────
+# Monkey-patching handled automatically by gunicorn gevent worker
+# Do not patch here — causes double-patch warning
 
 
 from dotenv import load_dotenv

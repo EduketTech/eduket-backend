@@ -64,10 +64,6 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 from collections import deque
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-from services.notifications import (
-    send_welcome_email_handler,
-    notify_principal_signup_handler, _send_email,
-)
 from services.school_activity import (
     get_school_activity_handler,
     mark_activity_read_handler,
@@ -2076,78 +2072,6 @@ def trigger_extract(exam_id):
 
 
 ## ── Routes ────────────────────────────────────────────────────────────────
-
-@app.route("/send-welcome-email", methods=["POST", "OPTIONS"])
-def send_welcome_email():
-    if request.method == "OPTIONS":
-        return "", 204
-    try:
-        data = request.get_json() or {}
-    except Exception:
-        data = {}
-
-    def _run():
-        try:
-            from services.notifications import send_welcome_email_handler
-            send_welcome_email_handler(data)
-        except Exception as e:
-            print(f"[Welcome Email] Background error: {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"success": True, "queued": True})
-
-
-@app.route("/notify-principal-signup", methods=["POST", "OPTIONS"])
-def notify_principal_route():
-    if request.method == "OPTIONS":
-        return "", 204
-
-    try:
-        data = request.get_json() or {}
-    except Exception:
-        data = {}
-
-    # Write activity log in main thread — gRPC works here
-    try:
-        school_id   = data.get("schoolId",   "").strip()
-        new_name    = data.get("displayName") or data.get("firstName", "New User")
-        new_email   = data.get("email",      "").strip()
-        new_role    = data.get("role",       "student")
-        school_name = data.get("schoolName", "")
-        grade       = data.get("grade",      "")
-        subjects    = data.get("subjects",   [])
-        uid         = data.get("uid",        "")
-
-        if school_id and new_email:
-            db.collection("schoolActivity").document().set({
-                "schoolId":    school_id,
-                "schoolName":  school_name,
-                "type":        "user_joined",
-                "actorUid":    uid,
-                "actorName":   new_name,
-                "actorEmail":  new_email,
-                "actorRole":   new_role,
-                "grade":       grade,
-                "subjects":    subjects if isinstance(subjects, list) else [],
-                "description": f"{new_name} joined as {new_role}",
-                "timestamp":   fs_admin.SERVER_TIMESTAMP,
-                "read":        False,
-            })
-            print(f"[Notify] Activity logged for {new_email}")
-    except Exception as e:
-        print(f"[Notify] Activity log failed (non-fatal): {e}")
-
-    # Send email in background — email only, no Firestore
-    def _run():
-        try:
-            from services.notifications import _notify_email_only
-            _notify_email_only(db, data)
-        except Exception as e:
-            print(f"[Notify] Email thread error: {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"success": True, "queued": True})
-
 
 @app.route("/school-activity", methods=["GET", "OPTIONS"])
 def school_activity():

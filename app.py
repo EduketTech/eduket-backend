@@ -2070,15 +2070,15 @@ def register_user():
     # ... proceed with user registration ...
 
 
-# =============================
-# TIER LIMIT CHECK
-# =============================
 # ===========================================================
 # PRE-CHECK TIER LIMIT ENDPOINT
 # ===========================================================
-@app.route("/check-tier-limit", methods=["POST"])
-@limiter.limit("60 per minute")
+@app.route("/check-tier-limit", methods=["POST", "OPTIONS"])
 def api_check_tier_limit():
+    # Handle CORS preflight explicitly if needed
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
     data = request.json or {}
     school_id = data.get("schoolId")
     limit_type = data.get("role") or data.get("limitType")

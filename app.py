@@ -428,6 +428,73 @@ except ImportError:
 from billing_routes import billing_bp
 app.register_blueprint(billing_bp)
 
+# ===========================================================
+# LIMIT ENFORCER==============
+# ==========================================================
+def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
+    """
+    Checks if a school has exceeded its tier limits.
+    limit_type: 'exams' | 'teachers' | 'students' (or 'teacher' / 'student')
+    Returns (is_allowed, error_message)
+    """
+    if not school_id:
+        return False, "School ID is required."
+
+    school_doc = db.collection("schools").document(school_id).get()
+    if not school_doc.exists:
+        return False, "School not found."
+
+    school_data = school_doc.to_dict() or {}
+    tier_id = school_data.get("tier", "free").lower()
+
+    # Normalize limit key (e.g. 'teacher' -> 'teachers')
+    normalized_key = limit_type.lower().strip()
+    if normalized_key in ("teacher", "student", "exam"):
+        normalized_key = f"{normalized_key}s"
+
+    limits = {
+        "free":     {"exams": 4,   "teachers": 2,  "students": 30},
+        "silver":   {"exams": 15,  "teachers": 5,  "students": 150},
+        "gold":     {"exams": 30,  "teachers": 10, "students": 300},
+        "platinum": {"exams": 80,  "teachers": 25, "students": 800},
+        "diamond":  {"exams": 150, "teachers": 50, "students": 2000},
+    }
+
+    tier_limits = limits.get(tier_id, limits["free"])
+    max_allowed = tier_limits.get(normalized_key, 0)
+
+    try:
+        if normalized_key == "exams":
+            # Fast count aggregation for exams
+            query = db.collection("exams").where(filter=FieldFilter("schoolId", "==", school_id)).count()
+            current_count = query.get()[0][0].value
+
+        elif normalized_key in ("teachers", "students"):
+            # Extract 'teacher' or 'student' for Firestore role field matching
+            role_target = normalized_key[:-1]
+            query = (
+                db.collection("users")
+                .where(filter=FieldFilter("schoolId", "==", school_id))
+                .where(filter=FieldFilter("role", "==", role_target))
+                .count()
+            )
+            current_count = query.get()[0][0].value
+        else:
+            return True, ""
+
+    except Exception as e:
+        print(f"[Limit Check Error]: {e}")
+        # Fail safe or fall back to standard collection read
+        return True, ""
+
+    if current_count >= max_allowed:
+        return (
+            False,
+            f"School has reached the {tier_id.capitalize()} tier limit for {normalized_key} ({max_allowed}). Please upgrade your plan."
+        )
+
+    return True, ""
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECURITY — HIGH-06: Safe error handlers
@@ -1983,6 +2050,49 @@ def dashboard():
 
 
 # ── Admin routes — HIGH-09: require Firebase Admin token ──────────────────────
+@app.route("/api/register-user", methods=["POST"])
+def register_user():
+    uid, err = verify_request_token(request)
+    if err:
+        return err
+
+    data = request.json or {}
+    school_id = data.get("schoolId")
+    role = data.get("role")  # 'teacher' or 'student'
+
+    # Check Tier Limits at the backend
+    if role in ["teacher", "student"]:
+        limit_type = f"{role}s"
+        allowed, msg = check_school_limit(school_id, limit_type)
+        if not allowed:
+            return jsonify({"error": msg}), 403
+
+    # ... proceed with user registration ...
+
+
+# =============================
+# TIER LIMIT CHECK
+# =============================
+# ===========================================================
+# PRE-CHECK TIER LIMIT ENDPOINT
+# ===========================================================
+@app.route("/check-tier-limit", methods=["POST"])
+@limiter.limit("60 per minute")
+def api_check_tier_limit():
+    data = request.json or {}
+    school_id = data.get("schoolId")
+    limit_type = data.get("role") or data.get("limitType")
+
+    if not school_id or not limit_type:
+        return jsonify({"error": "Missing schoolId or limit_type"}), 400
+
+    allowed, message = check_school_limit(school_id, limit_type)
+
+    if not allowed:
+        return jsonify({"error": "limit_reached", "message": message}), 403
+
+    return jsonify({"status": "allowed"}), 200
+
 
 @app.route("/admin/extraction-status/<exam_id>", methods=["GET"])
 @require_admin

@@ -64,11 +64,6 @@ from firebase_admin import credentials, firestore as fs_admin, storage, auth as 
 from collections import deque
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-from services.school_activity import (
-    get_school_activity_handler,
-    mark_activity_read_handler,
-)
-
 # Suppress harmless gevent thread cleanup KeyError
 import threading as _threading
 _original_delete = _threading.Thread._delete
@@ -2069,30 +2064,6 @@ def trigger_extract(exam_id):
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-
-## ── Routes ────────────────────────────────────────────────────────────────
-
-@app.route("/school-activity", methods=["GET", "OPTIONS"])
-def school_activity():
-    if request.method == "OPTIONS":
-        return "", 204
-    return get_school_activity_handler(db)
-
-
-@app.route("/school-activity/mark-read", methods=["POST", "OPTIONS"])
-def mark_activity_read():
-    if request.method == "OPTIONS":
-        return "", 204
-    return mark_activity_read_handler(db)
-
-
-@app.route("/approve-school-user", methods=["POST", "OPTIONS"])
-def approve_school_user_route():
-    if request.method == "OPTIONS":
-        return "", 204
-    from services.school_activity import approve_school_user_handler
-    return approve_school_user_handler(db, request)
 
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])

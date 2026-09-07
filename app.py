@@ -927,25 +927,74 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
         )
 
         if existing_matches:
+            source_exam_id = existing_matches[0].id
             match_doc = existing_matches[0].to_dict()
-            logger.info(
-                "[Pipeline] Duplicate file detected (Hash %s matching exam %s) — skipping AI extraction",
-                file_hash, existing_matches[0].id
-            )
-            db.collection("exams").document(exam_id).set({
-                **match_doc,
-                "title": title,
-                "schoolId": meta.get("schoolId", school_id),
-                "uploadedBy": meta.get("uploadedBy", ""),
-                "uploadedAt": meta.get("uploadedAt", ""),
-                "sourceUploadId": exam_id,
-                "fileHash": file_hash,
-                "duplicatedFrom": existing_matches[0].id,
-                "extractedAt": fs_admin.SERVER_TIMESTAMP,
-            }, merge=True)
 
-            set_status("ready", {"duplicatedFrom": existing_matches[0].id})
-            return
+            # FIXED: this branch previously copied only the top-level
+            # exams/{examId} metadata (title, sections, totalQuestions...)
+            # from the matched exam, but never copied the actual
+            # exam_questions/{examId}_{nnnn} documents themselves. Since
+            # _load_exam() queries exam_questions filtered by this exam's
+            # OWN examId, the new exam ended up with metadata CLAIMING N
+            # questions while having zero real question documents — "the
+            # uploaded file is there but questions are not available".
+            # Now clones the source exam's question docs under the new
+            # exam_id (with examId rewritten to match) so each duplicate
+            # exam is fully self-contained and _load_exam() finds real
+            # data, exactly as if it had been extracted independently.
+            source_questions = list(
+                db.collection("exam_questions")
+                  .where(filter=FieldFilter("examId", "==", source_exam_id))
+                  .stream()
+            )
+
+            if not source_questions:
+                # The matched "duplicate" has no real question docs either
+                # (e.g. it's itself a stale/corrupted record) — a dedup
+                # copy here would just propagate the same emptiness to
+                # this upload too. Fall through to a real extraction
+                # instead of trusting a source that has nothing to copy.
+                logger.warning(
+                    "[Pipeline] Dedup match %s has no exam_questions — "
+                    "ignoring the match and extracting %s fresh instead",
+                    source_exam_id, exam_id
+                )
+            else:
+                logger.info(
+                    "[Pipeline] Duplicate file detected (Hash %s matching exam %s) — "
+                    "cloning %d question docs, skipping AI extraction",
+                    file_hash, source_exam_id, len(source_questions)
+                )
+
+                batch = db.batch()
+                for i, q_doc in enumerate(source_questions):
+                    q_data = q_doc.to_dict()
+                    q_data["examId"] = exam_id
+                    ref = db.collection("exam_questions").document(f"{exam_id}_{i:04d}")
+                    batch.set(ref, q_data)
+                    if (i + 1) % 400 == 0:
+                        batch.commit()
+                        batch = db.batch()
+                batch.commit()
+
+                db.collection("exams").document(exam_id).set({
+                    **match_doc,
+                    "title": title,
+                    "schoolId": meta.get("schoolId", school_id),
+                    "uploadedBy": meta.get("uploadedBy", ""),
+                    "uploadedAt": meta.get("uploadedAt", ""),
+                    "sourceUploadId": exam_id,
+                    "fileHash": file_hash,
+                    "duplicatedFrom": source_exam_id,
+                    "totalQuestions": len(source_questions),
+                    "extractedAt": fs_admin.SERVER_TIMESTAMP,
+                }, merge=True)
+
+                set_status("ready", {"duplicatedFrom": source_exam_id,
+                                      "totalQuestions": len(source_questions)})
+                return
+            # falls through to real extraction below when source_questions
+            # was empty
 
         # 2. Single-pass exam + (if present) memo extraction. Handles
         # PDF/DOCX conversion, Groq/Gemini routing, and visual-page image

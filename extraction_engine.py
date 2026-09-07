@@ -116,8 +116,7 @@ import subprocess
 
 import threading
 from typing import Any
-
-import fitz  # PyMuPDF
+import pymupdf as fitz
 import docx2txt
 
 logger = logging.getLogger(__name__)
@@ -127,14 +126,15 @@ logger = logging.getLogger(__name__)
 # AI CLIENTS — Groq primary, Gemini paid rescue
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.5-flash-lite")
-MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-2.5-flash-lite")
+MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.6-flash")
+MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.6-flash")
 
 GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
 GROQ_MODEL_MARK    = os.getenv("GROQ_MODEL_MARK",    "openai/gpt-oss-120b")
 GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))
 GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
 GROQ_MIN_PDF_CHARS_PER_PAGE = 50   # matches looks_insufficient()'s own default
+MAX_OUTPUT_TOKENS = 65536
 
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
@@ -269,10 +269,10 @@ def ai_text(prompt: str, max_tokens: int = 2000, temperature: float = 0.1,
     _, groq_model = _TASK_MODELS.get(task, _TASK_MODELS["extract"])
     try:
         resp = get_groq().chat.completions.create(
-            model=groq_model,
+            model=GROQ_MODEL_EXTRACT,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=min(max_tokens, MAX_OUTPUT_TOKENS),
         )
         usage = getattr(resp, "usage", None)
         total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(prompt)
@@ -340,11 +340,11 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192, temperature: floa
     )
     try:
         resp = get_groq().chat.completions.create(
-            model=groq_model,
+            model=GROQ_MODEL_EXTRACT,
             messages=[{"role": "user", "content": full_prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=min(max_tokens, MAX_OUTPUT_TOKENS),
+            response_format={"type": "json_object"} if schema else None,
         )
         usage = getattr(resp, "usage", None)
         total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(full_prompt)
@@ -369,8 +369,11 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192, temperature: floa
 
 
 def _gemini_document(pdf_bytes: bytes, prompt: str, schema: dict | None,
-                      max_tokens: int, model: str | None) -> Any:
-    config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=max_tokens)
+                         max_tokens: int, model: str | None) -> Any:
+    config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=min(max_tokens, MAX_OUTPUT_TOKENS),
+        )
     if schema:
         config.response_mime_type = "application/json"
         config.response_schema = schema
@@ -434,7 +437,7 @@ def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
             model=GROQ_MODEL_EXTRACT,
             messages=[{"role": "user", "content": full_prompt}],
             temperature=0.0,
-            max_tokens=max_tokens,
+            max_tokens=min(max_tokens, MAX_OUTPUT_TOKENS),
             response_format={"type": "json_object"} if schema else None,
         )
         usage = getattr(resp, "usage", None)
@@ -996,7 +999,7 @@ def extract_exam_and_memo_single_pass(file_bytes: bytes, filename: str, subject:
         pdf_bytes=pdf_bytes,
         prompt=prompt,
         schema=COMBINED_SCHEMA,
-        max_tokens=16384,
+        max_tokens=MAX_OUTPUT_TOKENS,
     )
 
     paper_meta = result.get("metadata") or {}

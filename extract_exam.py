@@ -121,7 +121,7 @@ MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.6-flash")
 # See the CONFIRM BEFORE RUNNING note in the module docstring — verify this
 # slug and the TPM budget against your Groq console before a large run.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "groq/compound")
+GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
 GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))   # conservative default
 GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
 GROQ_MIN_PDF_CHARS = 200   # below this, a "PDF" is treated as unreadable/scanned
@@ -622,6 +622,7 @@ def _generate_gemini(kind: str, payload, prompt: str, schema: dict, max_tokens: 
         pass
     return json.loads(resp.text)
 
+GROQ_MAX_OUTPUT_TOKENS = 65536  # openai/gpt-oss-120b's actual ceiling per Groq's docs
 
 def _generate_groq(text, prompt, schema=None, max_tokens=None):
     # Ensure text/payload is converted to string content
@@ -632,7 +633,7 @@ def _generate_groq(text, prompt, schema=None, max_tokens=None):
     else:
         text_content = text
 
-    groq_max_tokens = min(max_tokens, 8192) if max_tokens else 8192
+    groq_max_tokens = min(max_tokens, GROQ_MAX_OUTPUT_TOKENS) if max_tokens else GROQ_MAX_OUTPUT_TOKENS
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": str(prompt)},
@@ -640,15 +641,16 @@ def _generate_groq(text, prompt, schema=None, max_tokens=None):
     ]
 
     resp = gc.chat.completions.create(
-        model="groq/compound",
+        model=GROQ_MODEL_EXTRACT,
         messages=messages,
         max_tokens=groq_max_tokens,
+        response_format={"type": "json_object"},
     )
 
-    return resp.choices[0].message.content
+    raw = resp.choices[0].message.content
+    return _parse_structured_json(raw)
 
-
-def _generate(kind: str, payload, prompt: str, schema: dict, max_tokens: int = 32768):
+def _generate(kind: str, payload, prompt: str, schema: dict, max_tokens: int = 65536):
     """
     One structured call, routed Groq-first with a Gemini rescue.
     kind is 'pdf' or 'text' — matches load_source()'s return.

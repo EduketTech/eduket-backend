@@ -1803,12 +1803,25 @@ def submit_exam():
     """
     try:
         data = request.get_json(silent=True) or {}
+        sid = data.get("session_id")
 
-        session = _get_session(data.get("session_id"))
+        session = _get_session(sid)
         if not session:
             return jsonify({
                 "error": "Invalid or expired session. Please start the exam first."
             }), 400
+
+        # FIXED: no guard previously existed against replaying the same
+        # session_id to /submit more than once — each replay re-ran every
+        # AI marking call (real cost, and on open-ended questions, a chance
+        # to get a different AI-graded outcome on a second try) with no
+        # record that a resubmission had happened. A genuine retake should
+        # go through /start_exam again for a fresh session_id, not replay
+        # this one.
+        if session.get("submitted"):
+            return jsonify({
+                "error": "This exam attempt has already been submitted."
+            }), 409
 
         # exam_id comes from the session, so a student cannot submit against a
         # different paper than the one they opened.
@@ -1821,7 +1834,24 @@ def submit_exam():
             return jsonify({"error": "Exam not found or has no questions."}), 404
 
         subject = meta.get("subject", "General")
-        memo_map = _load_exam_memos(exam_id)   # server-side only
+
+        # FIXED: aiMarkingOnly was set at upload time but never actually
+        # checked here. extract_exam_and_memo_from_file() runs its
+        # single-pass extraction on the exam document itself regardless of
+        # aiMarkingOnly, and its prompt looks for memo content inside that
+        # same document — if the model believes it found (or hallucinates)
+        # memo-like content, those values get written to each question's
+        # `memo` field even when the teacher explicitly asked for AI-only
+        # marking. mark_with_memo() below does a strict/fuzzy STRING
+        # comparison against whatever memo value it's given, with no AI
+        # judgement involved — so a stray/wrong stored memo value
+        # deterministically marks a genuinely correct answer as incorrect
+        # every time, since it's being checked against the wrong expected
+        # answer. Honouring aiMarkingOnly here means every question for
+        # this exam always goes through AI judgement instead, regardless of
+        # what (if anything) ended up stored in a question's memo field.
+        ai_marking_only = bool(meta.get("aiMarkingOnly"))
+        memo_map = {} if ai_marking_only else _load_exam_memos(exam_id)   # server-side only
 
         total_score = 0.0
         total_marks = 0.0
@@ -1883,6 +1913,54 @@ def submit_exam():
 
         logger.info("[Submit] %s: %s/%s = %s%%",
                     student_id, total_score, total_marks, percentage)
+
+        # FIXED: this function previously computed and returned everything
+        # below but never wrote it anywhere — /results/<exam_id>/<student_id>
+        # and /dashboard both read from exam_attempts and would find nothing
+        # there no matter how many students submitted. Field names below
+        # (examId, studentId, completedAt, markedResults) match exactly what
+        # those two routes already query/read.
+        #
+        # userId is written alongside studentId because /agent-chat's first
+        # attempts query filters on 'userId' before falling back to
+        # 'studentId' — writing both means that primary query actually finds
+        # this attempt instead of always hitting the fallback.
+        #
+        # A new document per attempt (not a fixed exam_id+student_id key)
+        # deliberately allows a genuine retake (a fresh /start_exam session)
+        # to add another attempt rather than overwrite history — matches the
+        # composite index already declared for this collection:
+        # examId ASC, studentId ASC, completedAt DESC.
+        db.collection("exam_attempts").add({
+            "examId":             exam_id,
+            "studentId":          student_id,
+            "userId":             student_id,
+            "subject":            subject,
+            "examTitle":          meta.get("title", ""),
+            "score":              total_score,
+            "totalMarksObtained": total_score,
+            "total":              total_marks,
+            "percentage":         percentage,
+            "markedResults":      results,
+            "feedback":           feedback,
+            "analysis":           analysis,
+            "completedAt":        fs_admin.SERVER_TIMESTAMP,
+        })
+
+        # Consume the session so this exact session_id can't be resubmitted —
+        # see the "already submitted" guard above.
+        if sid:
+            try:
+                db.collection("exam_sessions").document(sid).update({
+                    "submitted":   True,
+                    "submittedAt": fs_admin.SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                # Non-fatal: the attempt is already durably saved above: a
+                # failure here only means this session could theoretically
+                # be resubmitted, not that the student's result was lost.
+                logger.warning("[Submit] Could not mark session %s submitted: %s", sid, e)
+
         return jsonify({
             "score":      total_score,
             "total":      total_marks,

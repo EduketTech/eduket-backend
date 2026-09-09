@@ -1811,20 +1811,14 @@ def submit_exam():
                 "error": "Invalid or expired session. Please start the exam first."
             }), 400
 
-        # FIXED: no guard previously existed against replaying the same
-        # session_id to /submit more than once — each replay re-ran every
-        # AI marking call (real cost, and on open-ended questions, a chance
-        # to get a different AI-graded outcome on a second try) with no
-        # record that a resubmission had happened. A genuine retake should
-        # go through /start_exam again for a fresh session_id, not replay
-        # this one.
+        # Guard against replaying the same session_id to /submit more than once.
+        # A genuine retake must go through /start_exam again for a fresh session_id.
         if session.get("submitted"):
             return jsonify({
                 "error": "This exam attempt has already been submitted."
             }), 409
 
-        # exam_id comes from the session, so a student cannot submit against a
-        # different paper than the one they opened.
+        # exam_id comes from the session so submission cannot target a different paper.
         exam_id = session.get("exam_id")
         student_id = session.get("student_id", "anonymous")
         answers = data.get("answers", {})
@@ -1835,30 +1829,15 @@ def submit_exam():
 
         subject = meta.get("subject", "General")
 
-        # FIXED: aiMarkingOnly was set at upload time but never actually
-        # checked here. extract_exam_and_memo_from_file() runs its
-        # single-pass extraction on the exam document itself regardless of
-        # aiMarkingOnly, and its prompt looks for memo content inside that
-        # same document — if the model believes it found (or hallucinates)
-        # memo-like content, those values get written to each question's
-        # `memo` field even when the teacher explicitly asked for AI-only
-        # marking. mark_with_memo() below does a strict/fuzzy STRING
-        # comparison against whatever memo value it's given, with no AI
-        # judgement involved — so a stray/wrong stored memo value
-        # deterministically marks a genuinely correct answer as incorrect
-        # every time, since it's being checked against the wrong expected
-        # answer. Honouring aiMarkingOnly here means every question for
-        # this exam always goes through AI judgement instead, regardless of
-        # what (if anything) ended up stored in a question's memo field.
         ai_marking_only = bool(meta.get("aiMarkingOnly"))
-        memo_map = {} if ai_marking_only else _load_exam_memos(exam_id)   # server-side only
+        memo_map = {} if ai_marking_only else _load_exam_memos(exam_id)  # server-side only
 
         total_score = 0.0
         total_marks = 0.0
         results = []
 
         for i, q in enumerate(questions):
-            q_num = q.get("question_number", f"Q{i+1}")
+            q_num = q.get("question_number", f"Q{i + 1}")
             q_type = (q.get("type") or "open").lower()
             marks = float(q.get("marks") or 1)
             total_marks += marks
@@ -1870,24 +1849,9 @@ def submit_exam():
             if isinstance(options, list) and options and isinstance(options[0], dict):
                 options = {o["key"]: o["value"] for o in options}
 
-            # Rule-based first (free, instant), AI only when inconclusive.
+            # Rule-based marking first, AI fallback when inconclusive.
             marked = mark_with_memo(raw_ans, memo, marks)
             if marked is None:
-                # FIXED: previously passed the bare student letter (e.g.
-                # "A") and the bare question text to the AI marker, with no
-                # memo and no option list. Without a memo, the AI has no
-                # ground truth of its own — it needs to actually SEE the
-                # options to judge whether "A" was the right choice, since
-                # it can't reliably infer "A" -> "LEDs" -> correct/incorrect
-                # from the letter alone. This was causing the AI to mark
-                # answers wrong that its own generated feedback then
-                # correctly described as right — it wasn't reasoning about
-                # the student's real answer at all, just guessing blind at
-                # what an isolated letter might mean. Build an
-                # options-aware question + answer for the AI call whenever
-                # options exist, mirroring the same letter->text lookup
-                # already used for the correct_answer/student_answer
-                # display fields above.
                 question_for_ai = q.get("question", "")
                 student_answer_for_ai = raw_ans
 
@@ -1902,8 +1866,6 @@ def submit_exam():
                         if letter in options:
                             student_answer_for_ai = f"{letter}. {options[letter]}"
 
-                # Pass the passage through — a comprehension answer cannot be
-                # marked fairly without the text it refers to.
                 marked = mark_with_ai(
                     question_for_ai, student_answer_for_ai, marks, subject, memo,
                     context=q.get("parent_context") or "",
@@ -1919,11 +1881,6 @@ def submit_exam():
                     f"{letter}. {options.get(letter, '')}" if letter in options else letter
                 )
 
-            # Same letter-to-text enrichment as correct_display above, but
-            # for the student's own raw answer. Without this, an MCQ result
-            # only ever showed a bare "B" for what the student picked, with
-            # no way for them to see what B actually meant next to their
-            # score and feedback.
             student_display = raw_ans or "No answer"
             if raw_ans and q_type == "mcq" and isinstance(options, dict):
                 letter = raw_ans.strip().upper()
@@ -1932,18 +1889,18 @@ def submit_exam():
 
             results.append({
                 "question_number": q_num,
-                "question":        q.get("question", ""),
-                "type":            q_type,
-                "section":         q.get("section", "A"),
-                "marks":           marks,
-                "earned":          earned,
-                "score":           earned,
-                "status":          marked.get("status", "incorrect"),
-                "student_answer":  student_display,
-                "correct_answer":  correct_display,
-                "feedback":        marked.get("feedback", ""),
-                "concept_gap":     marked.get("concept_gap", ""),
-                "model_answer":    marked.get("model_answer", ""),
+                "question": q.get("question", ""),
+                "type": q_type,
+                "section": q.get("section", "A"),
+                "marks": marks,
+                "earned": earned,
+                "score": earned,
+                "status": marked.get("status", "incorrect"),
+                "student_answer": student_display,
+                "correct_answer": correct_display,
+                "feedback": marked.get("feedback", ""),
+                "concept_gap": marked.get("concept_gap", ""),
+                "model_answer": marked.get("model_answer", ""),
             })
 
         percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
@@ -1954,72 +1911,53 @@ def submit_exam():
         logger.info("[Submit] %s: %s/%s = %s%%",
                     student_id, total_score, total_marks, percentage)
 
-        # FIXED: this function previously computed and returned everything
-        # below but never wrote it anywhere — /results/<exam_id>/<student_id>
-        # and /dashboard both read from exam_attempts and would find nothing
-        # there no matter how many students submitted. Field names below
-        # (examId, studentId, completedAt, markedResults) match exactly what
-        # those two routes already query/read.
-        #
-        # userId is written alongside studentId because /agent-chat's first
-        # attempts query filters on 'userId' before falling back to
-        # 'studentId' — writing both means that primary query actually finds
-        # this attempt instead of always hitting the fallback.
-        #
-        # A new document per attempt (not a fixed exam_id+student_id key)
-        # deliberately allows a genuine retake (a fresh /start_exam session)
-        # to add another attempt rather than overwrite history — matches the
-        # composite index already declared for this collection:
-        # examId ASC, studentId ASC, completedAt DESC.
-        db.collection("exam_attempts").add({
-            "examId":             exam_id,
-            "studentId":          student_id,
-            # FIXED: firestore.rules' read rule for exam_attempts checks
-            # resource.data.studentUid and resource.data.schoolId — neither
-            # was being written, so every branch of that rule failed for
-            # every attempt (not just this student — staff and linked
-            # parents too), which is what ResultsTab.jsx's client-side
-            # snapshot listener was hitting as permission-denied. studentId
-            # is kept for the Flask-side /results and /dashboard routes
-            # (Admin SDK, bypasses rules, already queries on "studentId").
-            "studentUid":         student_id,
-            "schoolId":           meta.get("schoolId", ""),
-            "userId":             student_id,
-            "subject":            subject,
-            "examTitle":          meta.get("title", ""),
-            "score":              total_score,
-            "totalMarksObtained": total_score,
-            "total":              total_marks,
-            "percentage":         percentage,
-            "markedResults":      results,
-            "feedback":           feedback,
-            "analysis":           analysis,
-            "completedAt":        fs_admin.SERVER_TIMESTAMP,
-        })
+        # ── DURABLE WRITE: Auto-Generated Document ID ───────────────────────
+        # Using .document() generates a unique Firestore ID per attempt.
+        # This guarantees that retakes create new attempt entries rather
+        # than overwriting past attempts under a static student_exam ID.
+        attempt_ref = db.collection("exam_attempts").document()
 
-        # Consume the session so this exact session_id can't be resubmitted —
-        # see the "already submitted" guard above.
+        attempt_payload = {
+            "examId": exam_id,
+            "studentId": student_id,
+            "studentUid": student_id,
+            "userId": student_id,
+            "schoolId": meta.get("schoolId", ""),
+            "subject": subject,
+            "examTitle": meta.get("title", ""),
+            "score": total_score,
+            "totalMarksObtained": total_score,
+            "total": total_marks,
+            "percentage": percentage,
+            "markedResults": results,
+            "feedback": feedback,
+            "analysis": analysis,
+            "completedAt": fs_admin.SERVER_TIMESTAMP,
+            "submittedAt": fs_admin.SERVER_TIMESTAMP,
+        }
+
+        attempt_ref.set(attempt_payload)
+
+        # Consume session to prevent re-submission of this session ID
         if sid:
             try:
                 db.collection("exam_sessions").document(sid).update({
-                    "submitted":   True,
+                    "submitted": True,
                     "submittedAt": fs_admin.SERVER_TIMESTAMP,
                 })
             except Exception as e:
-                # Non-fatal: the attempt is already durably saved above: a
-                # failure here only means this session could theoretically
-                # be resubmitted, not that the student's result was lost.
                 logger.warning("[Submit] Could not mark session %s submitted: %s", sid, e)
 
         return jsonify({
-            "score":      total_score,
-            "total":      total_marks,
+            "score": total_score,
+            "total": total_marks,
             "percentage": percentage,
-            "results":    results,
-            "feedback":   feedback,
-            "analysis":   analysis,
-            "subject":    subject,
+            "results": results,
+            "feedback": feedback,
+            "analysis": analysis,
+            "subject": subject,
         })
+
     except Exception:
         traceback.print_exc()
         return jsonify({"error": "Submission failed. Please contact your teacher."}), 500

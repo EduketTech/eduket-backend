@@ -1873,10 +1873,39 @@ def submit_exam():
             # Rule-based first (free, instant), AI only when inconclusive.
             marked = mark_with_memo(raw_ans, memo, marks)
             if marked is None:
+                # FIXED: previously passed the bare student letter (e.g.
+                # "A") and the bare question text to the AI marker, with no
+                # memo and no option list. Without a memo, the AI has no
+                # ground truth of its own — it needs to actually SEE the
+                # options to judge whether "A" was the right choice, since
+                # it can't reliably infer "A" -> "LEDs" -> correct/incorrect
+                # from the letter alone. This was causing the AI to mark
+                # answers wrong that its own generated feedback then
+                # correctly described as right — it wasn't reasoning about
+                # the student's real answer at all, just guessing blind at
+                # what an isolated letter might mean. Build an
+                # options-aware question + answer for the AI call whenever
+                # options exist, mirroring the same letter->text lookup
+                # already used for the correct_answer/student_answer
+                # display fields above.
+                question_for_ai = q.get("question", "")
+                student_answer_for_ai = raw_ans
+
+                if isinstance(options, dict) and options:
+                    opts_str = "\n".join(
+                        f"{k}. {v}" for k, v in sorted(options.items())
+                    )
+                    question_for_ai = f"{question_for_ai}\n\nOPTIONS:\n{opts_str}"
+
+                    if raw_ans:
+                        letter = raw_ans.strip().upper()
+                        if letter in options:
+                            student_answer_for_ai = f"{letter}. {options[letter]}"
+
                 # Pass the passage through — a comprehension answer cannot be
                 # marked fairly without the text it refers to.
                 marked = mark_with_ai(
-                    q.get("question", ""), raw_ans, marks, subject, memo,
+                    question_for_ai, student_answer_for_ai, marks, subject, memo,
                     context=q.get("parent_context") or "",
                 )
 

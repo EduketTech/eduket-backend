@@ -1890,6 +1890,17 @@ def submit_exam():
                     f"{letter}. {options.get(letter, '')}" if letter in options else letter
                 )
 
+            # Same letter-to-text enrichment as correct_display above, but
+            # for the student's own raw answer. Without this, an MCQ result
+            # only ever showed a bare "B" for what the student picked, with
+            # no way for them to see what B actually meant next to their
+            # score and feedback.
+            student_display = raw_ans or "No answer"
+            if raw_ans and q_type == "mcq" and isinstance(options, dict):
+                letter = raw_ans.strip().upper()
+                if letter in options:
+                    student_display = f"{letter} ({options[letter]})"
+
             results.append({
                 "question_number": q_num,
                 "question":        q.get("question", ""),
@@ -1899,7 +1910,7 @@ def submit_exam():
                 "earned":          earned,
                 "score":           earned,
                 "status":          marked.get("status", "incorrect"),
-                "student_answer":  raw_ans or "No answer",
+                "student_answer":  student_display,
                 "correct_answer":  correct_display,
                 "feedback":        marked.get("feedback", ""),
                 "concept_gap":     marked.get("concept_gap", ""),
@@ -1934,6 +1945,16 @@ def submit_exam():
         db.collection("exam_attempts").add({
             "examId":             exam_id,
             "studentId":          student_id,
+            # FIXED: firestore.rules' read rule for exam_attempts checks
+            # resource.data.studentUid and resource.data.schoolId — neither
+            # was being written, so every branch of that rule failed for
+            # every attempt (not just this student — staff and linked
+            # parents too), which is what ResultsTab.jsx's client-side
+            # snapshot listener was hitting as permission-denied. studentId
+            # is kept for the Flask-side /results and /dashboard routes
+            # (Admin SDK, bypasses rules, already queries on "studentId").
+            "studentUid":         student_id,
+            "schoolId":           meta.get("schoolId", ""),
             "userId":             student_id,
             "subject":            subject,
             "examTitle":          meta.get("title", ""),

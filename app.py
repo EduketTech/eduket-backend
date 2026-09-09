@@ -1859,22 +1859,19 @@ def save_answer():
     except Exception:
         return jsonify({"error": "Could not save answer."}), 500
 
-
 @app.route("/submit", methods=["POST"])
 @limiter.limit("10 per minute; 30 per hour")
 def submit_exam():
     """
-    Mark every answer, then generate feedback and analysis.
+    Mark exam, generate learning feedback and analysis, then save attempt.
 
     Student identity comes from the verified Firebase token.
-    Exam identity comes from the server-side exam session.
+    Exam identity comes from the server-side session.
     """
-    try:
-        # ---------------------------------------------------------
-        # 1. VERIFY FIREBASE USER
-        # ---------------------------------------------------------
-        authenticated_uid, auth_error = verify_request_token(request)
 
+    try:
+        # 1. Authenticate student
+        authenticated_uid, auth_error = verify_request_token(request)
         if auth_error:
             return auth_error
 
@@ -1883,78 +1880,49 @@ def submit_exam():
                 "error": "Unable to determine authenticated student."
             }), 401
 
-        # ---------------------------------------------------------
-        # 2. GET SESSION
-        # ---------------------------------------------------------
+        # 2. Load and validate session
         data = request.get_json(silent=True) or {}
-
         sid = data.get("session_id")
 
         session = _get_session(sid)
-
         if not session:
             return jsonify({
-                "error": (
-                    "Invalid or expired session. "
-                    "Please start the exam first."
-                )
+                "error": "Invalid or expired session. Please start the exam first."
             }), 400
 
-        # ---------------------------------------------------------
-        # 3. PREVENT DOUBLE SUBMISSION
-        # ---------------------------------------------------------
         if session.get("submitted"):
             return jsonify({
                 "error": "This exam attempt has already been submitted."
             }), 409
 
-        # ---------------------------------------------------------
-        # 4. VERIFY SESSION BELONGS TO THIS STUDENT
-        # ---------------------------------------------------------
-        session_student_id = str(
-            session.get("student_id") or ""
-        )
-
+        session_student_id = str(session.get("student_id") or "")
         if not session_student_id:
             return jsonify({
-                "error": (
-                    "This exam session is missing student information. "
-                    "Please start the exam again."
-                )
+                "error": "This exam session is missing student information. Please start the exam again."
             }), 400
 
         if session_student_id != authenticated_uid:
             logger.warning(
-                "[Submit] Student/session mismatch: "
-                "auth=%s session=%s session_id=%s",
+                "[Submit] Student/session mismatch: auth=%s session=%s session_id=%s",
                 authenticated_uid,
                 session_student_id,
                 sid
             )
-
             return jsonify({
                 "error": "This exam session belongs to another student."
             }), 403
 
-        # ---------------------------------------------------------
-        # 5. USE SERVER-SIDE VALUES
-        # ---------------------------------------------------------
+        # Never trust student_id or exam_id from frontend
         student_id = authenticated_uid
-
         exam_id = session.get("exam_id")
+        answers = data.get("answers") or {}
 
         if not exam_id:
             return jsonify({
                 "error": "Exam information is missing from this session."
             }), 400
 
-        # IMPORTANT:
-        # Do not use exam_id or student_id from request body.
-        answers = data.get("answers", {})
-
-        # ---------------------------------------------------------
-        # 6. LOAD EXAM
-        # ---------------------------------------------------------
+        # 3. Load exam
         meta, questions = _load_exam(exam_id)
 
         if not questions:
@@ -1962,15 +1930,8 @@ def submit_exam():
                 "error": "Exam not found or has no questions."
             }), 404
 
-        # ---------------------------------------------------------
-        # 7. EXISTING MARKING LOGIC
-        # ---------------------------------------------------------
-
         subject = meta.get("subject", "General")
-
-        ai_marking_only = bool(
-            meta.get("aiMarkingOnly")
-        )
+        ai_marking_only = bool(meta.get("aiMarkingOnly"))
 
         memo_map = (
             {}
@@ -1982,20 +1943,11 @@ def submit_exam():
         total_marks = 0.0
         results = []
 
+        # 4. Mark questions
         for i, q in enumerate(questions):
-
-            q_num = q.get(
-                "question_number",
-                f"Q{i + 1}"
-            )
-
-            q_type = (
-                q.get("type") or "open"
-            ).lower()
-
-            marks = float(
-                q.get("marks") or 1
-            )
+            q_num = q.get("question_number", f"Q{i + 1}")
+            q_type = (q.get("type") or "open").lower()
+            marks = float(q.get("marks") or 1)
 
             total_marks += marks
 
@@ -2008,6 +1960,7 @@ def submit_exam():
                 answers.get(str(i), "")
             ).strip()
 
+            # Normalise MCQ options
             options = q.get("options")
 
             if (
@@ -2016,48 +1969,39 @@ def submit_exam():
                 and isinstance(options[0], dict)
             ):
                 options = {
-                    o["key"]: o["value"]
+                    str(o.get("key")): o.get("value", "")
                     for o in options
                 }
 
+            # 4a. Try deterministic memo marking first
             marked = mark_with_memo(
                 raw_ans,
                 memo,
                 marks
             )
 
+            # 4b. AI marking when memo marking is unavailable
             if marked is None:
-
-                question_for_ai = q.get(
-                    "question",
-                    ""
-                )
-
+                question_for_ai = q.get("question", "")
                 student_answer_for_ai = raw_ans
 
                 if isinstance(options, dict) and options:
-
                     opts_str = "\n".join(
                         f"{k}. {v}"
                         for k, v in sorted(options.items())
                     )
 
                     question_for_ai = (
-                        f"{question_for_ai}"
-                        f"\n\nOPTIONS:\n{opts_str}"
+                        f"{question_for_ai}\n\n"
+                        f"OPTIONS:\n{opts_str}"
                     )
 
-                    if raw_ans:
+                    letter = raw_ans.strip().upper()
 
-                        letter = (
-                            raw_ans.strip().upper()
+                    if letter in options:
+                        student_answer_for_ai = (
+                            f"{letter}. {options[letter]}"
                         )
-
-                        if letter in options:
-                            student_answer_for_ai = (
-                                f"{letter}. "
-                                f"{options[letter]}"
-                            )
 
                 marked = mark_with_ai(
                     question_for_ai,
@@ -2065,21 +2009,37 @@ def submit_exam():
                     marks,
                     subject,
                     memo,
-                    context=q.get(
-                        "parent_context"
-                    ) or "",
+                    context=q.get("parent_context") or "",
                 )
 
-            earned = float(
-                marked.get("score", 0)
+            # 5. Normalise marking result
+            earned = max(
+                0.0,
+                min(float(marked.get("score", 0)), marks)
+            )
+
+            status = marked.get(
+                "status",
+                "incorrect"
             )
 
             total_score += earned
 
+            model_answer = marked.get(
+                "model_answer",
+                ""
+            )
+
+            concept_gap = marked.get(
+                "concept_gap",
+                ""
+            )
+
+            # 6. Correct answer for student display
             correct_display = (
                 memo
-                if memo
-                else "Not available"
+                or model_answer
+                or "Not available"
             )
 
             if (
@@ -2087,88 +2047,83 @@ def submit_exam():
                 and q_type == "mcq"
                 and isinstance(options, dict)
             ):
+                letter = str(memo).strip().upper()
 
-                letter = str(
-                    memo
-                ).strip().upper()
+                if letter in options:
+                    correct_display = (
+                        f"{letter}. {options[letter]}"
+                    )
+                else:
+                    correct_display = letter
 
-                correct_display = (
-                    f"{letter}. "
-                    f"{options.get(letter, '')}"
-                    if letter in options
-                    else letter
-                )
-
-            student_display = (
-                raw_ans
-                or "No answer"
-            )
+            # 7. Student answer for display
+            student_display = raw_ans or "No answer"
 
             if (
                 raw_ans
                 and q_type == "mcq"
                 and isinstance(options, dict)
             ):
-
-                letter = (
-                    raw_ans.strip().upper()
-                )
+                letter = raw_ans.strip().upper()
 
                 if letter in options:
                     student_display = (
-                        f"{letter} "
-                        f"({options[letter]})"
+                        f"{letter} ({options[letter]})"
                     )
 
+            # 8. Store complete learning feedback
             results.append({
                 "question_number": q_num,
-                "question": q.get(
-                    "question",
-                    ""
-                ),
+                "question": q.get("question", ""),
                 "type": q_type,
-                "section": q.get(
-                    "section",
-                    "A"
-                ),
+                "section": q.get("section", "A"),
+
                 "marks": marks,
                 "earned": earned,
                 "score": earned,
-                "status": marked.get(
-                    "status",
-                    "incorrect"
-                ),
+                "status": status,
+
                 "student_answer": student_display,
                 "correct_answer": correct_display,
-                "feedback": marked.get(
-                    "feedback",
-                    ""
+
+                "feedback": marked.get("feedback", ""),
+                "concept_gap": concept_gap,
+                "model_answer": model_answer,
+
+                "learning_explanation": marked.get(
+                    "learning_explanation", ""
                 ),
-                "concept_gap": marked.get(
-                    "concept_gap",
-                    ""
+                "why_correct": marked.get(
+                    "why_correct", ""
                 ),
-                "model_answer": marked.get(
-                    "model_answer",
-                    ""
+                "why_student_answer_is_wrong": marked.get(
+                    "why_student_answer_is_wrong", ""
+                ),
+                "step_by_step": marked.get(
+                    "step_by_step", ""
+                ),
+                "key_learning_point": marked.get(
+                    "key_learning_point", ""
+                ),
+                "exam_tip": marked.get(
+                    "exam_tip", ""
+                ),
+                "practice_question": marked.get(
+                    "practice_question", ""
+                ),
+                "encouragement": marked.get(
+                    "encouragement", ""
                 ),
             })
 
-        # ---------------------------------------------------------
-        # 8. FINAL ANALYSIS
-        # ---------------------------------------------------------
-
+        # 9. Final score
         percentage = (
-            round(
-                total_score /
-                total_marks *
-                100,
-                1
-            )
-            if total_marks
+            round((total_score / total_marks) * 100, 1)
+            if total_marks > 0
             else 0
         )
 
+        # 10. Overall feedback and analysis
         feedback = generate_final_feedback(
             percentage,
             results,
@@ -2184,8 +2139,7 @@ def submit_exam():
         )
 
         logger.info(
-            "[Submit] student=%s exam=%s "
-            "session=%s: %s/%s = %s%%",
+            "[Submit] student=%s exam=%s session=%s: %s/%s = %s%%",
             student_id,
             exam_id,
             sid,
@@ -2194,138 +2148,73 @@ def submit_exam():
             percentage
         )
 
-        # ---------------------------------------------------------
-        # 9. CREATE UNIQUE ATTEMPT
-        # ---------------------------------------------------------
-
-        attempt_ref = (
-            db.collection("exam_attempts")
-            .document()
-        )
-
+        # 11. Create unique attempt
+        attempt_ref = db.collection("exam_attempts").document()
         attempt_id = attempt_ref.id
 
         attempt_payload = {
-
-            # UNIQUE ATTEMPT ID
             "attemptId": attempt_id,
-
-            # EXAM
             "examId": exam_id,
 
-            # AUTHENTICATED STUDENT
             "studentId": student_id,
             "studentUid": student_id,
             "userId": student_id,
 
-            # SESSION
             "sessionId": sid,
 
-            # SCHOOL / EXAM INFO
-            "schoolId": meta.get(
-                "schoolId",
-                ""
-            ),
-
+            "schoolId": meta.get("schoolId", ""),
             "subject": subject,
+            "examTitle": meta.get("title", ""),
 
-            "examTitle": meta.get(
-                "title",
-                ""
-            ),
-
-            # RESULTS
             "score": total_score,
-
             "totalMarksObtained": total_score,
-
             "total": total_marks,
-
             "percentage": percentage,
 
             "markedResults": results,
 
             "feedback": feedback,
-
             "analysis": analysis,
 
-            # TIMESTAMPS
-            "completedAt":
-                fs_admin.SERVER_TIMESTAMP,
-
-            "submittedAt":
-                fs_admin.SERVER_TIMESTAMP,
+            "completedAt": fs_admin.SERVER_TIMESTAMP,
+            "submittedAt": fs_admin.SERVER_TIMESTAMP,
         }
 
-        attempt_ref.set(
-            attempt_payload
-        )
+        # 12. Save attempt
+        attempt_ref.set(attempt_payload)
 
-        # ---------------------------------------------------------
-        # 10. CLOSE SESSION
-        # ---------------------------------------------------------
+        # 13. Close session
+        try:
+            db.collection("exam_sessions").document(sid).update({
+                "submitted": True,
+                "submittedAt": fs_admin.SERVER_TIMESTAMP,
+                "submittedBy": student_id,
+                "attemptId": attempt_id,
+            })
+        except Exception as e:
+            logger.warning(
+                "[Submit] Could not close session %s: %s",
+                sid,
+                e
+            )
 
-        if sid:
-
-            try:
-
-                db.collection(
-                    "exam_sessions"
-                ).document(sid).update({
-
-                    "submitted": True,
-
-                    "submittedAt":
-                        fs_admin.SERVER_TIMESTAMP,
-
-                    "submittedBy":
-                        student_id,
-
-                    "attemptId":
-                        attempt_id,
-                })
-
-            except Exception as e:
-
-                logger.warning(
-                    "[Submit] Could not mark "
-                    "session %s submitted: %s",
-                    sid,
-                    e
-                )
-
-        # ---------------------------------------------------------
-        # 11. RESPONSE
-        # ---------------------------------------------------------
-
+        # 14. Return results
         return jsonify({
-
             "attemptId": attempt_id,
-
             "score": total_score,
-
             "total": total_marks,
-
             "percentage": percentage,
-
             "results": results,
-
             "feedback": feedback,
-
             "analysis": analysis,
-
             "subject": subject,
         })
 
-    except Exception:
-
-        traceback.print_exc()
+    except Exception as e:
+        logger.exception("[Submit] Submission failed: %s", e)
 
         return jsonify({
-            "error": (
-                "Submission failed. "
-                "Please contact your teacher."
-            )
+            "error": "Submission failed. Please contact your teacher."
         }), 500
 
 @app.route("/results/<exam_id>/<student_id>", methods=["GET"])

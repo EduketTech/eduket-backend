@@ -295,25 +295,39 @@ def _init_firebase():
     bucket = storage.bucket()
     logger.info("[Firebase] Ready")
 
-
 def verify_request_token(req):
     """
     Verify the Firebase ID token in the Authorization header.
     Returns (uid, None) on success, (None, error_response) on failure.
-    The uid comes from the token — never from the request body, which any
-    client can forge.
+
+    The uid comes from the token — never from the request body.
     """
     header = req.headers.get("Authorization", "")
+
     if not header.startswith("Bearer "):
-        return None, (jsonify({"error": "Missing or malformed Authorization header"}), 401)
+        return None, (
+            jsonify({"error": "Missing or malformed Authorization header"}),
+            401
+        )
+
     try:
-        decoded = fb_auth.verify_id_token(header.split("Bearer ", 1)[1].strip())
+        decoded = fb_auth.verify_id_token(
+            header.split("Bearer ", 1)[1].strip()
+        )
+
         return decoded["uid"], None
+
     except Exception as e:
-        logger.warning("[Auth] Token verification failed: %s: %s", type(e).__name__, e)
-        return None, (jsonify({"error": "Invalid or expired token"}), 401)
+        logger.warning(
+            "[Auth] Token verification failed: %s: %s",
+            type(e).__name__,
+            e
+        )
 
-
+        return None, (
+            jsonify({"error": "Invalid or expired token"}),
+            401
+        )
 # ══════════════════════════════════════════════════════════════════════════════
 # DYNAMIC SEAT-BASED LIMITS & USAGE TRACKING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1694,62 +1708,115 @@ def list_exams():
 
 
 @app.route("/start_exam", methods=["POST"])
-@limiter.limit("20 per minute")   # CRIT-01
+@limiter.limit("20 per minute")
 def start_exam():
     """
-    Create a session for an attempt. Questions come back without memos.
+    Create a unique exam session for the authenticated student.
 
-    OPEN SECURITY ITEM: student_id comes from the request body — see the block
-    at the foot of this file.
+    The student UID is taken ONLY from the verified Firebase token.
+    Never trust student_id supplied by the client.
     """
     try:
+        # ---------------------------------------------------------
+        # 1. VERIFY FIREBASE USER
+        # ---------------------------------------------------------
+        student_id, auth_error = verify_request_token(request)
+
+        if auth_error:
+            return auth_error
+
+        if not student_id:
+            return jsonify({
+                "error": "Unable to determine authenticated student."
+            }), 401
+
+        # ---------------------------------------------------------
+        # 2. READ REQUEST DATA
+        # ---------------------------------------------------------
         data = request.get_json(silent=True) or {}
-        exam_id = (data.get("exam_id") or data.get("examId") or "").strip()
-        student_id = data.get("student_id", "anonymous")
+
+        exam_id = (
+            data.get("exam_id")
+            or data.get("examId")
+            or ""
+        ).strip()
 
         if not exam_id:
-            return jsonify({"error": "exam_id required"}), 400
+            return jsonify({
+                "error": "exam_id required"
+            }), 400
 
+        # ---------------------------------------------------------
+        # 3. LOAD EXAM
+        # ---------------------------------------------------------
         meta, questions = _load_exam(exam_id)
+
         if meta is None:
-            return jsonify({"error": f"Exam not found: {exam_id}"}), 404
+            return jsonify({
+                "error": f"Exam not found: {exam_id}"
+            }), 404
 
         if not questions:
-            return jsonify({"error": (
-                f"Exam has no questions yet (status: {meta.get('status', 'unknown')}). "
-                "Extraction may still be running — please wait and try again."
-            )}), 400
+            return jsonify({
+                "error": (
+                    f"Exam has no questions yet "
+                    f"(status: {meta.get('status', 'unknown')}). "
+                    "Extraction may still be running — "
+                    "please wait and try again."
+                )
+            }), 400
 
+        # ---------------------------------------------------------
+        # 4. CREATE UNIQUE SESSION
+        # ---------------------------------------------------------
         sid = str(uuid.uuid4())
+
         _save_session(sid, {
-            "exam_id":    exam_id,
-            "exam":       meta.get("title", exam_id),
-            "subject":    meta.get("subject", ""),
+            "exam_id": exam_id,
+            "exam": meta.get("title", exam_id),
+            "subject": meta.get("subject", ""),
+
+            # IMPORTANT:
+            # This is the verified Firebase UID.
             "student_id": student_id,
-            # Only the count — questions are re-read from exam_questions.
-            # Inlining them risked the 1 MB document ceiling on papers with
-            # long passages.
+
             "question_count": len(questions),
-            "answers":    {},
+            "answers": {},
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "createdAt":  fs_admin.SERVER_TIMESTAMP,
+            "createdAt": fs_admin.SERVER_TIMESTAMP,
+
+            "submitted": False,
         })
 
+        logger.info(
+            "[StartExam] student=%s exam=%s session=%s",
+            student_id,
+            exam_id,
+            sid
+        )
+
+        # ---------------------------------------------------------
+        # 5. RETURN EXAM
+        # ---------------------------------------------------------
         return jsonify({
-            "session_id":            sid,
-            "questions":             questions,
-            "total_questions":       len(questions),
-            "memo_merged":           meta.get("memoMerged", False),
-            "subject":               meta.get("subject", ""),
-            "title":                 meta.get("title", ""),
-            "sections":              meta.get("sections", []),
-            "paper_instructions":    meta.get("paperInstructions", ""),
-            "total_marks":           meta.get("paperTotalMarks"),
+            "session_id": sid,
+            "questions": questions,
+            "total_questions": len(questions),
+            "memo_merged": meta.get("memoMerged", False),
+            "subject": meta.get("subject", ""),
+            "title": meta.get("title", ""),
+            "sections": meta.get("sections", []),
+            "paper_instructions": meta.get("paperInstructions", ""),
+            "total_marks": meta.get("paperTotalMarks"),
             "exam_duration_minutes": meta.get("examDuration", 0),
         })
+
     except Exception:
         traceback.print_exc()
-        return jsonify({"error": "Could not start exam."}), 500
+
+        return jsonify({
+            "error": "Could not start exam."
+        }), 500
 
 
 @app.route("/question", methods=["POST"])
@@ -1794,174 +1861,472 @@ def save_answer():
 
 
 @app.route("/submit", methods=["POST"])
-@limiter.limit("10 per minute; 30 per hour")   # CRIT-01 — prevent answer-mining
+@limiter.limit("10 per minute; 30 per hour")
 def submit_exam():
     """
     Mark every answer, then generate feedback and analysis.
-    HIGH-05: a valid session is required, so a student cannot submit without
-    having started the exam.
+
+    Student identity comes from the verified Firebase token.
+    Exam identity comes from the server-side exam session.
     """
     try:
+        # ---------------------------------------------------------
+        # 1. VERIFY FIREBASE USER
+        # ---------------------------------------------------------
+        authenticated_uid, auth_error = verify_request_token(request)
+
+        if auth_error:
+            return auth_error
+
+        if not authenticated_uid:
+            return jsonify({
+                "error": "Unable to determine authenticated student."
+            }), 401
+
+        # ---------------------------------------------------------
+        # 2. GET SESSION
+        # ---------------------------------------------------------
         data = request.get_json(silent=True) or {}
+
         sid = data.get("session_id")
 
         session = _get_session(sid)
+
         if not session:
             return jsonify({
-                "error": "Invalid or expired session. Please start the exam first."
+                "error": (
+                    "Invalid or expired session. "
+                    "Please start the exam first."
+                )
             }), 400
 
-        # Guard against replaying the same session_id to /submit more than once.
-        # A genuine retake must go through /start_exam again for a fresh session_id.
+        # ---------------------------------------------------------
+        # 3. PREVENT DOUBLE SUBMISSION
+        # ---------------------------------------------------------
         if session.get("submitted"):
             return jsonify({
                 "error": "This exam attempt has already been submitted."
             }), 409
 
-        # exam_id comes from the session so submission cannot target a different paper.
+        # ---------------------------------------------------------
+        # 4. VERIFY SESSION BELONGS TO THIS STUDENT
+        # ---------------------------------------------------------
+        session_student_id = str(
+            session.get("student_id") or ""
+        )
+
+        if not session_student_id:
+            return jsonify({
+                "error": (
+                    "This exam session is missing student information. "
+                    "Please start the exam again."
+                )
+            }), 400
+
+        if session_student_id != authenticated_uid:
+            logger.warning(
+                "[Submit] Student/session mismatch: "
+                "auth=%s session=%s session_id=%s",
+                authenticated_uid,
+                session_student_id,
+                sid
+            )
+
+            return jsonify({
+                "error": "This exam session belongs to another student."
+            }), 403
+
+        # ---------------------------------------------------------
+        # 5. USE SERVER-SIDE VALUES
+        # ---------------------------------------------------------
+        student_id = authenticated_uid
+
         exam_id = session.get("exam_id")
-        student_id = session.get("student_id", "anonymous")
+
+        if not exam_id:
+            return jsonify({
+                "error": "Exam information is missing from this session."
+            }), 400
+
+        # IMPORTANT:
+        # Do not use exam_id or student_id from request body.
         answers = data.get("answers", {})
 
+        # ---------------------------------------------------------
+        # 6. LOAD EXAM
+        # ---------------------------------------------------------
         meta, questions = _load_exam(exam_id)
+
         if not questions:
-            return jsonify({"error": "Exam not found or has no questions."}), 404
+            return jsonify({
+                "error": "Exam not found or has no questions."
+            }), 404
+
+        # ---------------------------------------------------------
+        # 7. EXISTING MARKING LOGIC
+        # ---------------------------------------------------------
 
         subject = meta.get("subject", "General")
 
-        ai_marking_only = bool(meta.get("aiMarkingOnly"))
-        memo_map = {} if ai_marking_only else _load_exam_memos(exam_id)  # server-side only
+        ai_marking_only = bool(
+            meta.get("aiMarkingOnly")
+        )
+
+        memo_map = (
+            {}
+            if ai_marking_only
+            else _load_exam_memos(exam_id)
+        )
 
         total_score = 0.0
         total_marks = 0.0
         results = []
 
         for i, q in enumerate(questions):
-            q_num = q.get("question_number", f"Q{i + 1}")
-            q_type = (q.get("type") or "open").lower()
-            marks = float(q.get("marks") or 1)
+
+            q_num = q.get(
+                "question_number",
+                f"Q{i + 1}"
+            )
+
+            q_type = (
+                q.get("type") or "open"
+            ).lower()
+
+            marks = float(
+                q.get("marks") or 1
+            )
+
             total_marks += marks
 
-            memo = memo_map.get(_normalise_qnum(str(q_num)), "")
-            raw_ans = str(answers.get(str(i), "")).strip()
+            memo = memo_map.get(
+                _normalise_qnum(str(q_num)),
+                ""
+            )
+
+            raw_ans = str(
+                answers.get(str(i), "")
+            ).strip()
 
             options = q.get("options")
-            if isinstance(options, list) and options and isinstance(options[0], dict):
-                options = {o["key"]: o["value"] for o in options}
 
-            # Rule-based marking first, AI fallback when inconclusive.
-            marked = mark_with_memo(raw_ans, memo, marks)
+            if (
+                isinstance(options, list)
+                and options
+                and isinstance(options[0], dict)
+            ):
+                options = {
+                    o["key"]: o["value"]
+                    for o in options
+                }
+
+            marked = mark_with_memo(
+                raw_ans,
+                memo,
+                marks
+            )
+
             if marked is None:
-                question_for_ai = q.get("question", "")
+
+                question_for_ai = q.get(
+                    "question",
+                    ""
+                )
+
                 student_answer_for_ai = raw_ans
 
                 if isinstance(options, dict) and options:
+
                     opts_str = "\n".join(
-                        f"{k}. {v}" for k, v in sorted(options.items())
+                        f"{k}. {v}"
+                        for k, v in sorted(options.items())
                     )
-                    question_for_ai = f"{question_for_ai}\n\nOPTIONS:\n{opts_str}"
+
+                    question_for_ai = (
+                        f"{question_for_ai}"
+                        f"\n\nOPTIONS:\n{opts_str}"
+                    )
 
                     if raw_ans:
-                        letter = raw_ans.strip().upper()
+
+                        letter = (
+                            raw_ans.strip().upper()
+                        )
+
                         if letter in options:
-                            student_answer_for_ai = f"{letter}. {options[letter]}"
+                            student_answer_for_ai = (
+                                f"{letter}. "
+                                f"{options[letter]}"
+                            )
 
                 marked = mark_with_ai(
-                    question_for_ai, student_answer_for_ai, marks, subject, memo,
-                    context=q.get("parent_context") or "",
+                    question_for_ai,
+                    student_answer_for_ai,
+                    marks,
+                    subject,
+                    memo,
+                    context=q.get(
+                        "parent_context"
+                    ) or "",
                 )
 
-            earned = float(marked.get("score", 0))
+            earned = float(
+                marked.get("score", 0)
+            )
+
             total_score += earned
 
-            correct_display = memo if memo else "Not available"
-            if memo and q_type == "mcq" and isinstance(options, dict):
-                letter = str(memo).strip().upper()
+            correct_display = (
+                memo
+                if memo
+                else "Not available"
+            )
+
+            if (
+                memo
+                and q_type == "mcq"
+                and isinstance(options, dict)
+            ):
+
+                letter = str(
+                    memo
+                ).strip().upper()
+
                 correct_display = (
-                    f"{letter}. {options.get(letter, '')}" if letter in options else letter
+                    f"{letter}. "
+                    f"{options.get(letter, '')}"
+                    if letter in options
+                    else letter
                 )
 
-            student_display = raw_ans or "No answer"
-            if raw_ans and q_type == "mcq" and isinstance(options, dict):
-                letter = raw_ans.strip().upper()
+            student_display = (
+                raw_ans
+                or "No answer"
+            )
+
+            if (
+                raw_ans
+                and q_type == "mcq"
+                and isinstance(options, dict)
+            ):
+
+                letter = (
+                    raw_ans.strip().upper()
+                )
+
                 if letter in options:
-                    student_display = f"{letter} ({options[letter]})"
+                    student_display = (
+                        f"{letter} "
+                        f"({options[letter]})"
+                    )
 
             results.append({
                 "question_number": q_num,
-                "question": q.get("question", ""),
+                "question": q.get(
+                    "question",
+                    ""
+                ),
                 "type": q_type,
-                "section": q.get("section", "A"),
+                "section": q.get(
+                    "section",
+                    "A"
+                ),
                 "marks": marks,
                 "earned": earned,
                 "score": earned,
-                "status": marked.get("status", "incorrect"),
+                "status": marked.get(
+                    "status",
+                    "incorrect"
+                ),
                 "student_answer": student_display,
                 "correct_answer": correct_display,
-                "feedback": marked.get("feedback", ""),
-                "concept_gap": marked.get("concept_gap", ""),
-                "model_answer": marked.get("model_answer", ""),
+                "feedback": marked.get(
+                    "feedback",
+                    ""
+                ),
+                "concept_gap": marked.get(
+                    "concept_gap",
+                    ""
+                ),
+                "model_answer": marked.get(
+                    "model_answer",
+                    ""
+                ),
             })
 
-        percentage = round(total_score / total_marks * 100, 1) if total_marks else 0
-        feedback = generate_final_feedback(percentage, results, subject)
-        analysis = generate_exam_analysis(subject, percentage, total_score,
-                                          total_marks, results)
+        # ---------------------------------------------------------
+        # 8. FINAL ANALYSIS
+        # ---------------------------------------------------------
 
-        logger.info("[Submit] %s: %s/%s = %s%%",
-                    student_id, total_score, total_marks, percentage)
+        percentage = (
+            round(
+                total_score /
+                total_marks *
+                100,
+                1
+            )
+            if total_marks
+            else 0
+        )
 
-        # ── DURABLE WRITE: Auto-Generated Document ID ───────────────────────
-        # Using .document() generates a unique Firestore ID per attempt.
-        # This guarantees that retakes create new attempt entries rather
-        # than overwriting past attempts under a static student_exam ID.
-        attempt_ref = db.collection("exam_attempts").document()
+        feedback = generate_final_feedback(
+            percentage,
+            results,
+            subject
+        )
+
+        analysis = generate_exam_analysis(
+            subject,
+            percentage,
+            total_score,
+            total_marks,
+            results
+        )
+
+        logger.info(
+            "[Submit] student=%s exam=%s "
+            "session=%s: %s/%s = %s%%",
+            student_id,
+            exam_id,
+            sid,
+            total_score,
+            total_marks,
+            percentage
+        )
+
+        # ---------------------------------------------------------
+        # 9. CREATE UNIQUE ATTEMPT
+        # ---------------------------------------------------------
+
+        attempt_ref = (
+            db.collection("exam_attempts")
+            .document()
+        )
+
+        attempt_id = attempt_ref.id
 
         attempt_payload = {
+
+            # UNIQUE ATTEMPT ID
+            "attemptId": attempt_id,
+
+            # EXAM
             "examId": exam_id,
+
+            # AUTHENTICATED STUDENT
             "studentId": student_id,
             "studentUid": student_id,
             "userId": student_id,
-            "schoolId": meta.get("schoolId", ""),
+
+            # SESSION
+            "sessionId": sid,
+
+            # SCHOOL / EXAM INFO
+            "schoolId": meta.get(
+                "schoolId",
+                ""
+            ),
+
             "subject": subject,
-            "examTitle": meta.get("title", ""),
+
+            "examTitle": meta.get(
+                "title",
+                ""
+            ),
+
+            # RESULTS
             "score": total_score,
+
             "totalMarksObtained": total_score,
+
             "total": total_marks,
+
             "percentage": percentage,
+
             "markedResults": results,
+
             "feedback": feedback,
+
             "analysis": analysis,
-            "completedAt": fs_admin.SERVER_TIMESTAMP,
-            "submittedAt": fs_admin.SERVER_TIMESTAMP,
+
+            # TIMESTAMPS
+            "completedAt":
+                fs_admin.SERVER_TIMESTAMP,
+
+            "submittedAt":
+                fs_admin.SERVER_TIMESTAMP,
         }
 
-        attempt_ref.set(attempt_payload)
+        attempt_ref.set(
+            attempt_payload
+        )
 
-        # Consume session to prevent re-submission of this session ID
+        # ---------------------------------------------------------
+        # 10. CLOSE SESSION
+        # ---------------------------------------------------------
+
         if sid:
+
             try:
-                db.collection("exam_sessions").document(sid).update({
+
+                db.collection(
+                    "exam_sessions"
+                ).document(sid).update({
+
                     "submitted": True,
-                    "submittedAt": fs_admin.SERVER_TIMESTAMP,
+
+                    "submittedAt":
+                        fs_admin.SERVER_TIMESTAMP,
+
+                    "submittedBy":
+                        student_id,
+
+                    "attemptId":
+                        attempt_id,
                 })
+
             except Exception as e:
-                logger.warning("[Submit] Could not mark session %s submitted: %s", sid, e)
+
+                logger.warning(
+                    "[Submit] Could not mark "
+                    "session %s submitted: %s",
+                    sid,
+                    e
+                )
+
+        # ---------------------------------------------------------
+        # 11. RESPONSE
+        # ---------------------------------------------------------
 
         return jsonify({
+
+            "attemptId": attempt_id,
+
             "score": total_score,
+
             "total": total_marks,
+
             "percentage": percentage,
+
             "results": results,
+
             "feedback": feedback,
+
             "analysis": analysis,
+
             "subject": subject,
         })
 
     except Exception:
-        traceback.print_exc()
-        return jsonify({"error": "Submission failed. Please contact your teacher."}), 500
 
+        traceback.print_exc()
+
+        return jsonify({
+            "error": (
+                "Submission failed. "
+                "Please contact your teacher."
+            )
+        }), 500
 
 @app.route("/results/<exam_id>/<student_id>", methods=["GET"])
 @limiter.limit("30 per minute")   # CRIT-01

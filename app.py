@@ -149,6 +149,7 @@ import hashlib
 from billing_routes import billing_bp
 from loyalty_routes import loyalty_bp
 from marking_service import create_rubric_cache, mark_student_submission
+from pricing import is_loyalty_subscription_active
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")

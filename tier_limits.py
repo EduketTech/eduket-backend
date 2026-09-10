@@ -13,6 +13,12 @@ from datetime import datetime, timezone
 from firebase_admin import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+# Loyalty bypass -- see pricing.py. This is the actual gatekeeper behind
+# /api/register-user and /check-tier-limit in app.py, so a school with an
+# active loyalty cycle needs to be exempted HERE, not just in app.py's own
+# check_school_exam_quota (which only governs exam uploads, not seats).
+from pricing import is_loyalty_subscription_active
+
 log = logging.getLogger(__name__)
 
 FIRESTORE_TIMEOUT = 8.0
@@ -66,6 +72,20 @@ def _get_month_bounds():
     now = datetime.now(timezone.utc)
     start_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     return start_dt.isoformat(), start_dt
+
+
+def _is_loyalty_active(school_id: str) -> bool:
+    """Shared loyalty check for every branch of check_school_limit() below.
+    Fails closed (returns False, i.e. normal limits apply) on any error
+    rather than accidentally granting unlimited access on a Firestore
+    hiccup."""
+    if not school_id:
+        return False
+    try:
+        return is_loyalty_subscription_active(get_db(), school_id)
+    except Exception as e:
+        log.error("[Loyalty] Status check failed for school %s: %s", school_id, e)
+        return False
 
 
 # ── Dynamic Limit Calculation Engine ─────────────────────────────────────────
@@ -137,7 +157,15 @@ def check_school_exam_quota(school_id: str) -> tuple[bool, int, int]:
     """
     Evaluates current month exam upload quota.
     Returns: (can_upload: bool, used: int, limit: int)
+
+    A school with an active loyalty cycle bypasses the limit entirely --
+    limit is reported as -1 to signal "unlimited" to callers, matching the
+    convention used in app.py's own check_school_exam_quota.
     """
+    if _is_loyalty_active(school_id):
+        used = count_school_usage(school_id, "exams")
+        return True, used, -1
+
     limit = get_school_exam_limit(school_id)
     used = count_school_usage(school_id, "exams")
     return (used < limit), used, limit
@@ -149,9 +177,17 @@ def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
     """
     Evaluates capacity for a requested resource/seat or exam upload.
     Used for pre-checks and authoritative write guardrails.
+
+    Loyalty bypass is checked ONCE, up front, covering all three resource
+    types (teacher, student, exam) -- this is the function actually behind
+    /api/register-user and /check-tier-limit in app.py, so this is the
+    real enforcement point for seat limits, not just exam uploads.
     """
     if not school_id:
         return False, "No school ID associated with request."
+
+    if _is_loyalty_active(school_id):
+        return True, "Allowed (loyalty access active)"
 
     db = get_db()
     res = limit_type.lower().rstrip("s")

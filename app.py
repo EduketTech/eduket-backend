@@ -147,6 +147,7 @@ import traceback
 import threading
 import hashlib
 from billing_routes import billing_bp
+from loyalty_routes import loyalty_bp
 from marking_service import create_rubric_cache, mark_student_submission
 
 logging.basicConfig(level=logging.INFO)
@@ -420,6 +421,7 @@ app = Flask(__name__)
 # so this endpoint only ever receives JSON metadata.
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024   # 5 MB
 app.register_blueprint(billing_bp)
+app.register_blueprint(loyalty_bp)
 
 # ── CRIT-08: HTTPS enforcement — one guarded block, applied once ─────────────
 _backend_url = os.environ.get("BACKEND_BASE_URL", "")

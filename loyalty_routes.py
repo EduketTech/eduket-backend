@@ -54,9 +54,9 @@ def _get_school_id_for_uid(uid: str):
         logger.error("[Loyalty] schoolId lookup failed for %s: %s", uid, e)
         return None
 
-def _audit(action: str, actor: str, target: str, details: dict = None):
+def _audit(action: str, actor: str, target: str, details: dict = None, school_id: str = None):
     try:
-        _db().collection("auditLog").add({
+        entry = {
             "action":    action,
             "actorUid":  actor,
             "target":    target,
@@ -65,7 +65,10 @@ def _audit(action: str, actor: str, target: str, details: dict = None):
             "ip": request.headers.get(
                 "X-Forwarded-For", request.remote_addr or "unknown"
             ).split(",")[0].strip(),
-        })
+        }
+        if school_id:
+            entry["schoolId"] = school_id
+        _db().collection("auditLog").add(entry)
     except Exception as e:
         logger.error("[Audit] Loyalty log failed: %s", e)
 

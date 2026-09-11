@@ -1776,6 +1776,26 @@ def start_exam():
             }), 400
 
         # ---------------------------------------------------------
+        # 3b. LOOK UP STUDENT NAME
+        # ---------------------------------------------------------
+        # Fetched once here and carried on the session, rather than
+        # re-fetched in submit_exam() -- one extra read now saves a
+        # second one later, and keeps the name consistent with whatever
+        # it was at the moment the student started the exam.
+        student_name = "Unknown Student"
+        try:
+            student_doc = db.collection("users").document(student_id).get()
+            if student_doc.exists:
+                student_data = student_doc.to_dict() or {}
+                student_name = (
+                    student_data.get("displayName")
+                    or student_data.get("name")
+                    or "Unknown Student"
+                )
+        except Exception as e:
+            logger.warning("[StartExam] Could not fetch student name for %s: %s", student_id, e)
+
+        # ---------------------------------------------------------
         # 4. CREATE UNIQUE SESSION
         # ---------------------------------------------------------
         sid = str(uuid.uuid4())
@@ -1788,6 +1808,7 @@ def start_exam():
             # IMPORTANT:
             # This is the verified Firebase UID.
             "student_id": student_id,
+            "student_name": student_name,
 
             "question_count": len(questions),
             "answers": {},
@@ -1798,8 +1819,9 @@ def start_exam():
         })
 
         logger.info(
-            "[StartExam] student=%s exam=%s session=%s",
+            "[StartExam] student=%s (%s) exam=%s session=%s",
             student_id,
+            student_name,
             exam_id,
             sid
         )
@@ -1868,6 +1890,7 @@ def save_answer():
     except Exception:
         return jsonify({"error": "Could not save answer."}), 500
 
+
 @app.route("/submit", methods=["POST"])
 @limiter.limit("10 per minute; 30 per hour")
 def submit_exam():
@@ -1930,6 +1953,24 @@ def submit_exam():
             return jsonify({
                 "error": "Exam information is missing from this session."
             }), 400
+
+        # 2b. Student name -- read from the session first (set in
+        # start_exam()); fall back to a direct lookup only for sessions
+        # created before this field existed, so nothing already in
+        # progress at deploy time shows a blank name.
+        student_name = session.get("student_name")
+        if not student_name:
+            try:
+                student_doc = db.collection("users").document(student_id).get()
+                if student_doc.exists:
+                    student_data = student_doc.to_dict() or {}
+                    student_name = (
+                        student_data.get("displayName")
+                        or student_data.get("name")
+                    )
+            except Exception as e:
+                logger.warning("[Submit] Could not fetch student name for %s: %s", student_id, e)
+        student_name = student_name or "Unknown Student"
 
         # 3. Load exam
         meta, questions = _load_exam(exam_id)
@@ -2148,8 +2189,9 @@ def submit_exam():
         )
 
         logger.info(
-            "[Submit] student=%s exam=%s session=%s: %s/%s = %s%%",
+            "[Submit] student=%s (%s) exam=%s session=%s: %s/%s = %s%%",
             student_id,
+            student_name,
             exam_id,
             sid,
             total_score,
@@ -2168,6 +2210,7 @@ def submit_exam():
             "studentId": student_id,
             "studentUid": student_id,
             "userId": student_id,
+            "studentName": student_name,
 
             "sessionId": sid,
 
@@ -2217,6 +2260,7 @@ def submit_exam():
             "feedback": feedback,
             "analysis": analysis,
             "subject": subject,
+            "studentName": student_name,
         })
 
     except Exception as e:
@@ -2225,6 +2269,7 @@ def submit_exam():
         return jsonify({
             "error": "Submission failed. Please contact your teacher."
         }), 500
+
 
 @app.route("/results/<exam_id>/<student_id>", methods=["GET"])
 @limiter.limit("30 per minute")   # CRIT-01

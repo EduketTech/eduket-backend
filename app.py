@@ -1657,8 +1657,13 @@ def exam_usage():
             return jsonify({"error": "No school associated with this account"}), 400
 
         # Retrieve dynamic seat limit & monthly usage
-        exam_limit = get_school_exam_limit(school_id)
         used = _count_month_uploads(school_id)
+        is_loyalty = False
+        try:
+            is_loyalty = is_loyalty_subscription_active(db, school_id)
+        except Exception as e:
+            logger.error("[Usage] Loyalty status check failed for school %s: %s", school_id, e)
+        exam_limit = None if is_loyalty else get_school_exam_limit(school_id)
 
         # Fetch subscription seat info for detailed status reporting
         sub_doc = db.collection("subscriptions").document(school_id).get()
@@ -1675,8 +1680,9 @@ def exam_usage():
             "seats": seats,
             "limit": exam_limit,
             "used": used,
-            "remaining": max(0, exam_limit - used),
-            "atLimit": used >= exam_limit,
+            "remaining": None if is_loyalty else max(0, exam_limit - used),
+            "atLimit": False if is_loyalty else used >= exam_limit,
+            "unlimited": is_loyalty,
         })
     except Exception:
         traceback.print_exc()
